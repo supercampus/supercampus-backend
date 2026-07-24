@@ -1,0 +1,240 @@
+// Prisma schema file for Supercampus Backend
+// Learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum Role {
+  STUDENT
+  TEACHER
+  PARENT
+  STAFF
+  ADMIN
+  SECURITY
+}
+
+enum StudentType {
+  DAY_SCHOLAR
+  HOSTELLER
+}
+
+enum StaffType {
+  TEACHING
+  NON_TEACHING
+}
+
+enum VisitorType {
+  INVITED
+  WALK_IN
+}
+
+enum OutpassType {
+  DAY_OUT
+  HOME_VISIT
+  MEDICAL
+  EMERGENCY
+}
+
+enum PassStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+  USED
+}
+
+enum ActorType {
+  STUDENT
+  STAFF
+  VISITOR
+}
+
+enum EntryExitType {
+  ENTRY
+  EXIT
+}
+
+enum ScanResult {
+  ALLOWED
+  DENIED
+  FLAGGED
+}
+
+enum OverrideReason {
+  SYSTEM_DOWN
+  OTHER
+}
+
+enum ApproverRole {
+  CLASS_ADVISOR
+  HOD
+  WARDEN
+  PRINCIPAL
+  ADMIN
+}
+
+// ─── Models ──────────────────────────────────────────────────────────────────
+
+/// Core user model — extended with optional profile fields per role type.
+model User {
+  id          String       @id @default(uuid())
+  email       String       @unique
+  name        String?
+  role        Role         @default(STUDENT)
+  // Student-specific fields
+  studentType StudentType?
+  rollNumber  String?
+  hostelBlock String?
+  parentPhone String?      // WhatsApp number for parent notifications
+  // Staff-specific fields
+  staffType   StaffType?
+  employeeId  String?
+  department  String?      // Used for HOD/approver resolution
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  // Relations
+  gatePasses        GatePass[]      @relation("PassOwner")
+  approvalSteps     ApprovalStep[]  @relation("ApproverUser")
+  geofenceEvents    GeofenceEvent[]
+  recordedOverrides ManualOverride[] @relation("OverrideRecorder")
+  reviewedOverrides ManualOverride[] @relation("OverrideReviewer")
+
+  @@map("users")
+}
+
+/// Central pass record for all actor types (Student / Staff / Visitor).
+model GatePass {
+  id          String       @id @default(uuid())
+  userId      String
+  actorType   ActorType
+  outpassType OutpassType? // Applicable for STUDENT (HOSTELLER) and STAFF exits
+  status      PassStatus   @default(PENDING)
+  fromTime    DateTime?
+  backTime    DateTime?
+  purpose     String?
+  remarks     String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  user           User            @relation("PassOwner", fields: [userId], references: [id])
+  approvalSteps  ApprovalStep[]
+  qrToken        QRToken?
+  gateLogs       GateLog[]
+  visitorProfile VisitorProfile?
+
+  @@map("gate_passes")
+}
+
+/// One row per approver in the sequential chain for a pass.
+/// Step order determines the sequence; current step = first with status PENDING.
+model ApprovalStep {
+  id           String       @id @default(uuid())
+  passId       String
+  approverId   String?      // Resolved at runtime; null until assigned
+  approverRole ApproverRole
+  stepOrder    Int
+  status       PassStatus   @default(PENDING)
+  remarks      String?
+  decidedAt    DateTime?
+  createdAt    DateTime     @default(now())
+
+  pass     GatePass @relation(fields: [passId], references: [id])
+  approver User?    @relation("ApproverUser", fields: [approverId], references: [id])
+
+  @@map("approval_steps")
+}
+
+/// JWT-based QR token linked 1-to-1 with a GatePass.
+/// Cached in DB to allow offline validation at the gate scanner.
+model QRToken {
+  id        String     @id @default(uuid())
+  passId    String     @unique
+  token     String     @unique // Signed JWT
+  expiresAt DateTime
+  usedAt    DateTime?
+  status    PassStatus @default(APPROVED)
+  createdAt DateTime   @default(now())
+
+  pass GatePass @relation(fields: [passId], references: [id])
+
+  @@map("qr_tokens")
+}
+
+/// Records each gate scan event (entry or exit).
+model GateLog {
+  id          String        @id @default(uuid())
+  passId      String
+  scannedById String?       // Security user who scanned
+  type        EntryExitType
+  result      ScanResult
+  scannedAt   DateTime      @default(now())
+  notes       String?
+
+  pass           GatePass        @relation(fields: [passId], references: [id])
+  manualOverride ManualOverride?
+
+  @@map("gate_logs")
+}
+
+/// Visitor details captured by security at the gate.
+model VisitorProfile {
+  id          String      @id @default(uuid())
+  passId      String      @unique
+  visitorName String
+  visitorType VisitorType
+  phone       String?
+  purpose     String?
+  whomToMeet  String?
+  photoUrl    String?
+  createdAt   DateTime    @default(now())
+
+  pass GatePass @relation(fields: [passId], references: [id])
+
+  @@map("visitor_profiles")
+}
+
+/// Offline fallback log used when the QR system is unavailable.
+/// Flagged for admin review after system is restored.
+model ManualOverride {
+  id           String         @id @default(uuid())
+  gateLogId    String?        @unique
+  recordedById String
+  actorDesc    String         // Free-text: name / ID / description of person
+  reason       OverrideReason @default(SYSTEM_DOWN)
+  photoUrl     String?
+  isReviewed   Boolean        @default(false)
+  reviewedAt   DateTime?
+  reviewedById String?
+  createdAt    DateTime       @default(now())
+
+  gateLog  GateLog? @relation(fields: [gateLogId], references: [id])
+  recorder User     @relation("OverrideRecorder", fields: [recordedById], references: [id])
+  reviewer User?    @relation("OverrideReviewer", fields: [reviewedById], references: [id])
+
+  @@map("manual_overrides")
+}
+
+/// Records geofence events sent by mobile apps.
+/// Entry event → auto-generates Day Scholar QR.
+/// Exit event  → triggers parent WhatsApp notification for Hostellers.
+model GeofenceEvent {
+  id        String        @id @default(uuid())
+  userId    String
+  type      EntryExitType
+  latitude  Float?
+  longitude Float?
+  createdAt DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("geofence_events")
+}

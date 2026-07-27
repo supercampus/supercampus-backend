@@ -6,7 +6,7 @@ export const sessionCookieName = 'supercampus_session';
 export const sessionCookieOptions = {
   httpOnly: true,
   secure: config.nodeEnv === 'production',
-  sameSite: 'lax',
+  sameSite: config.nodeEnv === 'production' ? 'none' : 'lax',
   maxAge: 8 * 60 * 60 * 1000,
   path: '/',
 };

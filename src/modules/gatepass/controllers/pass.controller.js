@@ -1,13 +1,11 @@
-'use strict';
-
-const passService              = require('../services/pass.service');
-const { validateCreatePass, validatePassId } = require('../validators/pass.validator');
+import * as passService from '../services/pass.service.js';
+import { validateCreatePass, validatePassId } from '../validators/pass.validator.js';
 
 /**
  * POST /api/gatepass/passes
  * Submit a new gate pass request.
  */
-const createPass = async (req, res) => {
+export const createPass = async (req, res) => {
   const { valid, errors } = validateCreatePass(req.body);
   if (!valid) {
     return res.status(400).json({ error: 'Validation failed', details: errors });
@@ -26,7 +24,7 @@ const createPass = async (req, res) => {
  * GET /api/gatepass/passes
  * List passes — filtered by role (own passes for students/staff, all for admin).
  */
-const listPasses = async (req, res) => {
+export const listPasses = async (req, res) => {
   const { status, actorType, page = 1, limit = 20 } = req.query;
   try {
     const passes = await passService.listPasses({
@@ -48,7 +46,7 @@ const listPasses = async (req, res) => {
  * GET /api/gatepass/passes/:id
  * Get a single pass with its full approval chain.
  */
-const getPass = async (req, res) => {
+export const getPass = async (req, res) => {
   const { id } = req.params;
   if (!validatePassId(id)) {
     return res.status(400).json({ error: 'Invalid pass ID format' });
@@ -68,7 +66,7 @@ const getPass = async (req, res) => {
  * DELETE /api/gatepass/passes/:id
  * Cancel a pending pass (owner only).
  */
-const cancelPass = async (req, res) => {
+export const cancelPass = async (req, res) => {
   const { id } = req.params;
   if (!validatePassId(id)) {
     return res.status(400).json({ error: 'Invalid pass ID format' });
@@ -86,5 +84,3 @@ const cancelPass = async (req, res) => {
     return res.status(500).json({ error: 'Failed to cancel pass' });
   }
 };
-
-module.exports = { createPass, listPasses, getPass, cancelPass };

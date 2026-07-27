@@ -1,12 +1,10 @@
-'use strict';
-
-const approvalService = require('../services/approval.service');
+import * as approvalService from '../services/approval.service.js';
 
 /**
  * GET /api/gatepass/approvals/pending
  * Returns all passes where the authenticated approver is the current pending step.
  */
-const getPendingApprovals = async (req, res) => {
+export const getPendingApprovals = async (req, res) => {
   try {
     const pending = await approvalService.getPendingForApprover(
       req.user.id,
@@ -25,7 +23,7 @@ const getPendingApprovals = async (req, res) => {
  * Approve the current step for a pass.
  * Body: { remarks?: string }
  */
-const approveStep = async (req, res) => {
+export const approveStep = async (req, res) => {
   const { passId } = req.params;
   const { remarks } = req.body;
 
@@ -57,7 +55,7 @@ const approveStep = async (req, res) => {
  * Reject a pass — terminates the entire chain immediately.
  * Body: { remarks?: string }
  */
-const rejectStep = async (req, res) => {
+export const rejectStep = async (req, res) => {
   const { passId } = req.params;
   const { remarks } = req.body;
 
@@ -78,5 +76,3 @@ const rejectStep = async (req, res) => {
     return res.status(500).json({ error: 'Failed to reject step' });
   }
 };
-
-module.exports = { getPendingApprovals, approveStep, rejectStep };

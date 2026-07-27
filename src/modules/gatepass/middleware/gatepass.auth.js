@@ -1,5 +1,3 @@
-'use strict';
-
 /**
  * Gatepass Role-Guard Middleware
  *
@@ -40,11 +38,4 @@ const requireApprover = requireRoles(['TEACHER', 'STAFF', 'ADMIN']); // HOD / Wa
 const requireStudent  = requireRoles(['STUDENT']);
 const requireStaff    = requireRoles(['STAFF', 'TEACHER']);
 
-module.exports = {
-  requireRoles,
-  requireAdmin,
-  requireSecurity,
-  requireApprover,
-  requireStudent,
-  requireStaff,
-};
+export { requireRoles, requireAdmin, requireSecurity, requireApprover, requireStudent, requireStaff };

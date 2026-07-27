@@ -1,5 +1,3 @@
-'use strict';
-
 /**
  * Geofence event validator.
  * Mobile app sends lat/lng when the student crosses the campus boundary.
@@ -10,7 +8,7 @@
  * @param {object} body - Expected: { userId: string, latitude?: number, longitude?: number }
  * @returns {{ valid: boolean, errors: string[] }}
  */
-const validateGeofenceEvent = (body) => {
+export const validateGeofenceEvent = (body) => {
   const errors = [];
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -28,5 +26,3 @@ const validateGeofenceEvent = (body) => {
 
   return { valid: errors.length === 0, errors };
 };
-
-module.exports = { validateGeofenceEvent };

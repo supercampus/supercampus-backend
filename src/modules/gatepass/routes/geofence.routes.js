@@ -1,9 +1,8 @@
-'use strict';
+import express from 'express';
+import * as ctrl from '../controllers/geofence.controller.js';
+import { requireRoles } from '../middleware/gatepass.auth.js';
 
-const express    = require('express');
-const router     = express.Router();
-const ctrl       = require('../controllers/geofence.controller');
-const { requireRoles } = require('../middleware/gatepass.auth');
+const router = express.Router();
 
 /**
  * Geofence Events — called by the mobile app when a student/staff
@@ -25,4 +24,4 @@ router.post('/entry', requireRoles(['STUDENT', 'STAFF']), ctrl.handleEntry);
 // POST /api/gatepass/geofence/exit
 router.post('/exit', requireRoles(['STUDENT', 'STAFF']), ctrl.handleExit);
 
-module.exports = router;
+export default router;

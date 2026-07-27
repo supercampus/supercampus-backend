@@ -1,5 +1,3 @@
-'use strict';
-
 /**
  * Scan input validator.
  */
@@ -9,7 +7,7 @@
  * @param {object} body - Expected: { token: string, type?: 'ENTRY'|'EXIT' }
  * @returns {{ valid: boolean, errors: string[] }}
  */
-const validateScan = (body) => {
+export const validateScan = (body) => {
   const errors = [];
   const validTypes = ['ENTRY', 'EXIT'];
 
@@ -23,5 +21,3 @@ const validateScan = (body) => {
 
   return { valid: errors.length === 0, errors };
 };
-
-module.exports = { validateScan };

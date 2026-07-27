@@ -1,8 +1,6 @@
-'use strict';
-
-const prisma          = require('../../../lib/prisma');
-const qrService       = require('./qr.service');
-const notificationSvc = require('./notification.service');
+import prisma from '../../../lib/prisma.js';
+import * as qrService from './qr.service.js';
+import * as notificationSvc from './notification.service.js';
 
 /**
  * Validate a scanned QR token and create a GateLog entry.
@@ -16,7 +14,7 @@ const notificationSvc = require('./notification.service');
  *
  * @param {{ token: string, type?: string, scannedById: string }} params
  */
-const validateAndScan = async ({ token, type, scannedById }) => {
+export const validateAndScan = async ({ token, type, scannedById }) => {
   let decoded;
 
   // Step 1: Verify JWT signature
@@ -59,8 +57,8 @@ const validateAndScan = async ({ token, type, scannedById }) => {
   }
 
   // Step 3: Auto-detect ENTRY/EXIT from last gate log
-  const lastLog   = qrToken.pass.gateLogs[0];
-  const scanType  = type || (lastLog?.type === 'ENTRY' ? 'EXIT' : 'ENTRY');
+  const lastLog  = qrToken.pass.gateLogs[0];
+  const scanType = type || (lastLog?.type === 'ENTRY' ? 'EXIT' : 'ENTRY');
 
   // Step 4: Create GateLog
   const gateLog = await prisma.gateLog.create({
@@ -104,7 +102,7 @@ const validateAndScan = async ({ token, type, scannedById }) => {
 /**
  * List gate logs with optional filters.
  */
-const getGateLogs = async ({ page, limit, type, result }) => {
+export const getGateLogs = async ({ page, limit, type, result }) => {
   const skip = (page - 1) * limit;
   const where = {};
   if (type)   where.type   = type;
@@ -127,7 +125,7 @@ const getGateLogs = async ({ page, limit, type, result }) => {
 /**
  * Get a single gate log by ID.
  */
-const getGateLogById = async (id) => {
+export const getGateLogById = async (id) => {
   return prisma.gateLog.findUnique({
     where: { id },
     include: {
@@ -139,9 +137,6 @@ const getGateLogById = async (id) => {
 
 // ─── Internal Helpers ─────────────────────────────────────────────────────────
 
-/**
- * Log a denied/flagged scan without creating a valid access event.
- */
 const _logAndReturn = async (passId, scannedById, type, result, message) => {
   if (passId) {
     await prisma.gateLog.create({
@@ -150,5 +145,3 @@ const _logAndReturn = async (passId, scannedById, type, result, message) => {
   }
   return { result, message, passId };
 };
-
-module.exports = { validateAndScan, getGateLogs, getGateLogById };

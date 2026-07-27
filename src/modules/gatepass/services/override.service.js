@@ -1,13 +1,11 @@
-'use strict';
-
-const prisma = require('../../../lib/prisma');
+import prisma from '../../../lib/prisma.js';
 
 /**
  * Create a manual override log entry (system-down fallback).
  *
  * @param {{ recordedById, actorDesc, reason, photoUrl }} params
  */
-const createOverride = async ({ recordedById, actorDesc, reason, photoUrl }) => {
+export const createOverride = async ({ recordedById, actorDesc, reason, photoUrl }) => {
   return prisma.manualOverride.create({
     data: {
       recordedById,
@@ -27,7 +25,7 @@ const createOverride = async ({ recordedById, actorDesc, reason, photoUrl }) => 
  *
  * @param {{ page, limit, isReviewed?: boolean }} params
  */
-const listOverrides = async ({ page, limit, isReviewed }) => {
+export const listOverrides = async ({ page, limit, isReviewed }) => {
   const skip = (page - 1) * limit;
   const where = {};
   if (isReviewed !== undefined) where.isReviewed = isReviewed;
@@ -56,7 +54,7 @@ const listOverrides = async ({ page, limit, isReviewed }) => {
  * @param {string} id          - Override ID
  * @param {string} reviewedById - Admin user ID
  */
-const reviewOverride = async (id, reviewedById) => {
+export const reviewOverride = async (id, reviewedById) => {
   const existing = await prisma.manualOverride.findUnique({ where: { id } });
   if (!existing) return null;
 
@@ -73,5 +71,3 @@ const reviewOverride = async (id, reviewedById) => {
     },
   });
 };
-
-module.exports = { createOverride, listOverrides, reviewOverride };

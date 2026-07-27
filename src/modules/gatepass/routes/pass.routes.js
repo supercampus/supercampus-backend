@@ -1,9 +1,8 @@
-'use strict';
+import express from 'express';
+import * as ctrl from '../controllers/pass.controller.js';
+import { requireRoles } from '../middleware/gatepass.auth.js';
 
-const express    = require('express');
-const router     = express.Router();
-const ctrl       = require('../controllers/pass.controller');
-const { requireRoles } = require('../middleware/gatepass.auth');
+const router = express.Router();
 
 // POST   /api/gatepass/passes          — submit a new pass request
 router.post('/', requireRoles(['STUDENT', 'STAFF', 'SECURITY']), ctrl.createPass);
@@ -17,4 +16,4 @@ router.get('/:id', requireRoles(['STUDENT', 'STAFF', 'ADMIN', 'SECURITY']), ctrl
 // DELETE /api/gatepass/passes/:id      — cancel a pending pass (owner only)
 router.delete('/:id', requireRoles(['STUDENT', 'STAFF']), ctrl.cancelPass);
 
-module.exports = router;
+export default router;

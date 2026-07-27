@@ -1,9 +1,8 @@
-'use strict';
+import express from 'express';
+import * as ctrl from '../controllers/override.controller.js';
+import { requireSecurity, requireAdmin } from '../middleware/gatepass.auth.js';
 
-const express    = require('express');
-const router     = express.Router();
-const ctrl       = require('../controllers/override.controller');
-const { requireSecurity, requireAdmin } = require('../middleware/gatepass.auth');
+const router = express.Router();
 
 // POST  /api/gatepass/override          — log manual entry/exit (system down)
 router.post('/', requireSecurity, ctrl.createOverride);
@@ -14,4 +13,4 @@ router.get('/', requireAdmin, ctrl.listOverrides);
 // PATCH /api/gatepass/override/:id/review — mark override as reviewed (admin)
 router.patch('/:id/review', requireAdmin, ctrl.reviewOverride);
 
-module.exports = router;
+export default router;

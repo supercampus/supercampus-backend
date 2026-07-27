@@ -1,9 +1,8 @@
-'use strict';
+import express from 'express';
+import * as ctrl from '../controllers/scan.controller.js';
+import { requireSecurity, requireAdmin } from '../middleware/gatepass.auth.js';
 
-const express    = require('express');
-const router     = express.Router();
-const ctrl       = require('../controllers/scan.controller');
-const { requireSecurity, requireAdmin } = require('../middleware/gatepass.auth');
+const router = express.Router();
 
 // POST /api/gatepass/scan/validate  — scan & validate a QR, log entry/exit
 router.post('/validate', requireSecurity, ctrl.validateQR);
@@ -14,4 +13,4 @@ router.get('/logs', requireSecurity, ctrl.getGateLogs);
 // GET  /api/gatepass/scan/logs/:id  — single gate log detail
 router.get('/logs/:id', requireAdmin, ctrl.getGateLogById);
 
-module.exports = router;
+export default router;

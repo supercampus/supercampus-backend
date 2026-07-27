@@ -1,7 +1,5 @@
-'use strict';
-
-const jwt    = require('jsonwebtoken');
-const prisma = require('../../../lib/prisma');
+import jwt from 'jsonwebtoken';
+import prisma from '../../../lib/prisma.js';
 
 /**
  * TTL (in minutes) per pass / actor type.
@@ -25,12 +23,10 @@ const GATEPASS_SECRET = process.env.GATEPASS_SECRET || 'gatepass-secret-change-i
  * @param {string} [outpassType]
  * @param {number} [customTtlMinutes] - Override TTL (e.g. for walk-in visitors)
  */
-const generateQR = async (passId, userId, actorType, outpassType, customTtlMinutes) => {
-  // Resolve TTL
+export const generateQR = async (passId, userId, actorType, outpassType, customTtlMinutes) => {
   const ttl = customTtlMinutes || _resolveTTL(actorType, outpassType);
   const expiresAt = new Date(Date.now() + ttl * 60 * 1000);
 
-  // Build JWT payload
   const payload = {
     passId,
     userId,
@@ -44,7 +40,6 @@ const generateQR = async (passId, userId, actorType, outpassType, customTtlMinut
     issuer: 'supercampus',
   });
 
-  // Upsert in DB — regenerate replaces the old token
   const qrToken = await prisma.qRToken.upsert({
     where: { passId },
     create: { passId, token, expiresAt, status: 'APPROVED' },
@@ -57,12 +52,8 @@ const generateQR = async (passId, userId, actorType, outpassType, customTtlMinut
 /**
  * Retrieve the QR token for a pass.
  * Non-admin users may only retrieve tokens for their own passes.
- *
- * @param {string} passId
- * @param {string} requesterId
- * @param {string} requesterRole
  */
-const getQRByPassId = async (passId, requesterId, requesterRole) => {
+export const getQRByPassId = async (passId, requesterId, requesterRole) => {
   const pass = await prisma.gatePass.findUnique({
     where: { id: passId },
     include: { qrToken: true },
@@ -70,12 +61,10 @@ const getQRByPassId = async (passId, requesterId, requesterRole) => {
 
   if (!pass || !pass.qrToken) return null;
 
-  // Ownership check for non-privileged roles
   if (!['ADMIN', 'SECURITY'].includes(requesterRole) && pass.userId !== requesterId) {
     return null;
   }
 
-  // Check token expiry
   if (new Date(pass.qrToken.expiresAt) < new Date()) {
     await prisma.qRToken.update({
       where: { passId },
@@ -94,7 +83,7 @@ const getQRByPassId = async (passId, requesterId, requesterRole) => {
 /**
  * Admin: force regenerate a QR token (e.g. after expiry).
  */
-const regenerateQR = async (passId) => {
+export const regenerateQR = async (passId) => {
   const pass = await prisma.gatePass.findUnique({ where: { id: passId } });
   if (!pass) return null;
 
@@ -103,11 +92,8 @@ const regenerateQR = async (passId) => {
 
 /**
  * Verify a JWT token offline (no DB call needed).
- * Returns the decoded payload or throws.
- *
- * @param {string} token
  */
-const verifyToken = (token) => {
+export const verifyToken = (token) => {
   return jwt.verify(token, GATEPASS_SECRET, { issuer: 'supercampus' });
 };
 
@@ -119,5 +105,3 @@ const _resolveTTL = (actorType, outpassType) => {
   if (actorType === 'VISITOR') return TTL_MINUTES.VISITOR;
   return 60;
 };
-
-module.exports = { generateQR, getQRByPassId, regenerateQR, verifyToken };

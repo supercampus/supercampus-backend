@@ -1,12 +1,10 @@
-'use strict';
-
-const qrService = require('../services/qr.service');
+import * as qrService from '../services/qr.service.js';
 
 /**
  * GET /api/gatepass/qr/:passId
  * Returns the QR token (and data URL) for an approved pass.
  */
-const getQR = async (req, res) => {
+export const getQR = async (req, res) => {
   const { passId } = req.params;
   try {
     const qr = await qrService.getQRByPassId(passId, req.user.id, req.user.role);
@@ -22,7 +20,7 @@ const getQR = async (req, res) => {
  * POST /api/gatepass/qr/:passId/regenerate
  * Admin-only: force regenerate a QR token (e.g. after expiry).
  */
-const regenerateQR = async (req, res) => {
+export const regenerateQR = async (req, res) => {
   const { passId } = req.params;
   try {
     const qr = await qrService.regenerateQR(passId);
@@ -33,5 +31,3 @@ const regenerateQR = async (req, res) => {
     return res.status(500).json({ error: 'Failed to regenerate QR' });
   }
 };
-
-module.exports = { getQR, regenerateQR };

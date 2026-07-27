@@ -1,14 +1,12 @@
-'use strict';
-
-const scanService             = require('../services/scan.service');
-const { validateScan }        = require('../validators/scan.validator');
+import * as scanService from '../services/scan.service.js';
+import { validateScan } from '../validators/scan.validator.js';
 
 /**
  * POST /api/gatepass/scan/validate
  * Security device submits a scanned QR token.
  * Body: { token: string, type?: 'ENTRY' | 'EXIT' }
  */
-const validateQR = async (req, res) => {
+export const validateQR = async (req, res) => {
   const { valid, errors } = validateScan(req.body);
   if (!valid) {
     return res.status(400).json({ error: 'Validation failed', details: errors });
@@ -34,7 +32,7 @@ const validateQR = async (req, res) => {
  * Paginated gate log listing for security / admin.
  * Query: ?page=1&limit=20&type=ENTRY|EXIT&result=ALLOWED|DENIED|FLAGGED
  */
-const getGateLogs = async (req, res) => {
+export const getGateLogs = async (req, res) => {
   const { page = 1, limit = 20, type, result } = req.query;
   try {
     const logs = await scanService.getGateLogs({
@@ -54,7 +52,7 @@ const getGateLogs = async (req, res) => {
  * GET /api/gatepass/scan/logs/:id
  * Single gate log detail (admin only).
  */
-const getGateLogById = async (req, res) => {
+export const getGateLogById = async (req, res) => {
   const { id } = req.params;
   try {
     const log = await scanService.getGateLogById(id);
@@ -65,5 +63,3 @@ const getGateLogById = async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch gate log' });
   }
 };
-
-module.exports = { validateQR, getGateLogs, getGateLogById };

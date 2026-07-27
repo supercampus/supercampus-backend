@@ -1,8 +1,6 @@
-'use strict';
-
-const prisma          = require('../../../lib/prisma');
-const qrService       = require('./qr.service');
-const notificationSvc = require('./notification.service');
+import prisma from '../../../lib/prisma.js';
+import * as qrService from './qr.service.js';
+import * as notificationSvc from './notification.service.js';
 
 /**
  * Approval Matrix — defines the sequential approver chain per outpass/exit type.
@@ -31,7 +29,7 @@ const STAFF_EXIT_MATRIX = {
  * @param {object} user        - User record (includes studentType, staffType)
  * @returns {string[]}
  */
-const resolveApprovalChain = (actorType, outpassType, user) => {
+export const resolveApprovalChain = (actorType, outpassType, user) => {
   if (actorType === 'STUDENT') {
     if (user.studentType === 'HOSTELLER' && outpassType) {
       return OUTPASS_APPROVAL_MATRIX[outpassType] || [];
@@ -56,23 +54,8 @@ const resolveApprovalChain = (actorType, outpassType, user) => {
 
 /**
  * Get all passes where the authenticated approver is the current pending step.
- *
- * The "current pending step" is the lowest-stepOrder ApprovalStep with status PENDING.
- * We match approver by role (and department for HOD matching).
- *
- * @param {string} approverId
- * @param {string} approverRole  - Role enum value from User
- * @param {string} department
  */
-const getPendingForApprover = async (approverId, approverRole, department) => {
-  // Map user Role to ApproverRole
-  const roleMap = {
-    TEACHER: 'CLASS_ADVISOR', // Default mapping; HOD determined by department
-    STAFF:   'WARDEN',
-    ADMIN:   'ADMIN',
-  };
-
-  // Collect all relevant ApproverRole values this user can fulfil
+export const getPendingForApprover = async (approverId, approverRole, department) => {
   const matchingApproverRoles = [];
   if (approverRole === 'TEACHER') {
     matchingApproverRoles.push('CLASS_ADVISOR');
@@ -88,7 +71,6 @@ const getPendingForApprover = async (approverId, approverRole, department) => {
 
   if (matchingApproverRoles.length === 0) return [];
 
-  // Find the minimum pending stepOrder per pass that matches this approver's roles
   const steps = await prisma.approvalStep.findMany({
     where: {
       approverRole: { in: matchingApproverRoles },
@@ -103,7 +85,6 @@ const getPendingForApprover = async (approverId, approverRole, department) => {
     orderBy: { stepOrder: 'asc' },
   });
 
-  // Filter: only return steps that are the *current* (minimum order) pending step for their pass
   const passStepMap = {};
   steps.forEach((step) => {
     const prev = passStepMap[step.passId];
@@ -119,7 +100,7 @@ const getPendingForApprover = async (approverId, approverRole, department) => {
  * Approve the current pending step for a pass.
  * If this was the last step, the pass becomes APPROVED and a QR is generated.
  */
-const approveStep = async ({ passId, approverId, approverRole, department, remarks }) => {
+export const approveStep = async ({ passId, approverId, approverRole, department, remarks }) => {
   const currentStep = await _findCurrentStep(passId, approverRole, department);
   if (!currentStep) return null;
 
@@ -133,7 +114,6 @@ const approveStep = async ({ passId, approverId, approverRole, department, remar
     },
   });
 
-  // Check if all steps are now approved
   const remainingSteps = await prisma.approvalStep.count({
     where: { passId, status: 'PENDING' },
   });
@@ -147,7 +127,6 @@ const approveStep = async ({ passId, approverId, approverRole, department, remar
     const pass = await prisma.gatePass.findUnique({ where: { id: passId }, include: { user: true } });
     qrToken = await qrService.generateQR(passId, pass.userId, pass.actorType, pass.outpassType);
 
-    // Notify the pass owner via WhatsApp
     if (pass.user && pass.user.parentPhone) {
       await notificationSvc.sendWhatsApp({
         to: pass.user.parentPhone,
@@ -168,7 +147,7 @@ const approveStep = async ({ passId, approverId, approverRole, department, remar
 /**
  * Reject a pass — terminates the approval chain immediately.
  */
-const rejectStep = async ({ passId, approverId, approverRole, department, remarks }) => {
+export const rejectStep = async ({ passId, approverId, approverRole, department, remarks }) => {
   const currentStep = await _findCurrentStep(passId, approverRole, department);
   if (!currentStep) return null;
 
@@ -198,9 +177,6 @@ const rejectStep = async ({ passId, approverId, approverRole, department, remark
 
 // ─── Internal Helpers ─────────────────────────────────────────────────────────
 
-/**
- * Find the current (lowest-order) pending step for a pass that this approver can act on.
- */
 const _findCurrentStep = async (passId, approverRole, department) => {
   const matchingRoles = _mapToApproverRoles(approverRole, department);
   if (matchingRoles.length === 0) return null;
@@ -220,11 +196,4 @@ const _mapToApproverRoles = (role, department) => {
     case 'ADMIN':   return ['ADMIN'];
     default:        return [];
   }
-};
-
-module.exports = {
-  resolveApprovalChain,
-  getPendingForApprover,
-  approveStep,
-  rejectStep,
 };

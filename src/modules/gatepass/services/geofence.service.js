@@ -1,8 +1,6 @@
-'use strict';
-
-const prisma          = require('../../../lib/prisma');
-const qrService       = require('./qr.service');
-const notificationSvc = require('./notification.service');
+import prisma from '../../../lib/prisma.js';
+import * as qrService from './qr.service.js';
+import * as notificationSvc from './notification.service.js';
 
 /**
  * Handle a campus geofence ENTRY event from the mobile app.
@@ -12,7 +10,7 @@ const notificationSvc = require('./notification.service');
  *
  * @param {{ userId, studentType, latitude, longitude }} params
  */
-const handleEntry = async ({ userId, studentType, latitude, longitude }) => {
+export const handleEntry = async ({ userId, studentType, latitude, longitude }) => {
   // Log the raw geofence event
   await prisma.geofenceEvent.create({
     data: {
@@ -63,7 +61,7 @@ const handleEntry = async ({ userId, studentType, latitude, longitude }) => {
  *
  * @param {{ userId, studentType, parentPhone, latitude, longitude }} params
  */
-const handleExit = async ({ userId, studentType, parentPhone, latitude, longitude }) => {
+export const handleExit = async ({ userId, studentType, parentPhone, latitude, longitude }) => {
   // Log the raw geofence event
   await prisma.geofenceEvent.create({
     data: {
@@ -86,5 +84,3 @@ const handleExit = async ({ userId, studentType, parentPhone, latitude, longitud
 
   return { message: 'Geofence exit logged' };
 };
-
-module.exports = { handleEntry, handleExit };

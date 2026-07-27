@@ -1,7 +1,5 @@
-'use strict';
-
-const geofenceService                   = require('../services/geofence.service');
-const { validateGeofenceEvent }         = require('../validators/geofence.validator');
+import * as geofenceService from '../services/geofence.service.js';
+import { validateGeofenceEvent } from '../validators/geofence.validator.js';
 
 /**
  * POST /api/gatepass/geofence/entry
@@ -10,7 +8,7 @@ const { validateGeofenceEvent }         = require('../validators/geofence.valida
  * - DAY_SCHOLAR → creates a 30-min QR, returns it to the app for display at gate.
  * - HOSTELLER / STAFF → logs the geofence event; no QR needed here.
  */
-const handleEntry = async (req, res) => {
+export const handleEntry = async (req, res) => {
   const payload = { ...req.body, userId: req.user.id };
   const { valid, errors } = validateGeofenceEvent(payload);
   if (!valid) {
@@ -38,7 +36,7 @@ const handleEntry = async (req, res) => {
  * - HOSTELLER with an approved outpass → sends WhatsApp notification to parent.
  * - Others → logs event only.
  */
-const handleExit = async (req, res) => {
+export const handleExit = async (req, res) => {
   const payload = { ...req.body, userId: req.user.id };
   const { valid, errors } = validateGeofenceEvent(payload);
   if (!valid) {
@@ -59,5 +57,3 @@ const handleExit = async (req, res) => {
     return res.status(500).json({ error: 'Failed to process geofence exit event' });
   }
 };
-
-module.exports = { handleEntry, handleExit };

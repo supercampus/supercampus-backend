@@ -1,14 +1,12 @@
-'use strict';
+import express from 'express';
+import passRoutes from './routes/pass.routes.js';
+import approvalRoutes from './routes/approval.routes.js';
+import qrRoutes from './routes/qr.routes.js';
+import scanRoutes from './routes/scan.routes.js';
+import geofenceRoutes from './routes/geofence.routes.js';
+import overrideRoutes from './routes/override.routes.js';
 
-const express = require('express');
 const router = express.Router();
-
-const passRoutes     = require('./routes/pass.routes');
-const approvalRoutes = require('./routes/approval.routes');
-const qrRoutes       = require('./routes/qr.routes');
-const scanRoutes     = require('./routes/scan.routes');
-const geofenceRoutes = require('./routes/geofence.routes');
-const overrideRoutes = require('./routes/override.routes');
 
 router.use('/passes',   passRoutes);
 router.use('/approvals', approvalRoutes);
@@ -17,4 +15,4 @@ router.use('/scan',     scanRoutes);
 router.use('/geofence', geofenceRoutes);
 router.use('/override', overrideRoutes);
 
-module.exports = router;
+export default router;

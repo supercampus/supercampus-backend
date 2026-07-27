@@ -1,5 +1,3 @@
-'use strict';
-
 /**
  * Notification Service — Meta Cloud API (WhatsApp Business)
  *
@@ -25,7 +23,7 @@ const META_API_BASE = `https://graph.facebook.com/${API_VERSION}/${PHONE_ID}/mes
  * @param {string[]} params.params       - Ordered list of body parameter values
  * @param {string}  [params.language]    - BCP-47 language code (default: 'en_US')
  */
-const sendWhatsApp = async ({ to, templateName, params = [], language = 'en_US' }) => {
+export const sendWhatsApp = async ({ to, templateName, params = [], language = 'en_US' }) => {
   if (!META_TOKEN || !PHONE_ID) {
     console.warn('[NotificationService] META_WHATSAPP_TOKEN or META_WHATSAPP_PHONE_ID not set — skipping WhatsApp send');
     return { skipped: true, reason: 'Missing Meta Cloud API credentials' };
@@ -80,7 +78,7 @@ const sendWhatsApp = async ({ to, templateName, params = [], language = 'en_US' 
  * @param {string} to      - Recipient phone (E.164)
  * @param {string} message - Plain text body
  */
-const sendTextMessage = async (to, message) => {
+export const sendTextMessage = async (to, message) => {
   if (!META_TOKEN || !PHONE_ID) {
     console.warn('[NotificationService] Missing credentials — skipping text message');
     return { skipped: true };
@@ -110,5 +108,3 @@ const sendTextMessage = async (to, message) => {
     return { success: false, error: err.message };
   }
 };
-
-module.exports = { sendWhatsApp, sendTextMessage };

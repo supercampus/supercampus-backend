@@ -1,13 +1,11 @@
-'use strict';
-
-const overrideService = require('../services/override.service');
+import * as overrideService from '../services/override.service.js';
 
 /**
  * POST /api/gatepass/override
  * Log a manual entry/exit when the QR system is down.
  * Body: { actorDesc: string, reason?: 'SYSTEM_DOWN'|'OTHER', photoUrl?: string }
  */
-const createOverride = async (req, res) => {
+export const createOverride = async (req, res) => {
   const { actorDesc, reason, photoUrl } = req.body;
   if (!actorDesc || actorDesc.trim().length === 0) {
     return res.status(400).json({ error: 'actorDesc is required' });
@@ -32,7 +30,7 @@ const createOverride = async (req, res) => {
  * List overrides pending admin review.
  * Query: ?page=1&limit=20&isReviewed=false
  */
-const listOverrides = async (req, res) => {
+export const listOverrides = async (req, res) => {
   const { page = 1, limit = 20, isReviewed } = req.query;
   try {
     const overrides = await overrideService.listOverrides({
@@ -51,7 +49,7 @@ const listOverrides = async (req, res) => {
  * PATCH /api/gatepass/override/:id/review
  * Admin marks an override as reviewed.
  */
-const reviewOverride = async (req, res) => {
+export const reviewOverride = async (req, res) => {
   const { id } = req.params;
   try {
     const override = await overrideService.reviewOverride(id, req.user.id);
@@ -62,5 +60,3 @@ const reviewOverride = async (req, res) => {
     return res.status(500).json({ error: 'Failed to review override' });
   }
 };
-
-module.exports = { createOverride, listOverrides, reviewOverride };

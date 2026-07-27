@@ -1,28 +1,36 @@
 {
-  "name": "express-template",
+  "name": "supercampus-backend",
   "version": "1.0.0",
-  "description": "Minimal Node.js and Express backend template",
+  "description": "SuperCampus API — Node.js / Express backend",
   "main": "src/server.js",
-  "type": "commonjs",
+  "type": "module",
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js",
-    "check": "node --check src/app.js && node --check src/server.js",
+    "dev": "node --watch src/server.js",
+    "db:migrate": "node src/migrate.js",
+    "db:verify": "node src/verify-db.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "test": "node --test"
   },
-  "keywords": [
-    "node",
-    "express",
-    "api"
-  ],
+  "keywords": ["node", "express", "api", "supercampus"],
   "license": "MIT",
   "dependencies": {
     "@prisma/client": "^6.4.1",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2",
-    "jsonwebtoken": "^9.0.3"
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.6.0",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.16.3",
+    "zod": "^4.0.10"
   },
   "devDependencies": {
     "nodemon": "^3.1.9",

@@ -1,5 +1,3 @@
-'use strict';
-
 /**
  * Pass input validators.
  * Plain validation helpers — swap for Joi/Zod when added as a dependency.
@@ -10,7 +8,7 @@
  * @param {object} body
  * @returns {{ valid: boolean, errors: string[] }}
  */
-const validateCreatePass = (body) => {
+export const validateCreatePass = (body) => {
   const errors = [];
   const validActorTypes   = ['STUDENT', 'STAFF', 'VISITOR'];
   const validOutpassTypes = ['DAY_OUT', 'HOME_VISIT', 'MEDICAL', 'EMERGENCY'];
@@ -43,9 +41,7 @@ const validateCreatePass = (body) => {
 /**
  * Validate cancel / delete payload — only needs a valid UUID passId (from params).
  */
-const validatePassId = (id) => {
+export const validatePassId = (id) => {
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   return uuidRegex.test(id);
 };
-
-module.exports = { validateCreatePass, validatePassId };

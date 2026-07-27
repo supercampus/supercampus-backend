@@ -1,8 +1,6 @@
-'use strict';
-
-const prisma          = require('../../../lib/prisma');
-const approvalService = require('./approval.service');
-const qrService       = require('./qr.service');
+import prisma from '../../../lib/prisma.js';
+import * as approvalService from './approval.service.js';
+import * as qrService from './qr.service.js';
 
 /**
  * Create a new gate pass and seed its approval steps.
@@ -10,7 +8,7 @@ const qrService       = require('./qr.service');
  * @param {string} userId - The requesting user's ID.
  * @param {object} data   - Validated request body.
  */
-const createPass = async (userId, data) => {
+export const createPass = async (userId, data) => {
   const {
     actorType,
     outpassType,
@@ -99,7 +97,7 @@ const createPass = async (userId, data) => {
  * List passes — scoped by role.
  * Admin / Security see all; Students / Staff see only their own.
  */
-const listPasses = async ({ requesterId, requesterRole, status, actorType, page, limit }) => {
+export const listPasses = async ({ requesterId, requesterRole, status, actorType, page, limit }) => {
   const skip = (page - 1) * limit;
   const where = {};
 
@@ -127,7 +125,7 @@ const listPasses = async ({ requesterId, requesterRole, status, actorType, page,
  * Get a single pass with its full approval chain.
  * Non-admin users can only see their own passes.
  */
-const getPassById = async (passId, requesterId, requesterRole) => {
+export const getPassById = async (passId, requesterId, requesterRole) => {
   const pass = await prisma.gatePass.findUnique({
     where: { id: passId },
     include: {
@@ -152,7 +150,7 @@ const getPassById = async (passId, requesterId, requesterRole) => {
  * Cancel a pending pass (owner only).
  * Returns null if not found, false if not cancellable, true on success.
  */
-const cancelPass = async (passId, userId) => {
+export const cancelPass = async (passId, userId) => {
   const pass = await prisma.gatePass.findUnique({ where: { id: passId } });
   if (!pass) return null;
   if (pass.userId !== userId || pass.status !== 'PENDING') return false;
@@ -164,5 +162,3 @@ const cancelPass = async (passId, userId) => {
 
   return true;
 };
-
-module.exports = { createPass, listPasses, getPassById, cancelPass };

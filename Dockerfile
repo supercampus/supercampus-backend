@@ -16,4 +16,4 @@ HEALTHCHECK --interval=30s --timeout=8s --start-period=30s --retries=3 CMD node 
 
 USER node
 
-CMD ["node", "src/server.js"]
+CMD node src/migrate.js && node src/server.js

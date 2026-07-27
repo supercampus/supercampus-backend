@@ -25,7 +25,7 @@ ALTER TABLE students ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT
 UPDATE students
 SET tenant_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
     email = 'arun.kumar@svce.edu.in',
-    password_hash = '$2b$12$MJVUf5IF0ZvPPw3HkZxWhuat1fdlyiPr6VlHQAeTLnp4mktZXHWqa'
+    password_hash = '$2b$12$d5PO6lSBKJ4L.wsKi/Mo9.P0WYkSZYxFkoTKgZZ.z83F0rvEQ4Ytu'
 WHERE id = '11111111-1111-4111-8111-111111111111';
 
 ALTER TABLE students ALTER COLUMN tenant_id SET NOT NULL;
@@ -43,7 +43,7 @@ INSERT INTO students (
   'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
   '23CS102',
   'priya.sharma@rec.edu.in',
-  '$2b$12$7SvJuERvvyEmDnIKLER1SO.omR/0g29VnCBQ8m1jhFWdeVVibB75q',
+  '$2b$12$Pi96zpZNaz5LgsGJYf9UhudoDlZnX6XUlMFbLB6/utZMTDDlUOvla',
   'Priya Sharma',
   'PS',
   'REC',

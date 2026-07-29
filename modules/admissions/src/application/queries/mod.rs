@@ -1,0 +1,1 @@
+//! Admissions read use cases.

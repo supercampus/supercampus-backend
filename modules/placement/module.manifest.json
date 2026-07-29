@@ -1,0 +1,22 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "placement",
+    "name":  "Placement",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-placement",
+    "permissions":  [
+                        "placement.read",
+                        "placement.create",
+                        "placement.update",
+                        "placement.configure",
+                        "placement.reports.read"
+                    ],
+    "capabilities":  [
+                         "employers",
+                         "drives",
+                         "jobs",
+                         "applications",
+                         "offers",
+                         "reports"
+                     ]
+}

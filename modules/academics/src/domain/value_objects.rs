@@ -1,0 +1,1 @@
+//! Validated Academics value objects.

@@ -1,0 +1,1 @@
+//! Academics domain errors.

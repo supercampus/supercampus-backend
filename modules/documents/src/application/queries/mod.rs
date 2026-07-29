@@ -1,0 +1,1 @@
+//! Documents read use cases.

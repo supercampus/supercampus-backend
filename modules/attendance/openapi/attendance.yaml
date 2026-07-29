@@ -1,0 +1,10 @@
+openapi: 3.1.0
+info:
+  title: SuperCampus Attendance API
+  version: 0.1.0
+paths:
+  /api/v1/attendance:
+    get:
+      operationId: listAttendanceModule
+      responses:
+        "200": { description: Tenant-filtered Attendance records }

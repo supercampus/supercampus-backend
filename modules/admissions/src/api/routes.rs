@@ -1,0 +1,1 @@
+//! Admissions Axum route registration.

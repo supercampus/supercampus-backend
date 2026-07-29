@@ -1,0 +1,10 @@
+openapi: 3.1.0
+info:
+  title: SuperCampus Library API
+  version: 0.1.0
+paths:
+  /api/v1/library:
+    get:
+      operationId: listLibraryModule
+      responses:
+        "200": { description: Tenant-filtered Library records }

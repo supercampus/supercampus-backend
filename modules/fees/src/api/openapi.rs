@@ -1,0 +1,1 @@
+//! Fees OpenAPI registration.

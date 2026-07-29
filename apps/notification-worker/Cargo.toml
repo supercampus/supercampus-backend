@@ -1,0 +1,9 @@
+[package]
+name = "supercampus-notification-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+supercampus-observability.workspace = true

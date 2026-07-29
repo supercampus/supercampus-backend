@@ -1,19 +1,18 @@
-FROM node:22-alpine
+FROM rust:1.97-bookworm AS builder
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+COPY . .
+RUN cargo build --release -p supercampus-platform-api
 
-COPY prisma ./prisma
-RUN npx prisma generate
-
-COPY src ./src
-
-ENV NODE_ENV=production
-ENV PORT=4000
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --create-home supercampus
+WORKDIR /app
+COPY --from=builder /app/target/release/supercampus-platform-api /usr/local/bin/supercampus-platform-api
+ENV HTTP_HOST=0.0.0.0
+ENV HTTP_PORT=4000
+USER supercampus
 EXPOSE 4000
-
-HEALTHCHECK --interval=30s --timeout=8s --start-period=30s --retries=3 CMD node -e "fetch('http://127.0.0.1:4000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
-
-USER node
-
-CMD node src/migrate.js && node src/server.js
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD curl --fail http://127.0.0.1:4000/health || exit 1
+ENTRYPOINT ["supercampus-platform-api"]

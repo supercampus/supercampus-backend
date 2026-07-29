@@ -1,0 +1,1 @@
+//! Placement Axum route registration.

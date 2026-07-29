@@ -1,0 +1,1 @@
+//! Placement domain errors.

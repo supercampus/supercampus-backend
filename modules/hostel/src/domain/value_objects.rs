@@ -1,0 +1,1 @@
+//! Validated Hostel value objects.

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["tenantId", "namespace", "key", "version", "value"],
+  "properties": {
+    "tenantId": { "type": "string", "format": "uuid" },
+    "namespace": { "type": "string" },
+    "key": { "type": "string" },
+    "version": { "type": "integer", "minimum": 1 },
+    "value": { "type": "object" }
+  }
+}

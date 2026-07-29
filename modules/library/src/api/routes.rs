@@ -1,0 +1,1 @@
+//! Library Axum route registration.

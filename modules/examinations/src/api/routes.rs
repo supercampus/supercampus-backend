@@ -1,0 +1,1 @@
+//! Examinations Axum route registration.

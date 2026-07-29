@@ -1,0 +1,1 @@
+//! Versioned Fees domain events.

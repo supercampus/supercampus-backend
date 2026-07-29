@@ -1,0 +1,1 @@
+//! Fees Axum route registration.

@@ -1,0 +1,10 @@
+openapi: 3.1.0
+info:
+  title: SuperCampus Fees API
+  version: 0.1.0
+paths:
+  /api/v1/fees:
+    get:
+      operationId: listFeesModule
+      responses:
+        "200": { description: Tenant-filtered Fees records }

@@ -1,0 +1,1 @@
+//! CRM OpenAPI registration.

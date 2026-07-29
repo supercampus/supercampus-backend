@@ -1,0 +1,1 @@
+//! Versioned Hostel domain events.

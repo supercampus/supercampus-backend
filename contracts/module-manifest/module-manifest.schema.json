@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SuperCampus backend module manifest",
+  "type": "object",
+  "required": ["key", "name", "version", "backendCrate", "permissions", "capabilities"],
+  "properties": {
+    "key": {
+      "enum": ["crm", "admissions", "academics", "attendance", "documents", "examinations", "fees", "gatepass", "hostel", "library", "placement", "transport"]
+    },
+    "name": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "backendCrate": { "type": "string", "pattern": "^supercampus-[a-z][a-z0-9-]*$" },
+    "permissions": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "capabilities": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "seededPipelines": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,23 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "admissions",
+    "name":  "Admissions",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-admissions",
+    "permissions":  [
+                        "admissions.read",
+                        "admissions.create",
+                        "admissions.update",
+                        "admissions.configure",
+                        "admissions.reports.read"
+                    ],
+    "capabilities":  [
+                         "applications",
+                         "applicants",
+                         "programs",
+                         "intakes",
+                         "counseling",
+                         "offers",
+                         "enrollment"
+                     ]
+}

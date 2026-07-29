@@ -1,0 +1,21 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "attendance",
+    "name":  "Attendance",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-attendance",
+    "permissions":  [
+                        "attendance.read",
+                        "attendance.create",
+                        "attendance.update",
+                        "attendance.configure",
+                        "attendance.reports.read"
+                    ],
+    "capabilities":  [
+                         "sessions",
+                         "records",
+                         "policies",
+                         "exceptions",
+                         "reports"
+                     ]
+}

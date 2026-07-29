@@ -1,0 +1,22 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "academics",
+    "name":  "Academics",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-academics",
+    "permissions":  [
+                        "academics.read",
+                        "academics.create",
+                        "academics.update",
+                        "academics.configure",
+                        "academics.reports.read"
+                    ],
+    "capabilities":  [
+                         "programs",
+                         "courses",
+                         "curriculum",
+                         "classes",
+                         "faculty",
+                         "timetable"
+                     ]
+}

@@ -1,0 +1,21 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "documents",
+    "name":  "Documents",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-documents",
+    "permissions":  [
+                        "documents.read",
+                        "documents.create",
+                        "documents.update",
+                        "documents.configure",
+                        "documents.reports.read"
+                    ],
+    "capabilities":  [
+                         "files",
+                         "folders",
+                         "templates",
+                         "verification",
+                         "retention"
+                     ]
+}

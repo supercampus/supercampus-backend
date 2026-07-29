@@ -1,0 +1,17 @@
+[package]
+name = "supercampus-crm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+supercampus-kernel.workspace = true
+supercampus-module-sdk.workspace = true

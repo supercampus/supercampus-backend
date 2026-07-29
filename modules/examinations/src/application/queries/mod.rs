@@ -1,0 +1,1 @@
+//! Examinations read use cases.

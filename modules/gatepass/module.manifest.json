@@ -1,0 +1,22 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "gatepass",
+    "name":  "Gate Pass",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-gatepass",
+    "permissions":  [
+                        "gatepass.read",
+                        "gatepass.create",
+                        "gatepass.update",
+                        "gatepass.configure",
+                        "gatepass.reports.read"
+                    ],
+    "capabilities":  [
+                         "passes",
+                         "approvals",
+                         "qr",
+                         "scans",
+                         "geofences",
+                         "overrides"
+                     ]
+}

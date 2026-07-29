@@ -1,0 +1,10 @@
+openapi: 3.1.0
+info:
+  title: SuperCampus Examinations API
+  version: 0.1.0
+paths:
+  /api/v1/examinations:
+    get:
+      operationId: listExaminationsModule
+      responses:
+        "200": { description: Tenant-filtered Examinations records }

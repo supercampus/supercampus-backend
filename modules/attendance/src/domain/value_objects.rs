@@ -1,0 +1,1 @@
+//! Validated Attendance value objects.

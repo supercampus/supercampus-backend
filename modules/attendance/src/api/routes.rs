@@ -1,0 +1,1 @@
+//! Attendance Axum route registration.

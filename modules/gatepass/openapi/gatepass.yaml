@@ -1,0 +1,10 @@
+openapi: 3.1.0
+info:
+  title: SuperCampus Gate Pass API
+  version: 0.1.0
+paths:
+  /api/v1/gatepass:
+    get:
+      operationId: listGatepassModule
+      responses:
+        "200": { description: Tenant-filtered Gate Pass records }

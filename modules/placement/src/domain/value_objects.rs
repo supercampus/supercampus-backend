@@ -1,0 +1,1 @@
+//! Validated Placement value objects.

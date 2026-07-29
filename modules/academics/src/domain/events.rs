@@ -1,0 +1,1 @@
+//! Versioned Academics domain events.

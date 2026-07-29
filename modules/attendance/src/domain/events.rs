@@ -1,0 +1,1 @@
+//! Versioned Attendance domain events.

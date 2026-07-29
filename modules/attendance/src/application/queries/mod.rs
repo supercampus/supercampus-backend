@@ -1,0 +1,1 @@
+//! Attendance read use cases.

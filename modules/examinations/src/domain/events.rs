@@ -1,0 +1,1 @@
+//! Versioned Examinations domain events.

@@ -1,0 +1,22 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "hostel",
+    "name":  "Hostel",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-hostel",
+    "permissions":  [
+                        "hostel.read",
+                        "hostel.create",
+                        "hostel.update",
+                        "hostel.configure",
+                        "hostel.reports.read"
+                    ],
+    "capabilities":  [
+                         "buildings",
+                         "rooms",
+                         "allocations",
+                         "residents",
+                         "visitors",
+                         "maintenance"
+                     ]
+}

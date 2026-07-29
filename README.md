@@ -1,22 +1,34 @@
-# Express Template
+# SuperCampus backend
 
-Minimal Node.js and Express backend template.
+Rust backend workspace for the configuration-driven SuperCampus platform. Shared
+crates provide identity, tenancy, authorization, metadata, workflows, rules,
+events, audit, storage, observability, and module lifecycle services. Independent
+domain crates provide CRM, Admissions, Academics, Attendance, Documents,
+Examinations, Fees, Gate Pass, Hostel, Library, Placement, and Transport.
 
-## Setup
+## Prerequisites
+
+- Rust 1.97.1 or newer, selected from `rust-toolchain.toml`
+- PostgreSQL 16+
+
+## Local development
 
 ```bash
-npm install
 cp .env.example .env
-npm run dev
+cargo run -p supercampus-platform-api
 ```
 
-## Scripts
+The first Cargo build generates `Cargo.lock`; commit it so production dependency
+resolution remains reproducible. The API listens on `127.0.0.1:4000` by default.
+Verify with `GET /health` and `GET /api/v1/modules`. Endpoint details and local login credentials are documented in [`docs/api.md`](docs/api.md).
 
-- `npm start` starts the server.
-- `npm run dev` starts the server with nodemon.
-- `npm run check` validates JavaScript syntax.
+## Quality checks
 
-## Endpoints
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
 
-- `GET /` returns a basic API message.
-- `GET /health` returns service health.
+This is a Rust-only repository. Do not add `package.json`, `package-lock.json`,
+`node_modules`, Prisma, or Node runtime code to the backend.

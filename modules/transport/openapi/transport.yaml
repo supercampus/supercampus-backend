@@ -1,0 +1,10 @@
+openapi: 3.1.0
+info:
+  title: SuperCampus Transport API
+  version: 0.1.0
+paths:
+  /api/v1/transport:
+    get:
+      operationId: listTransportModule
+      responses:
+        "200": { description: Tenant-filtered Transport records }

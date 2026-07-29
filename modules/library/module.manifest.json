@@ -1,0 +1,22 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "library",
+    "name":  "Library",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-library",
+    "permissions":  [
+                        "library.read",
+                        "library.create",
+                        "library.update",
+                        "library.configure",
+                        "library.reports.read"
+                    ],
+    "capabilities":  [
+                         "catalog",
+                         "copies",
+                         "loans",
+                         "holds",
+                         "members",
+                         "fines"
+                     ]
+}

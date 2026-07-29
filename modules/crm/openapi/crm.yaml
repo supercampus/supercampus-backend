@@ -1,0 +1,14 @@
+openapi: 3.1.0
+info:
+  title: SuperCampus CRM API
+  version: 0.1.0
+paths:
+  /api/v1/crm/leads:
+    get:
+      operationId: listCrmLeads
+      responses:
+        "200": { description: Tenant-filtered CRM leads }
+    post:
+      operationId: createCrmLead
+      responses:
+        "201": { description: CRM lead created }

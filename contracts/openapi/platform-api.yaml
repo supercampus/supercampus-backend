@@ -1,0 +1,134 @@
+openapi: 3.1.0
+info:
+  title: SuperCampus Platform API
+  version: 0.1.0
+  description: Local boilerplate contracts for platform services and domain modules.
+servers:
+  - url: http://127.0.0.1:4000
+paths:
+  /health:
+    get:
+      operationId: platformHealth
+      responses:
+        "200": { description: Service is healthy }
+  /ready:
+    get:
+      operationId: platformReady
+      responses:
+        "200": { description: Service is ready }
+  /api/v1/bootstrap:
+    get:
+      operationId: getBootstrap
+      responses:
+        "200": { description: Runtime bootstrap document }
+  /api/v1/services:
+    get:
+      operationId: listServices
+      responses:
+        "200": { description: Platform service catalog }
+  /api/v1/services/{serviceKey}:
+    get:
+      operationId: getService
+      parameters:
+        - { name: serviceKey, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Platform service descriptor }
+        "404": { description: Unknown service }
+  /api/v1/modules:
+    get:
+      operationId: listModules
+      responses:
+        "200": { description: Registered domain modules }
+  /api/v1/modules/{moduleKey}:
+    get:
+      operationId: getModule
+      parameters:
+        - { name: moduleKey, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Module descriptor }
+        "404": { description: Unknown module }
+  /api/v1/configuration/{namespace}:
+    get:
+      operationId: getConfiguration
+      parameters:
+        - { name: namespace, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Active configuration document }
+        "404": { description: Configuration not found }
+    put:
+      operationId: putConfiguration
+      parameters:
+        - { name: namespace, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [value], properties: { value: {} } }
+      responses:
+        "200": { description: New configuration version }
+  /api/v1/{moduleKey}/records:
+    get:
+      operationId: listModuleRecords
+      parameters:
+        - { name: moduleKey, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Tenant-filtered records }
+    post:
+      operationId: createModuleRecord
+      parameters:
+        - { name: moduleKey, in: path, required: true, schema: { type: string } }
+      responses:
+        "201": { description: Record created }
+  /api/v1/{moduleKey}/records/{recordId}:
+    get:
+      operationId: getModuleRecord
+      parameters:
+        - { name: moduleKey, in: path, required: true, schema: { type: string } }
+        - { name: recordId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Module record }
+    patch:
+      operationId: updateModuleRecord
+      parameters:
+        - { name: moduleKey, in: path, required: true, schema: { type: string } }
+        - { name: recordId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Record updated }
+    delete:
+      operationId: deleteModuleRecord
+      parameters:
+        - { name: moduleKey, in: path, required: true, schema: { type: string } }
+        - { name: recordId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: Record deleted }
+  /api/auth/tenants:
+    get:
+      operationId: listAuthTenants
+      responses:
+        "200": { description: Available tenants }
+  /api/auth/login:
+    post:
+      operationId: login
+      responses:
+        "200": { description: Local development session created }
+        "401": { description: Invalid credentials }
+  /api/auth/me:
+    get:
+      operationId: getSession
+      responses:
+        "200": { description: Current authenticated student }
+        "401": { description: Authentication required }
+  /api/auth/logout:
+    post:
+      operationId: logout
+      responses:
+        "204": { description: Session revoked }
+  /api/state:
+    get:
+      operationId: getAppState
+      responses:
+        "200": { description: Student application state }
+    put:
+      operationId: saveAppState
+      responses:
+        "200": { description: Student application state saved }

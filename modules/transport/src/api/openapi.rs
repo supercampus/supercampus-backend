@@ -1,0 +1,1 @@
+//! Transport OpenAPI registration.

@@ -1,0 +1,1 @@
+//! Versioned Admissions domain events.

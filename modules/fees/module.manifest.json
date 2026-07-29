@@ -1,0 +1,22 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "fees",
+    "name":  "Fees",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-fees",
+    "permissions":  [
+                        "fees.read",
+                        "fees.create",
+                        "fees.update",
+                        "fees.configure",
+                        "fees.reports.read"
+                    ],
+    "capabilities":  [
+                         "fee-plans",
+                         "invoices",
+                         "payments",
+                         "refunds",
+                         "scholarships",
+                         "reports"
+                     ]
+}

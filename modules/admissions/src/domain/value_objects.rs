@@ -1,0 +1,1 @@
+//! Validated Admissions value objects.

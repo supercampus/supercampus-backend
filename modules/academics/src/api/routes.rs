@@ -1,0 +1,1 @@
+//! Academics Axum route registration.

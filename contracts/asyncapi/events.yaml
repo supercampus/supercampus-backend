@@ -1,0 +1,12 @@
+asyncapi: 3.0.0
+info:
+  title: SuperCampus domain events
+  version: 0.1.0
+channels:
+  crmLeadEvents:
+    address: supercampus.crm.leads
+    messages:
+      leadChanged:
+        payload:
+          type: object
+          required: [tenantId, eventType, aggregateId, occurredAt]

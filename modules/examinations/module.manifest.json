@@ -1,0 +1,21 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "examinations",
+    "name":  "Examinations",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-examinations",
+    "permissions":  [
+                        "examinations.read",
+                        "examinations.create",
+                        "examinations.update",
+                        "examinations.configure",
+                        "examinations.reports.read"
+                    ],
+    "capabilities":  [
+                         "assessments",
+                         "schedules",
+                         "grading",
+                         "results",
+                         "transcripts"
+                     ]
+}

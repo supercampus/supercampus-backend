@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: supercampus
+      POSTGRES_USER: supercampus
+      POSTGRES_PASSWORD: supercampus-local
+    ports: ["5432:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supercampus"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 4000
+      DATABASE_URL: postgresql://supercampus:supercampus-local@postgres:5432/supercampus
+      RUST_LOG: info
+    ports: ["4000:4000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

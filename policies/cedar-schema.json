@@ -1,0 +1,16 @@
+{
+  "SuperCampus": {
+    "entityTypes": {
+      "User": { "memberOfTypes": ["Role"] },
+      "Role": {},
+      "Tenant": {},
+      "Campus": {},
+      "Department": {},
+      "CrmLead": { "shape": { "type": "Record", "attributes": { "tenantId": { "type": "String", "required": true } } } }
+    },
+    "actions": {
+      "crm.leads.read": { "appliesTo": { "principalTypes": ["User"], "resourceTypes": ["CrmLead"] } },
+      "crm.leads.update": { "appliesTo": { "principalTypes": ["User"], "resourceTypes": ["CrmLead"] } }
+    }
+  }
+}

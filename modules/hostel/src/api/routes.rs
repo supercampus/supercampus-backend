@@ -1,0 +1,1 @@
+//! Hostel Axum route registration.

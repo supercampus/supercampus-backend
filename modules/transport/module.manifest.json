@@ -1,0 +1,22 @@
+{
+    "$schema":  "../../contracts/module-manifest/module-manifest.schema.json",
+    "key":  "transport",
+    "name":  "Transport",
+    "version":  "0.1.0",
+    "backendCrate":  "supercampus-transport",
+    "permissions":  [
+                        "transport.read",
+                        "transport.create",
+                        "transport.update",
+                        "transport.configure",
+                        "transport.reports.read"
+                    ],
+    "capabilities":  [
+                         "routes",
+                         "vehicles",
+                         "stops",
+                         "assignments",
+                         "tracking",
+                         "maintenance"
+                     ]
+}

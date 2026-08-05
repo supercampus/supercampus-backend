@@ -6,6 +6,7 @@ CREATE SCHEMA IF NOT EXISTS identity;
 CREATE TABLE IF NOT EXISTS platform.tenants (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     slug text NOT NULL UNIQUE,
+    code text NOT NULL DEFAULT 'LOCAL',
     name text NOT NULL,
     status text NOT NULL DEFAULT 'active',
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -53,6 +54,6 @@ CREATE TABLE IF NOT EXISTS identity.ui_states (
     PRIMARY KEY (tenant_id, user_id)
 );
 
-INSERT INTO platform.tenants (slug, name)
-VALUES ('tenant-local', 'SuperCampus Local')
+INSERT INTO platform.tenants (slug, code, name)
+VALUES ('tenant-local', 'LOCAL', 'SuperCampus Local')
 ON CONFLICT (slug) DO NOTHING;

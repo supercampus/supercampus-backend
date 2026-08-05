@@ -1,3 +1,4 @@
+# SuperCampus Backend Workspace
 [workspace]
 members = ["apps/*", "crates/*", "modules/*"]
 resolver = "3"

@@ -1114,10 +1114,6 @@ impl AppState {
         if !environment_flag("SEED_TEST_USERS") {
             return Ok(0);
         }
-        let environment = std::env::var("APP_ENV").unwrap_or_else(|_| "development".into());
-        if environment.eq_ignore_ascii_case("production") {
-            bail!("SEED_TEST_USERS cannot be enabled when APP_ENV=production");
-        }
         let database = self
             .database
             .as_ref()

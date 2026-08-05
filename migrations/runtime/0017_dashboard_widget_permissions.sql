@@ -56,8 +56,8 @@ ON CONFLICT (tenant_id, permission_key) DO UPDATE SET
 -- already hold the legacy functional permission gating that widget today.
 INSERT INTO authz.role_permissions
     (tenant_id, role_id, permission_key, scope, granted_by)
-SELECT grant.tenant_id, grant.role_id, widget.permission_key, 'all', 'migration-0017'
-FROM authz.role_permissions AS grant
+SELECT rp.tenant_id, rp.role_id, widget.permission_key, 'all', 'migration-0017'
+FROM authz.role_permissions AS rp
 JOIN (VALUES
     ('crm.assignment.read', 'dashboard.counselor_sla.read'),
     ('crm.assignment.read', 'dashboard.track_team.read'),
@@ -66,7 +66,7 @@ JOIN (VALUES
     ('crm.erp.handoff', 'dashboard.fee_readiness.read'),
     ('crm.reports.read', 'dashboard.source_quality.read')
 ) AS widget(legacy_key, permission_key)
-    ON widget.legacy_key = grant.permission_key
+    ON widget.legacy_key = rp.permission_key
 ON CONFLICT (tenant_id, role_id, permission_key) DO NOTHING;
 
 -- Default per-tenant dashboard definition. Ungated widgets keep

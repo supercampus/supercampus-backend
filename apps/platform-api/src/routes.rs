@@ -1,21 +1,26 @@
+use std::collections::HashSet;
+
 use axum::{
-    Json, Router,
-    extract::{Path, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::IntoResponse,
-    routing::{get, post},
+    Extension, Json, Router,
+    extract::{Path, Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
+    middleware::Next,
+    response::{IntoResponse, Response},
+    routing::{get, post, put},
 };
+use chrono::Utc;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     error::{ApiError, ApiResult},
     models::{
-        ApiResponse, BootstrapDocument, CreateRecordRequest, HealthDocument, LoginData,
-        LoginRequest, NavigationItem, PutConfigurationRequest, SaveAppStateRequest,
-        UpdateRecordRequest,
+        ApiResponse, AssignUserRolesRequest, BootstrapDocument, CreateAuthorizationRoleRequest,
+        CreateRecordRequest, CreateTenantUserRequest, HealthDocument, LoginData, LoginRequest,
+        NavigationItem, PutConfigurationRequest, SaveAppStateRequest, SessionData,
+        SetRolePermissionsRequest, UpdateAuthorizationRoleRequest, UpdateRecordRequest,
     },
-    state::AppState,
+    state::{AppState, AuthPrincipal, CreatedAuthSession, EffectiveAccess, RefreshSessionResult},
 };
 
 pub fn router(state: AppState) -> Router {
@@ -27,9 +32,34 @@ pub fn router(state: AppState) -> Router {
         .route("/modules", get(list_modules))
         .route("/modules/{module_key}", get(get_module))
         .route(
+            "/authorization/permissions",
+            get(list_authorization_permissions),
+        )
+        .route(
+            "/authorization/roles",
+            get(list_authorization_roles).post(create_authorization_role),
+        )
+        .route(
+            "/authorization/roles/{role_id}",
+            put(update_authorization_role).delete(delete_authorization_role),
+        )
+        .route(
+            "/authorization/roles/{role_id}/permissions",
+            put(set_authorization_role_permissions),
+        )
+        .route(
+            "/authorization/users",
+            get(list_tenant_users).post(create_tenant_user),
+        )
+        .route(
+            "/authorization/users/{user_id}/roles",
+            put(assign_tenant_user_roles),
+        )
+        .route(
             "/configuration/{namespace}",
             get(get_configuration).put(put_configuration),
         )
+        .route("/dashboard/effective", get(get_effective_dashboard))
         .route(
             "/{module_key}/records",
             get(list_records).post(create_record),
@@ -40,8 +70,8 @@ pub fn router(state: AppState) -> Router {
         );
 
     let api = Router::new()
-        .route("/auth/tenants", get(list_tenants))
         .route("/auth/login", post(login))
+        .route("/auth/refresh", post(refresh))
         .route("/auth/me", get(me))
         .route("/auth/logout", post(logout))
         .route("/state", get(get_app_state).put(save_app_state))
@@ -98,53 +128,281 @@ async fn get_service(
 
 async fn bootstrap(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
 ) -> ApiResult<Json<ApiResponse<BootstrapDocument>>> {
-    let tenant_id = tenant_id(&headers);
-    let user_id = match session_token(&headers) {
-        Some(token) => state
-            .session(&token)
-            .await?
-            .map_or_else(|| "anonymous-local".into(), |student| student.id),
-        None => "anonymous-local".into(),
-    };
-    let modules = state.modules();
+    let modules = state
+        .modules()
+        .into_iter()
+        .filter(|module| can_access_module(&access, &module.key))
+        .collect::<Vec<_>>();
     let navigation = modules
         .iter()
-        .map(|module| NavigationItem {
-            id: module.key.clone(),
-            label: module.name.clone(),
-            route: format!("/dashboard/{}", module.key),
-            required_permission: format!("{}.read", module.key),
+        .filter_map(|module| {
+            module_read_permission(&access, &module.key).map(|required_permission| NavigationItem {
+                id: module.key.clone(),
+                label: module.name.clone(),
+                route: format!("/dashboard/{}", module.key),
+                required_permission,
+            })
         })
         .collect();
     Ok(Json(ApiResponse::new(BootstrapDocument {
-        tenant_id,
-        user_id,
+        tenant_id: principal.student.tenant_id,
+        user_id: principal.student.id,
+        roles: access.roles,
+        permissions: access.permissions,
+        permission_scopes: access.scopes,
         services: state.services(),
         modules,
         navigation,
     })))
 }
 
-async fn list_modules(State(state): State<AppState>) -> Json<ApiResponse<Value>> {
-    Json(ApiResponse::new(json!(state.modules())))
+async fn list_modules(
+    State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> Json<ApiResponse<Value>> {
+    let modules = state
+        .modules()
+        .into_iter()
+        .filter(|module| can_access_module(&access, &module.key))
+        .collect::<Vec<_>>();
+    Json(ApiResponse::new(json!(modules)))
 }
 
 async fn get_module(
     State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
     Path(module_key): Path<String>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     let module = ensure_module(&state, &module_key)?;
+    if !can_access_module(&access, &module_key) {
+        return Err(ApiError::Forbidden);
+    }
     Ok(Json(ApiResponse::new(json!(module))))
+}
+
+async fn list_authorization_permissions(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "authorization.permissions.read")?;
+    Ok(Json(ApiResponse::new(
+        state
+            .authorization_permissions(&principal.student.tenant_id)
+            .await?,
+    )))
+}
+
+async fn list_authorization_roles(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "authorization.roles.read")?;
+    Ok(Json(ApiResponse::new(
+        state
+            .authorization_roles(&principal.student.tenant_id)
+            .await?,
+    )))
+}
+
+async fn create_authorization_role(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(request): Json<CreateAuthorizationRoleRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require_effective_permission(&access, "authorization.roles.create")?;
+    if request.name.trim().is_empty() || !valid_role_key(&request.key) {
+        return Err(ApiError::BadRequest(
+            "name is required and key must use lowercase letters, numbers, or underscores".into(),
+        ));
+    }
+    let role = state
+        .create_authorization_role(
+            &principal.student.tenant_id,
+            &principal.student.id,
+            &request,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(role))))
+}
+
+async fn update_authorization_role(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(role_id): Path<Uuid>,
+    Json(request): Json<UpdateAuthorizationRoleRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "authorization.roles.update")?;
+    Ok(Json(ApiResponse::new(
+        state
+            .update_authorization_role(
+                &principal.student.tenant_id,
+                &principal.student.id,
+                role_id,
+                &request,
+            )
+            .await?,
+    )))
+}
+
+async fn delete_authorization_role(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(role_id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    require_effective_permission(&access, "authorization.roles.delete")?;
+    state
+        .delete_authorization_role(&principal.student.tenant_id, &principal.student.id, role_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_authorization_role_permissions(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(role_id): Path<Uuid>,
+    Json(request): Json<SetRolePermissionsRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "authorization.roles.update")?;
+    if request
+        .permissions
+        .iter()
+        .any(|grant| !matches!(grant.scope.as_str(), "all" | "assigned" | "own"))
+    {
+        return Err(ApiError::BadRequest(
+            "permission scope must be all, assigned, or own".into(),
+        ));
+    }
+    let mut permission_keys = HashSet::new();
+    if request.permissions.iter().any(|grant| {
+        let key = grant.key.trim();
+        key.is_empty() || !permission_keys.insert(key.to_owned())
+    }) {
+        return Err(ApiError::BadRequest(
+            "permission keys must be non-empty and unique".into(),
+        ));
+    }
+    let permission_keys = permission_keys.into_iter().collect::<Vec<_>>();
+    if !state
+        .authorization_permission_keys_exist(&principal.student.tenant_id, &permission_keys)
+        .await?
+    {
+        return Err(ApiError::BadRequest(
+            "one or more permissions are inactive or do not belong to this tenant".into(),
+        ));
+    }
+    Ok(Json(ApiResponse::new(
+        state
+            .set_authorization_role_permissions(
+                &principal.student.tenant_id,
+                &principal.student.id,
+                role_id,
+                &request.permissions,
+            )
+            .await?,
+    )))
+}
+
+async fn list_tenant_users(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "authorization.users.read")?;
+    Ok(Json(ApiResponse::new(
+        state.tenant_users(&principal.student.tenant_id).await?,
+    )))
+}
+
+async fn create_tenant_user(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(request): Json<CreateTenantUserRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require_effective_permission(&access, "authorization.users.create")?;
+    if request.name.trim().is_empty()
+        || !request.email.contains('@')
+        || request.role_ids.is_empty()
+        || request
+            .temporary_password
+            .as_ref()
+            .is_some_and(|password| password.len() < 12)
+    {
+        return Err(ApiError::BadRequest(
+            "name, valid email, at least one role, and a 12-character temporary password are required".into(),
+        ));
+    }
+    let user = state
+        .create_tenant_user(
+            &principal.student.tenant_id,
+            &principal.student.id,
+            &request,
+        )
+        .await?
+        .ok_or_else(|| {
+            ApiError::Conflict(
+                "a user with this email already belongs to the tenant; assign roles to the existing user instead".into(),
+            )
+        })?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(user))))
+}
+
+async fn assign_tenant_user_roles(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(user_id): Path<Uuid>,
+    Json(request): Json<AssignUserRolesRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "authorization.users.update")?;
+    if request.role_ids.is_empty() {
+        return Err(ApiError::BadRequest("at least one role is required".into()));
+    }
+    Ok(Json(ApiResponse::new(
+        state
+            .assign_tenant_user_roles(
+                &principal.student.tenant_id,
+                &principal.student.id,
+                user_id,
+                &request,
+            )
+            .await?,
+    )))
+}
+
+fn require_effective_permission(access: &EffectiveAccess, permission: &str) -> ApiResult<()> {
+    if access.allows(permission) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+fn valid_role_key(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 async fn list_records(
     State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
     Path(module_key): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     ensure_module(&state, &module_key)?;
+    require_module_record_permission(&access, &module_key, "read")?;
     let records = state
         .list_records(&tenant_id(&headers), &module_key)
         .await?;
@@ -153,11 +411,13 @@ async fn list_records(
 
 async fn create_record(
     State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
     Path(module_key): Path<String>,
     headers: HeaderMap,
     Json(request): Json<CreateRecordRequest>,
 ) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
     ensure_module(&state, &module_key)?;
+    require_module_record_permission(&access, &module_key, "create")?;
     if request.record_type.trim().is_empty() {
         return Err(ApiError::BadRequest("recordType is required".into()));
     }
@@ -174,10 +434,12 @@ async fn create_record(
 
 async fn get_record(
     State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
     Path((module_key, record_id)): Path<(String, Uuid)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     ensure_module(&state, &module_key)?;
+    require_module_record_permission(&access, &module_key, "read")?;
     let record = state
         .record(&tenant_id(&headers), &module_key, record_id)
         .await?
@@ -187,11 +449,13 @@ async fn get_record(
 
 async fn update_record(
     State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
     Path((module_key, record_id)): Path<(String, Uuid)>,
     headers: HeaderMap,
     Json(request): Json<UpdateRecordRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     ensure_module(&state, &module_key)?;
+    require_module_record_permission(&access, &module_key, "update")?;
     let record = state
         .update_record(&tenant_id(&headers), &module_key, record_id, request.data)
         .await?
@@ -201,10 +465,12 @@ async fn update_record(
 
 async fn delete_record(
     State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
     Path((module_key, record_id)): Path<(String, Uuid)>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
     ensure_module(&state, &module_key)?;
+    require_module_record_permission(&access, &module_key, "delete")?;
     if state
         .delete_record(&tenant_id(&headers), &module_key, record_id)
         .await?
@@ -217,9 +483,11 @@ async fn delete_record(
 
 async fn get_configuration(
     State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
     Path(namespace): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "platform.configuration.read")?;
     let document = state
         .configuration(&tenant_id(&headers), &namespace)
         .await?
@@ -229,10 +497,12 @@ async fn get_configuration(
 
 async fn put_configuration(
     State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
     Path(namespace): Path<String>,
     headers: HeaderMap,
     Json(request): Json<PutConfigurationRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "platform.configuration.update")?;
     if namespace.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "Configuration namespace is required".into(),
@@ -244,82 +514,128 @@ async fn put_configuration(
     Ok(Json(ApiResponse::new(json!(document))))
 }
 
-async fn list_tenants() -> Json<ApiResponse<Value>> {
-    Json(ApiResponse::new(json!([{
-        "id": "tenant-local",
-        "code": "LOCAL",
-        "name": "SuperCampus Local",
-        "city": "Local Development"
-    }])))
-}
-
 async fn login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let expected_password =
-        std::env::var("DEV_LOGIN_PASSWORD").unwrap_or_else(|_| "SuperCampus@123".into());
-    if !request.email.contains('@') || request.password != expected_password {
+    let identity = state
+        .authenticate_credentials(&request.email, &request.password)
+        .await?;
+    let Some(identity) = identity else {
         return Err(ApiError::Unauthorized);
-    }
-    let (token, student) = state.create_session(request.email).await?;
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&format!(
-            "sc_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800"
-        ))
-        .expect("generated session cookie is valid"),
-    );
-    Ok((headers, Json(ApiResponse::new(LoginData { student }))))
+    };
+    let session = state.create_session(identity).await?;
+    Ok(login_response(session))
 }
 
 async fn me(
+    Extension(principal): Extension<AuthPrincipal>,
+) -> ApiResult<Json<ApiResponse<SessionData>>> {
+    Ok(Json(ApiResponse::new(SessionData {
+        student: principal.student,
+        session_id: principal.session_id,
+        roles: principal.roles,
+    })))
+}
+
+async fn refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> ApiResult<Json<ApiResponse<LoginData>>> {
-    let student = authenticated_student(&state, &headers).await?;
-    Ok(Json(ApiResponse::new(LoginData { student })))
+) -> ApiResult<impl IntoResponse> {
+    let token = cookie_value(&headers, "sc_session").ok_or(ApiError::Unauthorized)?;
+    match state.refresh_session(&token).await? {
+        RefreshSessionResult::Rotated(session) => Ok(login_response(*session)),
+        RefreshSessionResult::Invalid | RefreshSessionResult::ReuseDetected => {
+            Err(ApiError::Unauthorized)
+        }
+    }
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<impl IntoResponse> {
-    if let Some(token) = session_token(&headers) {
-        state.remove_session(&token).await?;
+    if let Some(token) = access_token(&headers)
+        && let Some(principal) = state.authenticate_access_token(&token).await?
+    {
+        state.revoke_session(principal.session_id).await?;
     }
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        header::SET_COOKIE,
-        HeaderValue::from_static("sc_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"),
-    );
+    if let Some(token) = cookie_value(&headers, "sc_session") {
+        state.revoke_refresh_token(&token).await?;
+    }
+    let response_headers = cleared_auth_cookies();
     Ok((response_headers, StatusCode::NO_CONTENT))
 }
 
 async fn get_app_state(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<AuthPrincipal>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    let student = authenticated_student(&state, &headers).await?;
-    let document = state.app_state(&student.id).await?;
+    let document = state
+        .app_state(&principal.student.tenant_id, &principal.student.id)
+        .await?;
     Ok(Json(ApiResponse::new(json!(document))))
 }
 
 async fn save_app_state(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<AuthPrincipal>,
     Json(request): Json<SaveAppStateRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    let student = authenticated_student(&state, &headers).await?;
     if let Some(action) = request.action.as_deref() {
-        tracing::info!(student_id = %student.id, %action, "local app state updated");
+        tracing::info!(student_id = %principal.student.id, %action, "local app state updated");
     }
-    let document = state.save_app_state(student.id, request.state).await?;
+    let document = state
+        .save_app_state(
+            principal.student.tenant_id,
+            principal.student.id,
+            request.state,
+        )
+        .await?;
     Ok(Json(ApiResponse::new(json!(document))))
+}
+
+async fn get_effective_dashboard(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let tenant_id = &principal.student.tenant_id;
+    let access = state.effective_access(tenant_id, &principal.student.id).await?;
+    let widgets = crate::dashboard::effective_widgets(None, &access);
+    Ok(Json(ApiResponse::new(json!({ "widgets": widgets }))))
 }
 
 fn ensure_module(state: &AppState, module_key: &str) -> ApiResult<crate::models::ModuleDescriptor> {
     state
         .module(module_key)
         .ok_or_else(|| ApiError::NotFound(format!("Unknown module: {module_key}")))
+}
+
+fn require_module_record_permission(
+    access: &EffectiveAccess,
+    module_key: &str,
+    action: &str,
+) -> ApiResult<()> {
+    require_effective_permission(access, &format!("{module_key}.records.{action}"))
+}
+
+fn can_access_module(access: &EffectiveAccess, module_key: &str) -> bool {
+    access.allows("*")
+        || access
+            .permissions
+            .iter()
+            .any(|permission| permission.starts_with(&format!("{module_key}.")))
+}
+
+fn module_read_permission(access: &EffectiveAccess, module_key: &str) -> Option<String> {
+    if access.allows("*") {
+        return Some("*".into());
+    }
+    access
+        .permissions
+        .iter()
+        .find(|permission| {
+            permission.starts_with(&format!("{module_key}."))
+                && (permission.ends_with(".read") || permission.ends_with(".read_submissions"))
+        })
+        .cloned()
 }
 
 fn tenant_id(headers: &HeaderMap) -> String {
@@ -331,22 +647,211 @@ fn tenant_id(headers: &HeaderMap) -> String {
         .to_owned()
 }
 
-fn session_token(headers: &HeaderMap) -> Option<String> {
+fn cookie_value(headers: &HeaderMap, expected_name: &str) -> Option<String> {
     headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
         .and_then(|cookies| {
             cookies.split(';').find_map(|cookie| {
                 let (name, value) = cookie.trim().split_once('=')?;
-                (name == "sc_session").then(|| value.to_owned())
+                (name == expected_name).then(|| value.to_owned())
             })
         })
 }
 
-async fn authenticated_student(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> ApiResult<crate::models::AuthStudent> {
-    let token = session_token(headers).ok_or(ApiError::Unauthorized)?;
-    state.session(&token).await?.ok_or(ApiError::Unauthorized)
+fn access_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, token)| scheme.eq_ignore_ascii_case("Bearer") && !token.contains(' '))
+        .map(|(_, token)| token)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| cookie_value(headers, "sc_access"))
+}
+
+pub async fn authorize_request(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    if !requires_authorization(request.method(), request.uri().path()) {
+        return Ok(next.run(request).await);
+    }
+    let token = access_token(request.headers()).ok_or(ApiError::Unauthorized)?;
+    let mut principal = state
+        .authenticate_access_token(&token)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    if let Some(requested_tenant) = request
+        .headers()
+        .get("x-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        && requested_tenant != principal.student.tenant_id
+    {
+        return Err(ApiError::Forbidden);
+    }
+    let access = state
+        .effective_access(&principal.student.tenant_id, &principal.student.id)
+        .await?;
+    principal.roles = access.roles.clone();
+    principal.student.role = access.roles.first().cloned().unwrap_or_default();
+    principal.student.access = access.permissions.clone();
+    request.headers_mut().insert(
+        HeaderName::from_static("x-tenant-id"),
+        HeaderValue::from_str(&principal.student.tenant_id).map_err(|_| ApiError::Unauthorized)?,
+    );
+    request.headers_mut().insert(
+        HeaderName::from_static("x-user-id"),
+        HeaderValue::from_str(&principal.student.id).map_err(|_| ApiError::Unauthorized)?,
+    );
+    let role = principal.roles.first().map_or("unassigned", String::as_str);
+    request.headers_mut().insert(
+        HeaderName::from_static("x-user-role"),
+        HeaderValue::from_str(role).map_err(|_| ApiError::Unauthorized)?,
+    );
+    request.headers_mut().insert(
+        HeaderName::from_static("x-user-roles"),
+        HeaderValue::from_str(
+            &serde_json::to_string(&access.roles).map_err(|_| ApiError::Internal)?,
+        )
+        .map_err(|_| ApiError::Unauthorized)?,
+    );
+    request.headers_mut().insert(
+        HeaderName::from_static("x-user-permissions"),
+        HeaderValue::from_str(
+            &serde_json::to_string(&access.permissions).map_err(|_| ApiError::Internal)?,
+        )
+        .map_err(|_| ApiError::Unauthorized)?,
+    );
+    request.headers_mut().insert(
+        HeaderName::from_static("x-permission-scopes"),
+        HeaderValue::from_str(
+            &serde_json::to_string(&access.scopes).map_err(|_| ApiError::Internal)?,
+        )
+        .map_err(|_| ApiError::Unauthorized)?,
+    );
+    request.extensions_mut().insert(access);
+    request.extensions_mut().insert(principal);
+    Ok(next.run(request).await)
+}
+
+fn requires_authorization(method: &Method, path: &str) -> bool {
+    let is_public_crm_route = (*method == Method::GET && path == "/api/v1/crm/health")
+        || (*method == Method::POST
+            && path.starts_with("/api/v1/crm/public/forms/")
+            && path.ends_with("/submit"));
+
+    !is_public_crm_route
+        && (path == "/api/state"
+            || path == "/api/v1"
+            || path.starts_with("/api/v1/")
+            || path == "/api/auth/me")
+}
+
+fn login_response(session: CreatedAuthSession) -> (HeaderMap, Json<ApiResponse<LoginData>>) {
+    let mut headers = HeaderMap::new();
+    let secure = secure_cookie_suffix();
+    let access_max_age = (session.access_expires_at - Utc::now())
+        .num_seconds()
+        .max(1);
+    let refresh_max_age = (session.refresh_expires_at - Utc::now())
+        .num_seconds()
+        .max(1);
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "sc_access={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={access_max_age}{secure}",
+            session.access_token
+        ))
+        .expect("generated access cookie is valid"),
+    );
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "sc_session={}; HttpOnly; SameSite=Lax; Path=/api/auth; Max-Age={refresh_max_age}{secure}",
+            session.refresh_token
+        ))
+        .expect("generated refresh cookie is valid"),
+    );
+    let data = LoginData {
+        student: session.student,
+        access_token: session.access_token,
+        token_type: "Bearer",
+        expires_at: session.access_expires_at,
+        session_id: session.session_id,
+        roles: session.roles,
+    };
+    (headers, Json(ApiResponse::new(data)))
+}
+
+fn cleared_auth_cookies() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let secure = secure_cookie_suffix();
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "sc_access=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}"
+        ))
+        .expect("cleared access cookie is valid"),
+    );
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "sc_session=; HttpOnly; SameSite=Lax; Path=/api/auth; Max-Age=0{secure}"
+        ))
+        .expect("cleared refresh cookie is valid"),
+    );
+    headers
+}
+
+fn secure_cookie_suffix() -> &'static str {
+    match std::env::var("APP_ENV").as_deref() {
+        Ok("production") | Ok("staging") => "; Secure",
+        _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn access(permissions: &[&str]) -> EffectiveAccess {
+        EffectiveAccess {
+            roles: vec!["test_role".into()],
+            permissions: permissions.iter().map(|value| (*value).into()).collect(),
+            scopes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn module_visibility_requires_an_effective_module_permission() {
+        let crm_reader = access(&["crm.leads.read"]);
+        assert!(can_access_module(&crm_reader, "crm"));
+        assert!(!can_access_module(&crm_reader, "fees"));
+        assert_eq!(
+            module_read_permission(&crm_reader, "crm").as_deref(),
+            Some("crm.leads.read")
+        );
+    }
+
+    #[test]
+    fn generic_records_require_independent_crud_permissions() {
+        let reader = access(&["admissions.records.read"]);
+        assert!(require_module_record_permission(&reader, "admissions", "read").is_ok());
+        assert!(matches!(
+            require_module_record_permission(&reader, "admissions", "update"),
+            Err(ApiError::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn wildcard_access_keeps_tenant_admin_recovery_access() {
+        let admin = access(&["*"]);
+        assert!(can_access_module(&admin, "crm"));
+        assert_eq!(module_read_permission(&admin, "fees").as_deref(), Some("*"));
+        assert!(require_module_record_permission(&admin, "fees", "delete").is_ok());
+    }
 }

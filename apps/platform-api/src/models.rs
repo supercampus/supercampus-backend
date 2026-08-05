@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,6 +51,9 @@ pub struct NavigationItem {
 pub struct BootstrapDocument {
     pub tenant_id: String,
     pub user_id: String,
+    pub roles: Vec<String>,
+    pub permissions: Vec<String>,
+    pub permission_scopes: HashMap<String, String>,
     pub services: Vec<ServiceDescriptor>,
     pub modules: Vec<ModuleDescriptor>,
     pub navigation: Vec<NavigationItem>,
@@ -94,7 +99,70 @@ pub struct PutConfigurationRequest {
     pub value: Value,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectiveWidget {
+    pub id: String,
+    pub required_permission: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAuthorizationRoleRequest {
+    pub key: String,
+    pub name: String,
+    #[serde(default)]
+    pub team: String,
+    #[serde(default)]
+    pub scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAuthorizationRoleRequest {
+    pub name: Option<String>,
+    pub team: Option<String>,
+    pub scope: Option<String>,
+    pub active: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionGrantRequest {
+    pub key: String,
+    #[serde(default = "default_permission_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub constraints: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetRolePermissionsRequest {
+    pub permissions: Vec<PermissionGrantRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateTenantUserRequest {
+    pub name: String,
+    pub email: String,
+    #[serde(default)]
+    pub role_ids: Vec<Uuid>,
+    pub temporary_password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignUserRolesRequest {
+    pub role_ids: Vec<Uuid>,
+}
+
+fn default_permission_scope() -> String {
+    "all".into()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
@@ -116,6 +184,12 @@ pub struct AuthStudent {
     pub email: String,
     pub name: String,
     pub initials: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub team: String,
+    #[serde(default)]
+    pub access: Vec<String>,
     pub roll: String,
     pub college: String,
     pub dept: String,
@@ -125,8 +199,22 @@ pub struct AuthStudent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LoginData {
     pub student: AuthStudent,
+    pub access_token: String,
+    pub token_type: &'static str,
+    pub expires_at: DateTime<Utc>,
+    pub session_id: Uuid,
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionData {
+    pub student: AuthStudent,
+    pub session_id: Uuid,
+    pub roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -47,6 +47,106 @@ paths:
       responses:
         "200": { description: Module descriptor }
         "404": { description: Unknown module }
+  /api/v1/authorization/permissions:
+    get:
+      operationId: listTenantPermissions
+      responses:
+        "200": { description: Tenant permission definitions }
+        "403": { description: Permission catalog access denied }
+  /api/v1/authorization/roles:
+    get:
+      operationId: listTenantRoles
+      responses:
+        "200": { description: Tenant roles with permission grants }
+    post:
+      operationId: createTenantRole
+      responses:
+        "201": { description: Empty tenant role created }
+  /api/v1/authorization/roles/{roleId}:
+    parameters:
+      - { name: roleId, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      operationId: updateTenantRole
+      responses:
+        "200": { description: Tenant role updated }
+    delete:
+      operationId: deleteTenantRole
+      responses:
+        "204": { description: Non-protected tenant role deleted }
+  /api/v1/authorization/roles/{roleId}/permissions:
+    put:
+      operationId: replaceTenantRolePermissions
+      parameters:
+        - { name: roleId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Role permission grants replaced transactionally }
+  /api/v1/authorization/users:
+    get:
+      operationId: listTenantUsers
+      responses:
+        "200": { description: Tenant users and role assignments }
+    post:
+      operationId: createTenantUser
+      responses:
+        "201": { description: Tenant user created or joined and assigned }
+        "409": { description: User already belongs to this tenant }
+  /api/v1/authorization/users/{userId}/roles:
+    put:
+      operationId: replaceTenantUserRoles
+      parameters:
+        - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: User role assignments replaced }
+  /api/v1/authorization/permissions:
+    get:
+      operationId: listTenantPermissions
+      responses:
+        "200": { description: Tenant permission definitions }
+        "403": { description: Permission catalog access denied }
+  /api/v1/authorization/roles:
+    get:
+      operationId: listTenantRoles
+      responses:
+        "200": { description: Tenant roles with permission grants }
+    post:
+      operationId: createTenantRole
+      responses:
+        "201": { description: Empty tenant role created }
+  /api/v1/authorization/roles/{roleId}:
+    parameters:
+      - { name: roleId, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      operationId: updateTenantRole
+      responses:
+        "200": { description: Tenant role updated }
+    delete:
+      operationId: deleteTenantRole
+      responses:
+        "204": { description: Non-protected tenant role deleted }
+  /api/v1/authorization/roles/{roleId}/permissions:
+    put:
+      operationId: replaceTenantRolePermissions
+      parameters:
+        - { name: roleId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Role permission grants replaced transactionally }
+  /api/v1/authorization/users:
+    get:
+      operationId: listTenantUsers
+      responses:
+        "200": { description: Tenant users and role assignments }
+    post:
+      operationId: createTenantUser
+      responses:
+        "201": { description: Tenant user created or joined and assigned }
+        "409": { description: User already belongs to this tenant }
+  /api/v1/authorization/users/{userId}/roles:
+    put:
+      operationId: replaceTenantUserRoles
+      parameters:
+        - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: User role assignments replaced }
   /api/v1/configuration/{namespace}:
     get:
       operationId: getConfiguration
@@ -101,11 +201,6 @@ paths:
         - { name: recordId, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
         "204": { description: Record deleted }
-  /api/auth/tenants:
-    get:
-      operationId: listAuthTenants
-      responses:
-        "200": { description: Available tenants }
   /api/auth/login:
     post:
       operationId: login

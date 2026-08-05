@@ -2,16 +2,30 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: supercampus
+      POSTGRES_DB: supercampus_control
       POSTGRES_USER: supercampus
       POSTGRES_PASSWORD: supercampus-local
     ports: ["5432:5432"]
     volumes: ["postgres-data:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U supercampus"]
+      test: ["CMD-SHELL", "pg_isready -U supercampus -d supercampus_control"]
       interval: 5s
       timeout: 5s
       retries: 10
+
+  provision:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["supercampus-migration-runner"]
+    command: ["provision", "tenant-local", "supercampus_tenant_local"]
+    environment:
+      CONTROL_DATABASE_URL: postgresql://supercampus:supercampus-local@postgres:5432/supercampus_control
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   api:
     build:
@@ -20,12 +34,13 @@ services:
     environment:
       HTTP_HOST: 0.0.0.0
       HTTP_PORT: 4000
-      DATABASE_URL: postgresql://supercampus:supercampus-local@postgres:5432/supercampus
+      CONTROL_DATABASE_URL: postgresql://supercampus:supercampus-local@postgres:5432/supercampus_control
+      JWT_SECRET: replace-with-at-least-32-random-characters
       RUST_LOG: info
     ports: ["4000:4000"]
     depends_on:
-      postgres:
-        condition: service_healthy
+      provision:
+        condition: service_completed_successfully
 
 volumes:
   postgres-data:

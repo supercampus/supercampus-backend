@@ -1,8 +1,11 @@
-pub mod entities;
-pub mod errors;
-pub mod events;
-pub mod value_objects;
+mod entities;
+mod errors;
+mod events;
+mod pipeline;
+mod value_objects;
 
-pub use entities::Lead;
-pub use errors::CrmError;
-pub use value_objects::{PipelineKey, StageKey};
+pub use entities::*;
+pub use errors::*;
+pub use events::*;
+pub use pipeline::*;
+pub use value_objects::*;

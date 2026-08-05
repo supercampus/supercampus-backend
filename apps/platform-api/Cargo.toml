@@ -17,8 +17,10 @@ tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+supercampus-authn = { path = "../../crates/authn" }
 supercampus-observability.workspace = true
 supercampus-database = { path = "../../crates/database" }
+supercampus-crm = { path = "../../modules/crm" }
 
 [dev-dependencies]
 tower.workspace = true

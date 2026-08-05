@@ -4,7 +4,9 @@ use serde::Serialize;
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
+    Conflict(String),
     Unauthorized,
+    Forbidden,
     NotFound(String),
     Internal,
 }
@@ -19,10 +21,16 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, code, error) = match self {
             Self::BadRequest(error) => (StatusCode::BAD_REQUEST, "bad_request", error),
+            Self::Conflict(error) => (StatusCode::CONFLICT, "conflict", error),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "Authentication is required".into(),
+            ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "This session cannot access the requested tenant or resource".into(),
             ),
             Self::NotFound(error) => (StatusCode::NOT_FOUND, "not_found", error),
             Self::Internal => (

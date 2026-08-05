@@ -2,13 +2,182 @@ openapi: 3.1.0
 info:
   title: SuperCampus CRM API
   version: 0.1.0
+  description: Tenant-scoped pre-admission CRM defined by the requirements in docs/requirements/crm.
+servers:
+  - url: http://localhost:4000
+security:
+  - bearerAuth: []
+tags:
+  - { name: Leads }
+  - { name: Pipeline }
+  - { name: Dashboard }
+  - { name: Campaigns }
+  - { name: Forms }
+  - { name: Communications }
+  - { name: Configuration }
 paths:
+  /api/v1/crm/health:
+    get: { operationId: crmHealth, security: [], responses: { "200": { description: Healthy } } }
+  /api/v1/crm/roles:
+    get: { operationId: listCrmRoles, responses: { "200": { description: Role catalog } } }
+  /api/v1/crm/permissions/effective:
+    get: { operationId: getEffectiveCrmPermissions, responses: { "200": { description: Effective access and scope } } }
   /api/v1/crm/leads:
     get:
+      tags: [Leads]
       operationId: listCrmLeads
-      responses:
-        "200": { description: Tenant-filtered CRM leads }
+      responses: { "200": { description: Role-scoped, tenant-filtered leads } }
     post:
+      tags: [Leads]
       operationId: createCrmLead
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CreateLead" } } } }
+      responses: { "201": { description: Lead created and assignment evaluated } }
+  /api/v1/crm/leads/import:
+    post:
+      tags: [Leads]
+      operationId: bulkImportCrmLeads
+      description: Imports up to 1000 validated rows and applies tenant-scoped phone/email duplicate handling.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BulkImportLeads" }
       responses:
-        "201": { description: CRM lead created }
+        "200": { description: Per-row created, skipped, and failed import results }
+        "400": { description: Invalid mapping payload, strategy, or row limit }
+  /api/v1/crm/leads/{id}:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    get: { tags: [Leads], operationId: getCrmLead, responses: { "200": { description: Lead detail }, "404": { $ref: "#/components/responses/NotFound" } } }
+    patch: { tags: [Leads], operationId: updateCrmLead, responses: { "200": { description: Lead updated } } }
+    delete: { tags: [Leads], operationId: deleteCrmLead, responses: { "204": { description: Lead soft deleted } } }
+  /api/v1/crm/leads/{id}/assign:
+    post: { tags: [Leads], operationId: assignCrmLead, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Lead assigned } } }
+  /api/v1/crm/leads/{id}/reassign:
+    post: { tags: [Leads], operationId: reassignCrmLead, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Lead reassigned with history } } }
+  /api/v1/crm/leads/{id}/stage/move:
+    post: { tags: [Pipeline], operationId: moveCrmLead, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Validated stage movement } } }
+  /api/v1/crm/leads/{id}/stage/prospect:
+    post: { tags: [Pipeline], operationId: markCrmProspect, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Prospect intake recorded } } }
+  /api/v1/crm/leads/{id}/stage/defer:
+    post: { tags: [Pipeline], operationId: deferCrmLead, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Deferral recorded } } }
+  /api/v1/crm/leads/{id}/stage/hold:
+    post: { tags: [Pipeline], operationId: holdCrmLead, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Progression placed on hold } } }
+  /api/v1/crm/leads/{id}/stage/release-hold:
+    post: { tags: [Pipeline], operationId: releaseCrmLeadHold, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Hold released } } }
+  /api/v1/crm/leads/{id}/stage/archive:
+    post: { tags: [Pipeline], operationId: archiveCrmLead, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Lead archived using an approved reason } } }
+  /api/v1/crm/leads/{id}/stage/unarchive:
+    post: { tags: [Pipeline], operationId: unarchiveCrmLead, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Lead restored } } }
+  /api/v1/crm/leads/{id}/timeline:
+    get: { tags: [Leads], operationId: getCrmLeadTimeline, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Stage and communication history } } }
+  /api/v1/crm/kanban/board:
+    get: { tags: [Dashboard], operationId: getCrmKanban, responses: { "200": { description: Nine-column role-scoped board } } }
+  /api/v1/crm/kanban/my-board:
+    get: { tags: [Dashboard], operationId: getMyCrmKanban, responses: { "200": { description: Assigned lead board } } }
+  /api/v1/crm/kanban/stages:
+    get: { tags: [Dashboard], operationId: listCrmStages, responses: { "200": { description: Stages and substates } } }
+  /api/v1/crm/dashboard:
+    get: { tags: [Dashboard], operationId: getCrmDashboard, responses: { "200": { description: Filtered dashboard payload } } }
+  /api/v1/crm/dashboard/operations:
+    get: { tags: [Dashboard], operationId: getCrmOperationsDashboard, responses: { "200": { description: Tenant and role-scoped CRM command-center metrics, queue, automations, source ROI, health, and cases } } }
+  /api/v1/crm/campaigns:
+    get: { tags: [Campaigns], operationId: listCrmCampaigns, responses: { "200": { description: Tenant campaign finance records } } }
+    post:
+      tags: [Campaigns]
+      operationId: upsertCrmCampaign
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CreateCampaign" } } } }
+      responses: { "201": { description: Campaign created or updated by tenant/name } }
+  /api/v1/crm/events:
+    get: { tags: [Dashboard], operationId: streamCrmEvents, description: WebSocket upgrade; emits ordered tenant outbox events with resumable cursor, responses: { "101": { description: WebSocket connected } } }
+  /api/v1/crm/forms:
+    get: { tags: [Forms], operationId: listCrmForms, responses: { "200": { description: Form definitions } } }
+    post: { tags: [Forms], operationId: createCrmForm, responses: { "201": { description: Version 1 draft created } } }
+  /api/v1/crm/forms/published/lead-capture:
+    get: { tags: [Forms], operationId: getPublishedCrmLeadCaptureForm, responses: { "200": { description: Latest published tenant lead-capture form }, "404": { description: No published lead-capture form } } }
+  /api/v1/crm/forms/{id}:
+    parameters: [ { $ref: "#/components/parameters/Id" } ]
+    get: { tags: [Forms], operationId: getCrmForm, responses: { "200": { description: Form schema } } }
+    put: { tags: [Forms], operationId: updateCrmForm, responses: { "200": { description: New draft version created } } }
+    delete: { tags: [Forms], operationId: deleteCrmForm, responses: { "204": { description: Form soft deleted } } }
+  /api/v1/crm/forms/{id}/publish:
+    post: { tags: [Forms], operationId: publishCrmForm, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Form published } } }
+  /api/v1/crm/forms/{id}/unpublish:
+    post: { tags: [Forms], operationId: unpublishCrmForm, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Form returned to draft } } }
+  /api/v1/crm/forms/{id}/submit:
+    post: { tags: [Forms], operationId: submitCrmForm, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "201": { description: Versioned submission recorded } } }
+  /api/v1/crm/public/forms/{id}/submit:
+    post: { tags: [Forms], operationId: submitPublicCrmEnquiry, security: [], parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "201": { description: Enquiry submission and CRM lead created } } }
+  /api/v1/crm/forms/{id}/submissions:
+    get: { tags: [Forms], operationId: listCrmFormSubmissions, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Versioned submissions } } }
+  /api/v1/crm/communications/whatsapp:
+    post: { tags: [Communications], operationId: queueCrmWhatsapp, responses: { "200": { description: WhatsApp message queued after qualification } } }
+  /api/v1/crm/communications/email:
+    post: { tags: [Communications], operationId: queueCrmEmail, responses: { "200": { description: Email queued } } }
+  /api/v1/crm/communications/calls:
+    post: { tags: [Communications], operationId: logCrmCall, responses: { "200": { description: Call outcome logged } } }
+  /api/v1/crm/communications/templates:
+    get: { tags: [Communications], operationId: listCrmTemplates, responses: { "200": { description: Tenant templates } } }
+    post: { tags: [Communications], operationId: upsertCrmTemplate, responses: { "201": { description: Template stored } } }
+  /api/v1/crm/assignment/counselors:
+    get: { tags: [Configuration], operationId: listCrmCounselors, responses: { "200": { description: Capacity and workload } } }
+    put: { tags: [Configuration], operationId: upsertCrmCounselor, responses: { "200": { description: Assignment capacity configured } } }
+  /api/v1/crm/configuration:
+    get: { tags: [Configuration], operationId: getCrmConfiguration, responses: { "200": { description: Workflow and automation toggles } } }
+  /api/v1/crm/configuration/workflow-toggles:
+    put: { tags: [Configuration], operationId: upsertCrmWorkflowToggle, responses: { "200": { description: Runtime transition policy updated } } }
+  /api/v1/crm/configuration/automation-toggles:
+    put: { tags: [Configuration], operationId: upsertCrmAutomationToggle, responses: { "200": { description: Runtime automation policy updated } } }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+  responses:
+    NotFound: { description: Record not found }
+  schemas:
+    CreateCampaign:
+      type: object
+      required: [name, source]
+      properties:
+        name: { type: string, minLength: 1 }
+        source: { type: string, minLength: 1 }
+        budget: { type: number, minimum: 0 }
+        spent: { type: number, minimum: 0 }
+        attributedRevenue: { type: number, minimum: 0 }
+        landingPages: { type: integer, minimum: 0 }
+        utmCode: { type: [string, "null"] }
+        status: { type: string, enum: [draft, active, paused, completed] }
+        startsOn: { type: [string, "null"], format: date }
+        endsOn: { type: [string, "null"], format: date }
+    CreateLead:
+      type: object
+      required: [source, student]
+      properties:
+        source: { type: string }
+        sourceDetail: { type: object, additionalProperties: true }
+        student:
+          type: object
+          required: [name]
+          properties:
+            name: { type: string }
+            email: { type: [string, "null"], format: email }
+            phone: { type: [string, "null"] }
+        academic: { type: object, additionalProperties: true }
+        interest: { type: object, additionalProperties: true }
+        customFields: { type: object, additionalProperties: true }
+    BulkImportLeads:
+      type: object
+      required: [rows]
+      properties:
+        duplicateStrategy: { type: string, enum: [skip, flag], default: skip }
+        rows:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            allOf:
+              - { $ref: "#/components/schemas/CreateLead" }
+              - type: object
+                required: [rowNumber]
+                properties:
+                  rowNumber: { type: integer, minimum: 2 }

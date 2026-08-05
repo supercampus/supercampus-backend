@@ -1,7 +1,7 @@
 FROM rust:1.97-bookworm AS builder
 WORKDIR /app
 COPY . .
-RUN cargo build --release -p supercampus-platform-api
+RUN cargo build --release -p supercampus-platform-api -p supercampus-migration-runner
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -10,6 +10,7 @@ RUN apt-get update \
     && useradd --system --uid 10001 --create-home supercampus
 WORKDIR /app
 COPY --from=builder /app/target/release/supercampus-platform-api /usr/local/bin/supercampus-platform-api
+COPY --from=builder /app/target/release/supercampus-migration-runner /usr/local/bin/supercampus-migration-runner
 ENV HTTP_HOST=0.0.0.0
 ENV HTTP_PORT=4000
 USER supercampus

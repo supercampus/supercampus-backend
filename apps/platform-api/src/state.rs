@@ -561,7 +561,9 @@ impl AppState {
                     id: row.try_get("slug")?,
                     code: row.try_get("code")?,
                     name: row.try_get("name")?,
-                    city: row.try_get("city")?,
+                    city: row
+                        .try_get::<Option<String>, _>("city")?
+                        .unwrap_or_default(),
                 },
                 role: primary_role,
                 profile,
@@ -1648,7 +1650,9 @@ fn row_to_tenant(row: &PgRow) -> anyhow::Result<TenantSummary> {
         id: row.try_get("slug")?,
         code: row.try_get("code")?,
         name: row.try_get("name")?,
-        city: row.try_get("city")?,
+        city: row
+            .try_get::<Option<String>, _>("city")?
+            .unwrap_or_default(),
     })
 }
 

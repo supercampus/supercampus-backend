@@ -1601,7 +1601,7 @@ async fn ensure_tenant(database: &Database, tenant_slug: &str) -> anyhow::Result
     sqlx::query_scalar(
         r#"INSERT INTO platform.tenants (slug, code, name)
            VALUES ($1, upper(replace($1, '-', '_')), $2)
-           ON CONFLICT (slug) DO UPDATE SET updated_at = platform.tenants.updated_at
+           ON CONFLICT (slug) DO UPDATE SET updated_at = now()
            RETURNING id"#,
     )
     .bind(tenant_slug)

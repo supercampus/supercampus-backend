@@ -483,7 +483,7 @@ impl AppState {
                    (tenant_id, namespace, version, value)
                    VALUES ($1, $2, 1, $3)
                    ON CONFLICT (tenant_id, namespace) DO UPDATE
-                   SET version = configuration.runtime_documents.version + 1,
+                   SET version = EXCLUDED.version + 1,
                        value = EXCLUDED.value,
                        updated_at = now()
                    RETURNING version, updated_at"#,
@@ -1530,7 +1530,7 @@ impl AppState {
                    VALUES ($1, $2, $3, 1)
                    ON CONFLICT (tenant_id, user_id) DO UPDATE
                    SET state = EXCLUDED.state,
-                       version = identity.ui_states.version + 1,
+                       version = EXCLUDED.version + 1,
                        updated_at = now()
                    RETURNING state, version, updated_at"#,
             )

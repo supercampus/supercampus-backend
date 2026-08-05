@@ -9,17 +9,17 @@ INSERT INTO authz.permission_templates
 SELECT permission_key, module_key, feature_key, action, ARRAY['read']::text[],
        display_name, description, true
 FROM (VALUES
-    ('dashboard.counselor_sla.read', 'dashboard', 'counselor_sla',
+    ('dashboard.counselor_sla.read', 'dashboard', 'counselor_sla', 'read',
      'View counselor SLA widget', 'Show the counselor SLA card on the staff dashboard'),
-    ('dashboard.track_team.read', 'dashboard', 'track_team',
+    ('dashboard.track_team.read', 'dashboard', 'track_team', 'read',
      'View team tracking widget', 'Show the team tracking donut on the staff dashboard'),
-    ('dashboard.pipeline_spread.read', 'dashboard', 'pipeline_spread',
+    ('dashboard.pipeline_spread.read', 'dashboard', 'pipeline_spread', 'read',
      'View pipeline spread widget', 'Show the lead-by-stage chart on the staff dashboard'),
-    ('dashboard.follow_ups.read', 'dashboard', 'follow_ups',
+    ('dashboard.follow_ups.read', 'dashboard', 'follow_ups', 'read',
      'View follow-ups widget', 'Show the follow-ups list on the staff dashboard'),
-    ('dashboard.fee_readiness.read', 'dashboard', 'fee_readiness',
+    ('dashboard.fee_readiness.read', 'dashboard', 'fee_readiness', 'read',
      'View fee readiness widget', 'Show the fee readiness card on the staff dashboard'),
-    ('dashboard.source_quality.read', 'dashboard', 'source_quality',
+    ('dashboard.source_quality.read', 'dashboard', 'source_quality', 'read',
      'View source quality widget', 'Show the source quality card on the staff dashboard')
 ) AS permission(permission_key, module_key, feature_key, action, display_name, description)
 ON CONFLICT (permission_key) DO UPDATE SET

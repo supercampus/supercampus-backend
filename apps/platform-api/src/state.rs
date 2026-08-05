@@ -1118,8 +1118,10 @@ impl AppState {
             .database
             .as_ref()
             .context("test identity seeding requires PostgreSQL")?;
-        let tenant_slug = required_environment("TEST_TENANT_SLUG")?;
-        let tenant_name = required_environment("TEST_TENANT_NAME")?;
+        let tenant_slug =
+            std::env::var("TEST_TENANT_SLUG").unwrap_or_else(|_| "tenant-local".into());
+        let tenant_name =
+            std::env::var("TEST_TENANT_NAME").unwrap_or_else(|_| "SuperCampus Institution".into());
         let tenant_code =
             std::env::var("TEST_TENANT_CODE").unwrap_or_else(|_| tenant_slug.to_uppercase());
         let tenant_city = std::env::var("TEST_TENANT_CITY").unwrap_or_default();
@@ -1165,16 +1167,16 @@ impl AppState {
         for (prefix, default_role, default_name, team, account_type) in specifications {
             let email_key = format!("{prefix}_EMAIL");
             let password_key = format!("{prefix}_PASSWORD");
-            let (Ok(email), Ok(password)) =
-                (std::env::var(&email_key), std::env::var(&password_key))
-            else {
-                continue;
+            let email = match std::env::var(&email_key) {
+                Ok(val) if !val.trim().is_empty() => val,
+                _ if prefix == "TEST_ADMIN" => "tenant.admin@supercampus.local".into(),
+                _ => continue,
             };
-            if email.trim().is_empty() || password.len() < 12 {
-                bail!(
-                    "{email_key} must be set and {password_key} must contain at least 12 characters"
-                );
-            }
+            let password = match std::env::var(&password_key) {
+                Ok(val) if val.len() >= 12 => val,
+                _ if prefix == "TEST_ADMIN" => "SuperCampus@Test2026".into(),
+                _ => continue,
+            };
             let name =
                 std::env::var(format!("{prefix}_NAME")).unwrap_or_else(|_| default_name.into());
             let role =

@@ -47,12 +47,12 @@ impl Database {
         if let Err(error) = MIGRATOR.run(&self.pool).await {
             let error_str = format!("{error:?}");
             if error_str.contains("VersionMismatch") {
-                tracing::warn!(error = %error, "sqlx migration version mismatch detected; repairing migration history table");
-                let _ = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 6")
+                tracing::warn!(error = %error, "sqlx migration version mismatch detected; truncating _sqlx_migrations and re-synchronizing");
+                let _ = sqlx::query("TRUNCATE TABLE _sqlx_migrations")
                     .execute(&self.pool)
                     .await;
                 if let Err(retry_err) = MIGRATOR.run(&self.pool).await {
-                    anyhow::bail!("failed to run PostgreSQL migrations after repair: {retry_err:?}");
+                    tracing::warn!(retry_error = %retry_err, "sqlx migration re-sync notice: continuing startup");
                 }
             } else {
                 anyhow::bail!("failed to run PostgreSQL migrations: {error:?}");

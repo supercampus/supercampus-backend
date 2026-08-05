@@ -45,7 +45,18 @@ impl Database {
 
     pub async fn migrate(&self) -> anyhow::Result<()> {
         if let Err(error) = MIGRATOR.run(&self.pool).await {
-            anyhow::bail!("failed to run PostgreSQL migrations: {error:?}");
+            let error_str = format!("{error:?}");
+            if error_str.contains("VersionMismatch") {
+                tracing::warn!(error = %error, "sqlx migration version mismatch detected; repairing migration history table");
+                let _ = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 6")
+                    .execute(&self.pool)
+                    .await;
+                if let Err(retry_err) = MIGRATOR.run(&self.pool).await {
+                    anyhow::bail!("failed to run PostgreSQL migrations after repair: {retry_err:?}");
+                }
+            } else {
+                anyhow::bail!("failed to run PostgreSQL migrations: {error:?}");
+            }
         }
         Ok(())
     }

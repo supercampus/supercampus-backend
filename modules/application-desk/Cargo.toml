@@ -1,27 +1,24 @@
 [package]
-name = "supercampus-platform-api"
+name = "supercampus-application-desk"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
-dotenvy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
-tokio.workspace = true
-tower-http.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 uuid.workspace = true
-supercampus-authn = { path = "../../crates/authn" }
-supercampus-observability.workspace = true
 supercampus-database = { path = "../../crates/database" }
-supercampus-crm = { path = "../../modules/crm" }
-supercampus-application-desk = { path = "../../modules/application-desk" }
+supercampus-kernel.workspace = true
+supercampus-module-sdk.workspace = true
 
 [dev-dependencies]
-tower.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

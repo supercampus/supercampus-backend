@@ -72,10 +72,20 @@ pub struct EffectiveAccess {
 }
 
 impl EffectiveAccess {
+    /// Exact match, the global `*`, or a `namespace.*` grant.
+    ///
+    /// The namespace form lets a role be granted a whole module — say
+    /// `application-desk.*` — without enumerating every permission in it.
     pub fn allows(&self, permission: &str) -> bool {
-        self.permissions
-            .iter()
-            .any(|value| value == "*" || value == permission)
+        self.permissions.iter().any(|value| {
+            value == "*"
+                || value == permission
+                || value.strip_suffix(".*").is_some_and(|namespace| {
+                    permission
+                        .strip_prefix(namespace)
+                        .is_some_and(|rest| rest.starts_with('.'))
+                })
+        })
     }
 }
 

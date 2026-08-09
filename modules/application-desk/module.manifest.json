@@ -1,0 +1,30 @@
+{
+  "$schema": "../../contracts/module-manifest/module-manifest.schema.json",
+  "key": "application-desk",
+  "name": "Application Desk",
+  "version": "0.1.0",
+  "backendCrate": "supercampus-application-desk",
+  "permissions": [
+    "application-desk.view",
+    "application-desk.create",
+    "application-desk.edit",
+    "application-desk.verify",
+    "application-desk.assign",
+    "application-desk.approve",
+    "application-desk.reject",
+    "application-desk.hold",
+    "application-desk.resume",
+    "application-desk.activate",
+    "application-desk.manage_settings",
+    "application-desk.reports.read"
+  ],
+  "capabilities": [
+    "onboarding-orchestration",
+    "configurable-workflow",
+    "duplicate-protection",
+    "transactional-student-numbering",
+    "idempotent-provisioning",
+    "transactional-outbox",
+    "append-only-audit"
+  ]
+}

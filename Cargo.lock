@@ -1917,6 +1917,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "supercampus-application-desk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "supercampus-database",
+ "supercampus-kernel",
+ "supercampus-module-sdk",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "supercampus-attendance"
 version = "0.1.0"
 dependencies = [
@@ -2123,6 +2142,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "supercampus-application-desk",
  "supercampus-authn",
  "supercampus-crm",
  "supercampus-database",

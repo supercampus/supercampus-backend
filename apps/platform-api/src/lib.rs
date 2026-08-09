@@ -23,7 +23,11 @@ pub fn app(state: AppState) -> axum::Router {
     router(state)
         .nest(
             "/api/v1/crm",
-            supercampus_crm::api::routes::router(tenant_databases),
+            supercampus_crm::api::routes::router(tenant_databases.clone()),
+        )
+        .nest(
+            "/api/v1/application-desk",
+            supercampus_application_desk::api::router(tenant_databases),
         )
         .layer(middleware::from_fn_with_state(
             auth_state,

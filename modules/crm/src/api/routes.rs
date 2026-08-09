@@ -9,9 +9,11 @@ use crate::application::CrmService;
 use super::handlers::{self, CrmApiState};
 
 pub fn router(databases: Option<TenantDatabaseManager>) -> Router {
+    let (realtime_wake, _) = tokio::sync::broadcast::channel(256);
     let state = CrmApiState {
         databases,
         catalog_service: CrmService::new(None),
+        realtime_wake,
     };
 
     Router::new()
@@ -26,6 +28,7 @@ pub fn router(databases: Option<TenantDatabaseManager>) -> Router {
             get(handlers::list_leads).post(handlers::create_lead),
         )
         .route("/leads/import", post(handlers::import_leads))
+        .route("/leads/unassigned", get(handlers::list_unassigned_leads))
         .route(
             "/leads/{id}",
             get(handlers::get_lead)
@@ -33,8 +36,22 @@ pub fn router(databases: Option<TenantDatabaseManager>) -> Router {
                 .delete(handlers::delete_lead),
         )
         .route("/leads/{id}/assign", post(handlers::assign_lead))
+        .route("/leads/{id}/claim", post(handlers::claim_lead))
         .route("/leads/{id}/reassign", post(handlers::reassign_lead))
         .route("/leads/{id}/stage/move", post(handlers::move_stage))
+        .route(
+            "/leads/{id}/stage/request",
+            post(handlers::request_stage_move),
+        )
+        .route("/move-requests", get(handlers::list_move_requests))
+        .route(
+            "/move-requests/{id}/approve",
+            post(handlers::approve_move_request),
+        )
+        .route(
+            "/move-requests/{id}/reject",
+            post(handlers::reject_move_request),
+        )
         .route("/leads/{id}/stage/prospect", post(handlers::mark_prospect))
         .route("/leads/{id}/prospect", post(handlers::mark_prospect))
         .route("/leads/{id}/stage/defer", post(handlers::mark_deferred))
@@ -51,21 +68,31 @@ pub fn router(databases: Option<TenantDatabaseManager>) -> Router {
         .route("/leads/{id}/stage/unarchive", post(handlers::unarchive))
         .route("/leads/{id}/unarchive", post(handlers::unarchive))
         .route("/leads/{id}/timeline", get(handlers::timeline))
+        .route("/leads/{id}/notes", post(handlers::add_lead_note))
+        .route("/leads/{id}/tasks", post(handlers::add_lead_task))
+        .route("/leads/{id}/application", get(handlers::application_link))
         .route("/kanban/board", get(handlers::board))
-        .route("/kanban/my-board", get(handlers::board))
+        .route("/kanban/my-board", get(handlers::my_board))
         .route("/kanban/stages", get(handlers::stages))
         .route("/kanban/stages/{stage}/leads", get(handlers::stage_leads))
         .route("/kanban/stages/{stage}/count", get(handlers::stage_count))
         .route("/dashboard", get(handlers::board))
         .route("/dashboard/operations", get(handlers::operations_dashboard))
+        .route("/activity", get(handlers::recent_activity))
         .route("/events", get(handlers::realtime_events))
         .route(
             "/forms",
             get(handlers::list_forms).post(handlers::create_form),
         )
+        .route("/forms/published", get(handlers::published_forms))
         .route(
             "/forms/published/lead-capture",
             get(handlers::published_lead_capture_form),
+        )
+        // Must stay after the literal lead-capture route so that path keeps priority.
+        .route(
+            "/forms/published/type/{form_type}",
+            get(handlers::published_form_by_type),
         )
         .route(
             "/forms/{id}",

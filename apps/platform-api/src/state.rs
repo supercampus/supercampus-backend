@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
 use supercampus_authn::{AccessClaims, AuthService, generate_refresh_token, hash_refresh_token};
 use supercampus_database::{Database, TenantDatabaseManager};
+use supercampus_notifications::{EmailMessage, LogMailer, Mailer};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -14,6 +15,16 @@ use crate::models::{
     CreateTenantUserRequest, DynamicRecord, ModuleDescriptor, PermissionGrantRequest,
     ServiceDescriptor, StoredAppState, TenantSummary, UpdateAuthorizationRoleRequest,
 };
+
+/// Reset links stay valid for one hour.
+const PASSWORD_RESET_TTL_MINUTES: i64 = 60;
+/// Requests allowed per account inside [`PASSWORD_RESET_THROTTLE_MINUTES`].
+const PASSWORD_RESET_MAX_REQUESTS: i64 = 3;
+const PASSWORD_RESET_THROTTLE_MINUTES: i64 = 15;
+/// Matches the minimum enforced by the sign-in form.
+pub const MINIMUM_PASSWORD_LENGTH: usize = 12;
+/// Realtime handshake tokens travel in a URL, so they expire almost immediately.
+const REALTIME_TOKEN_TTL_SECONDS: i64 = 60;
 
 #[derive(Debug, Clone)]
 struct StoredAuthSession {
@@ -116,6 +127,7 @@ pub struct AppState {
     records: Arc<RwLock<HashMap<String, DynamicRecord>>>,
     configurations: Arc<RwLock<HashMap<String, ConfigurationDocument>>>,
     auth: Arc<AuthService>,
+    mailer: Arc<dyn Mailer>,
     sessions: Arc<RwLock<HashMap<Uuid, StoredAuthSession>>>,
     identities: Arc<RwLock<HashMap<String, StoredIdentity>>>,
     app_states: Arc<RwLock<HashMap<String, StoredAppState>>>,
@@ -131,6 +143,7 @@ impl Default for AppState {
             records: Arc::new(RwLock::new(HashMap::new())),
             configurations: Arc::new(RwLock::new(HashMap::new())),
             auth: Arc::new(AuthService::default()),
+            mailer: Arc::new(LogMailer),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             identities: Arc::new(RwLock::new(HashMap::new())),
             app_states: Arc::new(RwLock::new(HashMap::new())),
@@ -157,6 +170,11 @@ impl AppState {
 
     pub fn with_auth(mut self, auth: AuthService) -> Self {
         self.auth = Arc::new(auth);
+        self
+    }
+
+    pub fn with_mailer(mut self, mailer: Arc<dyn Mailer>) -> Self {
+        self.mailer = mailer;
         self
     }
 
@@ -1494,6 +1512,259 @@ impl AppState {
         Ok(())
     }
 
+    /// Mints a one-minute token for the realtime WebSocket handshake.
+    pub fn issue_realtime_token(
+        &self,
+        principal: &AuthPrincipal,
+    ) -> anyhow::Result<supercampus_authn::IssuedAccessToken> {
+        self.auth
+            .issue_access_token_with_ttl(
+                &principal.student.id,
+                &principal.student.tenant_id,
+                principal.session_id,
+                principal.roles.clone(),
+                REALTIME_TOKEN_TTL_SECONDS,
+            )
+            .context("failed to issue realtime token")
+    }
+
+    /// Resolves the navigation a caller may see.
+    ///
+    /// Sections live in `platform.navigation_sections` per tenant, so a tenant
+    /// administrator decides which parts of the workspace exist and which grants reveal
+    /// them. Visibility is recomputed from live effective grants on every call, so a
+    /// permission change takes effect without a new token or a redeploy.
+    pub async fn navigation(
+        &self,
+        tenant_slug: &str,
+        access: &EffectiveAccess,
+    ) -> anyhow::Result<Value> {
+        let mut sections: Vec<NavigationSection> = Vec::new();
+        if let Some(database) = &self.database {
+            let rows = sqlx::query(
+                r#"SELECT section.section_key, section.kind, section.label, section.route,
+                          section.icon, section.required_permissions, section.module_key,
+                          section.always_visible
+                   FROM platform.navigation_sections section
+                   JOIN platform.tenants tenant ON tenant.id = section.tenant_id
+                   WHERE tenant.slug = $1 AND section.active
+                   ORDER BY section.kind, section.sort_order, section.label"#,
+            )
+            .bind(tenant_slug)
+            .fetch_all(database.pool())
+            .await
+            .context("failed to load navigation sections")?;
+            for row in &rows {
+                sections.push(NavigationSection {
+                    key: row.try_get("section_key")?,
+                    kind: row.try_get("kind")?,
+                    label: row.try_get("label")?,
+                    route: row.try_get("route")?,
+                    icon: row.try_get("icon")?,
+                    required: row.try_get("required_permissions")?,
+                    module_key: row.try_get("module_key")?,
+                    always_visible: row.try_get("always_visible")?,
+                });
+            }
+        }
+        // An institution created after the navigation migration has no rows yet. Fall
+        // back to the platform defaults so a new tenant is never left without a menu.
+        if sections.is_empty() {
+            sections = default_navigation_sections();
+        }
+
+        let mut workspace = Vec::new();
+        let mut settings = Vec::new();
+        for section in &sections {
+            // The Settings entry is resolved after its children are known.
+            if section.kind == "workspace" && section.key == "settings" {
+                continue;
+            }
+            if !section_is_visible(
+                access,
+                &section.required,
+                section.module_key.as_deref(),
+                section.always_visible,
+            ) {
+                continue;
+            }
+            let entry = json!({
+                "key": section.key,
+                "label": section.label,
+                "route": section.route,
+                "icon": section.icon,
+            });
+            if section.kind == "settings" {
+                settings.push(entry);
+            } else {
+                workspace.push(entry);
+            }
+        }
+
+        // Settings only appears when at least one settings child is reachable.
+        if let Some(section) = sections
+            .iter()
+            .find(|section| section.kind == "workspace" && section.key == "settings")
+            && !settings.is_empty()
+        {
+            workspace.push(json!({
+                "key": section.key,
+                "label": section.label,
+                "route": section.route,
+                "icon": section.icon,
+            }));
+        }
+
+        Ok(json!({
+            "workspace": workspace,
+            "settings": settings,
+            "permissions": access.permissions,
+            "roles": access.roles,
+            "scopes": access.scopes,
+        }))
+    }
+
+    /// Starts a password reset.
+    ///
+    /// Always succeeds from the caller's perspective. An unknown address, an inactive
+    /// account, and a throttled account are indistinguishable in the response so the
+    /// endpoint cannot be used to enumerate registered emails.
+    pub async fn request_password_reset(&self, email: &str, base_url: &str) -> anyhow::Result<()> {
+        let email = email.trim().to_ascii_lowercase();
+        let Some(database) = &self.database else {
+            tracing::warn!("password reset requested without PostgreSQL configured");
+            return Ok(());
+        };
+
+        let user: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, display_name FROM identity.users WHERE email = $1 AND active",
+        )
+        .bind(&email)
+        .fetch_optional(database.pool())
+        .await
+        .context("failed to look up the reset account")?;
+
+        let Some((user_id, display_name)) = user else {
+            // Spend no further work, but do not tell the caller.
+            tracing::info!("password reset requested for an unknown or inactive address");
+            return Ok(());
+        };
+
+        let recent: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM identity.password_reset_tokens
+               WHERE user_id = $1 AND created_at > now() - ($2 || ' minutes')::interval"#,
+        )
+        .bind(user_id)
+        .bind(PASSWORD_RESET_THROTTLE_MINUTES.to_string())
+        .fetch_one(database.pool())
+        .await
+        .context("failed to count recent reset requests")?;
+
+        if recent >= PASSWORD_RESET_MAX_REQUESTS {
+            tracing::warn!(%user_id, "password reset throttled");
+            return Ok(());
+        }
+
+        // The raw token goes to the user; only its digest is stored.
+        let token = generate_refresh_token();
+        let token_hash = hash_refresh_token(&token);
+        let expires_at = Utc::now() + chrono::Duration::minutes(PASSWORD_RESET_TTL_MINUTES);
+
+        sqlx::query(
+            r#"INSERT INTO identity.password_reset_tokens (user_id, token_hash, expires_at)
+               VALUES ($1, $2, $3)"#,
+        )
+        .bind(user_id)
+        .bind(token_hash.to_vec())
+        .bind(expires_at)
+        .execute(database.pool())
+        .await
+        .context("failed to store the reset token")?;
+
+        let reset_url = format!(
+            "{}/reset-password?token={token}",
+            base_url.trim_end_matches('/')
+        );
+        let message = password_reset_email(&email, &display_name, &reset_url);
+
+        // Delivery failure must not surface a different response to the caller, otherwise
+        // the timing and status differences leak which addresses exist.
+        if let Err(error) = self.mailer.send(message).await {
+            tracing::error!(error = ?error, %user_id, "failed to deliver the password reset email");
+        }
+        Ok(())
+    }
+
+    /// Completes a password reset. Returns `false` when the token is unknown, expired,
+    /// or already used.
+    pub async fn reset_password(&self, token: &str, new_password: &str) -> anyhow::Result<bool> {
+        let database = self.database.as_ref().context("PostgreSQL is required")?;
+        let token_hash = hash_refresh_token(token);
+
+        let mut transaction = database.pool().begin().await?;
+
+        // Claim the token first. The UPDATE ... RETURNING is atomic, so two concurrent
+        // submissions of the same link cannot both proceed.
+        let claimed: Option<Uuid> = sqlx::query_scalar(
+            r#"UPDATE identity.password_reset_tokens
+               SET consumed_at = now()
+               WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
+               RETURNING user_id"#,
+        )
+        .bind(token_hash.to_vec())
+        .fetch_optional(&mut *transaction)
+        .await
+        .context("failed to claim the reset token")?;
+
+        let Some(user_id) = claimed else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+
+        let updated = sqlx::query(
+            r#"UPDATE identity.users
+               SET password_hash = crypt($2, gen_salt('bf', 12)), updated_at = now()
+               WHERE id = $1 AND active"#,
+        )
+        .bind(user_id)
+        .bind(new_password)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to update the password")?;
+
+        if updated.rows_affected() == 0 {
+            // The account was deactivated between the request and the reset.
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+
+        // Any other outstanding link for this account is now void.
+        sqlx::query(
+            r#"UPDATE identity.password_reset_tokens
+               SET consumed_at = now()
+               WHERE user_id = $1 AND consumed_at IS NULL"#,
+        )
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to invalidate outstanding reset tokens")?;
+
+        // A password change signs out every existing device.
+        sqlx::query(
+            r#"UPDATE identity.auth_sessions
+               SET revoked_at = now()
+               WHERE user_id = $1 AND revoked_at IS NULL"#,
+        )
+        .bind(user_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .context("failed to revoke sessions after the password change")?;
+
+        transaction.commit().await?;
+        tracing::info!(%user_id, "password reset completed and sessions revoked");
+        Ok(true)
+    }
+
     pub async fn app_state(
         &self,
         tenant_id: &str,
@@ -1676,6 +1947,247 @@ fn record_key(tenant_id: &str, module_key: &str, id: Uuid) -> String {
 
 fn configuration_key(tenant_id: &str, namespace: &str) -> String {
     format!("{tenant_id}:{namespace}")
+}
+
+struct NavigationSection {
+    key: String,
+    kind: String,
+    label: String,
+    route: Option<String>,
+    icon: Option<String>,
+    required: Vec<String>,
+    module_key: Option<String>,
+    always_visible: bool,
+}
+
+/// Platform defaults, mirroring migration 0019.
+///
+/// Used only when an institution has no navigation rows of its own, which happens for
+/// tenants provisioned after that migration ran.
+fn default_navigation_sections() -> Vec<NavigationSection> {
+    const DEFAULTS: &[(&str, &str, &str, &str, &[&str], Option<&str>, bool)] = &[
+        (
+            "dashboard",
+            "workspace",
+            "Dashboard",
+            "LayoutDashboard",
+            &["crm.dashboard.read"],
+            None,
+            false,
+        ),
+        (
+            "crm",
+            "workspace",
+            "CRM",
+            "Target",
+            &["crm.dashboard.read"],
+            None,
+            false,
+        ),
+        (
+            "pipeline",
+            "workspace",
+            "Pipeline",
+            "Kanban",
+            &["crm.leads.read"],
+            None,
+            false,
+        ),
+        (
+            "admissions",
+            "workspace",
+            "Admissions",
+            "ClipboardList",
+            &["crm.erp.handoff"],
+            Some("admissions"),
+            false,
+        ),
+        (
+            "application-desk",
+            "workspace",
+            "Application Desk",
+            "IdCard",
+            &[],
+            Some("application-desk"),
+            false,
+        ),
+        (
+            "students",
+            "workspace",
+            "Students",
+            "Users",
+            &[],
+            Some("students"),
+            false,
+        ),
+        (
+            "academics",
+            "workspace",
+            "Academics",
+            "ListChecks",
+            &[],
+            Some("academics"),
+            false,
+        ),
+        (
+            "fees",
+            "workspace",
+            "Fees & Finance",
+            "Database",
+            &[],
+            Some("fees"),
+            false,
+        ),
+        (
+            "erp",
+            "workspace",
+            "ERP Services",
+            "Layers",
+            &[],
+            Some("erp"),
+            false,
+        ),
+        (
+            "reports",
+            "workspace",
+            "Reports & BI",
+            "BarChart3",
+            &["crm.reports.read"],
+            None,
+            false,
+        ),
+        (
+            "users",
+            "workspace",
+            "Users & Roles",
+            "UserCog",
+            &[
+                "authorization.users.read",
+                "authorization.roles.read",
+                "authorization.permissions.read",
+            ],
+            None,
+            false,
+        ),
+        (
+            "settings",
+            "workspace",
+            "Settings",
+            "Settings",
+            &[],
+            None,
+            false,
+        ),
+        ("account", "settings", "Account", "UserCog", &[], None, true),
+        (
+            "access",
+            "settings",
+            "Access Control",
+            "ShieldCheck",
+            &[
+                "authorization.permissions.read",
+                "authorization.roles.read",
+                "authorization.users.read",
+            ],
+            None,
+            false,
+        ),
+        (
+            "forms",
+            "settings",
+            "Form Builders",
+            "ClipboardList",
+            &["crm.forms.read"],
+            None,
+            false,
+        ),
+        (
+            "workflows",
+            "settings",
+            "Workflow Studio",
+            "Workflow",
+            &["crm.configuration.read"],
+            None,
+            false,
+        ),
+        (
+            "theme",
+            "settings",
+            "Theme",
+            "Palette",
+            &["platform.configuration.update"],
+            None,
+            false,
+        ),
+    ];
+    DEFAULTS
+        .iter()
+        .map(
+            |(key, kind, label, icon, required, module_key, always_visible)| NavigationSection {
+                key: (*key).into(),
+                kind: (*kind).into(),
+                label: (*label).into(),
+                route: Some("/dashboard/admissions".into()),
+                icon: Some((*icon).into()),
+                required: required.iter().map(|value| (*value).to_string()).collect(),
+                module_key: module_key.map(str::to_owned),
+                always_visible: *always_visible,
+            },
+        )
+        .collect()
+}
+
+/// ANY-of visibility: a full-tenant grant, an explicitly listed permission, or any
+/// permission inside the section's module reveals it.
+fn section_is_visible(
+    access: &EffectiveAccess,
+    required: &[String],
+    module_key: Option<&str>,
+    always_visible: bool,
+) -> bool {
+    if always_visible || access.allows("*") {
+        return true;
+    }
+    if required.iter().any(|permission| access.allows(permission)) {
+        return true;
+    }
+    match module_key {
+        Some(module_key) => {
+            let prefix = format!("{module_key}.");
+            access
+                .permissions
+                .iter()
+                .any(|permission| permission.starts_with(&prefix))
+        }
+        None => false,
+    }
+}
+
+fn password_reset_email(email: &str, display_name: &str, reset_url: &str) -> EmailMessage {
+    let name = display_name.trim();
+    let greeting = if name.is_empty() { "Hello" } else { name };
+    let text_body = format!(
+        "{greeting},\n\n\
+         We received a request to reset the password for your SuperCampus account.\n\n\
+         Open this link to choose a new password:\n{reset_url}\n\n\
+         The link expires in {PASSWORD_RESET_TTL_MINUTES} minutes and can be used once.\n\n\
+         If you did not request this, you can ignore this email. Your password stays unchanged.\n\n\
+         SuperCampus"
+    );
+    let html_body = format!(
+        "<p>{greeting},</p>\
+         <p>We received a request to reset the password for your SuperCampus account.</p>\
+         <p><a href=\"{reset_url}\">Choose a new password</a></p>\
+         <p>The link expires in {PASSWORD_RESET_TTL_MINUTES} minutes and can be used once.</p>\
+         <p>If you did not request this, you can ignore this email. Your password stays unchanged.</p>\
+         <p>SuperCampus</p>"
+    );
+    EmailMessage {
+        to: email.to_owned(),
+        subject: "Reset your SuperCampus password".into(),
+        text_body,
+        html_body: Some(html_body),
+    }
 }
 
 fn app_state_key(tenant_id: &str, user_id: &str) -> String {

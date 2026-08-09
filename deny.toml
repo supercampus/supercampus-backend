@@ -3,7 +3,9 @@ ignore = []
 
 [licenses]
 confidence-threshold = 0.8
-allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
+# 0BSD arrives with lettre's message builder (quoted_printable) and is public-domain
+# equivalent, so it is strictly more permissive than the entries beside it.
+allow = ["0BSD", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
 
 [bans]
 multiple-versions = "warn"

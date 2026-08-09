@@ -14,11 +14,12 @@ serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "sync"] }
 uuid.workspace = true
 supercampus-database = { path = "../../crates/database" }
 supercampus-kernel.workspace = true
 supercampus-module-sdk.workspace = true
+supercampus-application-desk = { path = "../application-desk" }
 
 [dev-dependencies]
 tower.workspace = true

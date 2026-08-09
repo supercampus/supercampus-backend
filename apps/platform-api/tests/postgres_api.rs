@@ -421,3 +421,176 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
         .await
         .expect("clean RBAC users");
 }
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL and writes temporary rows"]
+async fn password_reset_replaces_the_password_and_revokes_existing_sessions() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+    let database = Database::connect(&url).await.expect("database connection");
+    database.migrate().await.expect("database migration");
+
+    let tenant = format!("reset-{}", Uuid::new_v4());
+    let email = format!("reset-{}@supercampus.test", Uuid::new_v4());
+    let old_password = "original-test-password";
+    let new_password = "replacement-test-password";
+
+    let tenant_id: Uuid = sqlx::query_scalar(
+        r#"INSERT INTO platform.tenants (slug, code, name)
+           VALUES ($1, $2, $3) RETURNING id"#,
+    )
+    .bind(&tenant)
+    .bind(tenant.to_uppercase())
+    .bind("Reset Test Campus")
+    .fetch_one(database.pool())
+    .await
+    .expect("create tenant");
+    let user_id: Uuid = sqlx::query_scalar(
+        r#"INSERT INTO identity.users
+           (email, password_hash, display_name, initials, account_type)
+           VALUES ($1, crypt($2, gen_salt('bf', 4)), 'Reset User', 'RU', 'staff')
+           RETURNING id"#,
+    )
+    .bind(&email)
+    .bind(old_password)
+    .fetch_one(database.pool())
+    .await
+    .expect("create identity");
+    sqlx::query(
+        r#"INSERT INTO identity.tenant_memberships
+           (tenant_id, user_id, roles, is_primary, profile)
+           VALUES ($1, $2, $3, true, '{}'::jsonb)"#,
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(vec!["admissions_manager"])
+    .execute(database.pool())
+    .await
+    .expect("create membership");
+
+    let state = AppState::with_database(database.clone());
+    let api = app(state.clone());
+
+    // Sign in so there is a live session that the reset must revoke.
+    let login = api
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"email":"{email}","password":"{old_password}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(login.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let session_id = body["data"]["sessionId"].as_str().unwrap().to_owned();
+
+    // Request the reset through the public endpoint.
+    let requested = api
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/forgot-password")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"email":"{email}"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(requested.status(), StatusCode::ACCEPTED);
+
+    // The raw token is only in the email, so drive the state layer directly with a
+    // token we plant ourselves using the same hashing the service uses.
+    let raw_token = format!("test-{}", Uuid::new_v4());
+    let token_hash: [u8; 32] = supercampus_authn::hash_refresh_token(&raw_token);
+    sqlx::query(
+        r#"INSERT INTO identity.password_reset_tokens (user_id, token_hash, expires_at)
+           VALUES ($1, $2, now() + interval '1 hour')"#,
+    )
+    .bind(user_id)
+    .bind(token_hash.to_vec())
+    .execute(database.pool())
+    .await
+    .expect("plant reset token");
+
+    let reset = api
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/reset-password")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"token":"{raw_token}","password":"{new_password}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+
+    // The same token cannot be replayed.
+    let replay = api
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/reset-password")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"token":"{raw_token}","password":"another-long-password"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+
+    // The old password no longer works.
+    let stale_login = api
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"email":"{email}","password":"{old_password}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_login.status(), StatusCode::UNAUTHORIZED);
+
+    // The new password does.
+    let fresh_login = api
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"email":"{email}","password":"{new_password}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh_login.status(), StatusCode::OK);
+
+    // The session that existed before the reset is revoked.
+    let revoked: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM identity.auth_sessions WHERE id = $1::uuid")
+            .bind(&session_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read session");
+    assert!(revoked.is_some(), "pre-reset session must be revoked");
+
+    sqlx::query("DELETE FROM platform.tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(database.pool())
+        .await
+        .ok();
+    sqlx::query("DELETE FROM identity.users WHERE id = $1")
+        .bind(user_id)
+        .execute(database.pool())
+        .await
+        .ok();
+}

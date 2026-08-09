@@ -55,6 +55,7 @@ fn trigger(suffix: &str) -> AdmissionTrigger {
         applicant_id: format!("APP-{suffix}"),
         application_id: format!("APL-{suffix}"),
         admission_id: format!("ADM-{suffix}"),
+        crm_lead_id: None,
         admission_status: "CONFIRMED".into(),
         academic_year: Some("2026".into()),
         admission_category: Some("GENERAL".into()),

@@ -4,10 +4,14 @@ Implementation-synchronized documentation for the Rust backend as inspected on 3
 
 ## Coverage
 
-The running `platform-api` mounts **76 operations**:
+The running `platform-api` mounts **81 operations**:
 
-- 22 system, authentication, state, catalog, configuration, and dynamic-record operations.
-- 54 CRM operations, including one WebSocket upgrade endpoint.
+- 25 system, authentication, state, catalog, configuration, and dynamic-record operations.
+- 56 CRM operations, including one WebSocket upgrade endpoint.
+
+Added since the 31 July inspection: password reset (`forgot-password`, `reset-password`),
+server-driven `navigation`, the realtime handshake token, and published-form lookup by
+type.
 - 12 module packages are registered in the catalog, but only CRM has a mounted module-specific router.
 
 The canonical implementation sources are:
@@ -51,6 +55,7 @@ Documentation never treats a manifest or placeholder OpenAPI file as proof that 
 | [CRM module](modules/crm.md) | Every CRM endpoint, validation and side effect |
 | [Module status](modules/not-implemented.md) | HTTP features that are scaffolds or absent |
 | [OpenAPI 3.1](openapi.yaml) | Swagger UI/ReDoc compatible machine contract |
+| [API reference (PDF)](SuperCampus-API-Reference.pdf) | Printable reference rendered from `openapi.yaml` |
 | [Swagger JSON](swagger.json) | JSON form of the OpenAPI contract |
 | [Postman collection](postman/SuperCampus.postman_collection.json) | Importable requests |
 | [Postman environment](postman/SuperCampus.environment.json) | Local variables |
@@ -122,3 +127,23 @@ sequenceDiagram
 - A caller-provided `x-tenant-id` must match the JWT `tid` claim.
 - CRM identifiers are UUIDs unless documented otherwise.
 - Unknown JSON fields are currently accepted by Serde.
+
+## Regenerating the PDF reference
+
+`SuperCampus-API-Reference.pdf` is rendered from `openapi.yaml`, so it should be
+rebuilt whenever routes change. It needs Node and a Chromium-based browser; no npm
+install is required.
+
+```bash
+# 1. Render the printable HTML from the contract
+DOC_DATE="$(date +'%d %B %Y')" node docs/build-api-doc.mjs docs/openapi.yaml /tmp/api-reference.html
+
+# 2. Print it to PDF (Chrome or Edge, headless)
+"/c/Program Files/Google/Chrome/Application/chrome.exe" \
+  --headless --disable-gpu --no-pdf-header-footer \
+  --print-to-pdf="docs/SuperCampus-API-Reference.pdf" \
+  "file:///tmp/api-reference.html"
+```
+
+The generator reads the contract only. It never inspects the running service, so the
+PDF is exactly as accurate as `openapi.yaml`.

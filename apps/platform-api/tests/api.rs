@@ -376,3 +376,153 @@ async fn jwt_claims_override_spoofed_crm_identity_headers() {
     assert_eq!(body["data"]["primaryRole"], "admissions_manager");
     assert_eq!(body["data"]["permissions"][0], "*");
 }
+
+#[tokio::test]
+async fn forgot_password_is_public_and_does_not_reveal_whether_the_account_exists() {
+    let app = test_app();
+    let mut bodies = Vec::new();
+    for email in [TEST_EMAIL, "definitely-not-registered@supercampus.test"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/forgot-password")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"email":"{email}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        bodies.push(body);
+    }
+    // A registered and an unregistered address must be indistinguishable.
+    assert_eq!(bodies[0], bodies[1]);
+}
+
+#[tokio::test]
+async fn reset_password_rejects_a_password_below_the_minimum_length() {
+    let response = test_app()
+        .oneshot(
+            Request::post("/api/auth/reset-password")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"token":"any-token","password":"short"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("12 characters"));
+}
+
+#[tokio::test]
+async fn reset_password_rejects_an_empty_token() {
+    let response = test_app()
+        .oneshot(
+            Request::post("/api/auth/reset-password")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"token":"   ","password":"a-sufficiently-long-password"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn navigation_and_realtime_token_require_authentication() {
+    let app = test_app();
+    for (method, path) in [
+        ("GET", "/api/v1/navigation"),
+        ("POST", "/api/auth/realtime-token"),
+    ] {
+        let request = if method == "GET" {
+            Request::get(path).body(Body::empty()).unwrap()
+        } else {
+            Request::post(path).body(Body::empty()).unwrap()
+        };
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} must not be public"
+        );
+    }
+}
+
+#[tokio::test]
+async fn navigation_returns_sections_the_grants_allow() {
+    let app = test_app();
+    let session = login_session(&app, "tenant-local").await;
+    let response = app
+        .oneshot(
+            Request::get("/api/v1/navigation")
+                .header(header::AUTHORIZATION, session.bearer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let workspace = body["data"]["workspace"].as_array().unwrap();
+    let keys: Vec<&str> = workspace
+        .iter()
+        .map(|section| section["key"].as_str().unwrap())
+        .collect();
+    // The in-memory identity holds "*", so every default section resolves.
+    assert!(keys.contains(&"crm"), "expected crm section, got {keys:?}");
+    assert!(keys.contains(&"pipeline"));
+    // Settings is only emitted once at least one settings child is reachable.
+    assert!(keys.contains(&"settings"));
+    assert!(!body["data"]["settings"].as_array().unwrap().is_empty());
+    // Every section must carry what the client needs to render it.
+    for section in workspace {
+        assert!(
+            section["label"].is_string(),
+            "section missing label: {section}"
+        );
+        assert!(section["key"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn realtime_token_is_short_lived_and_accepted_as_a_query_credential() {
+    let app = test_app();
+    let session = login_session(&app, "tenant-local").await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/realtime-token")
+                .header(header::AUTHORIZATION, session.bearer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let token = body["data"]["token"].as_str().unwrap().to_owned();
+    assert!(!token.is_empty());
+
+    // The query credential is only honoured on the realtime stream path. Any other
+    // route must still reject it, so the relaxation cannot widen the auth surface.
+    let elsewhere = app
+        .oneshot(
+            Request::get(format!("/api/v1/navigation?access_token={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(elsewhere.status(), StatusCode::UNAUTHORIZED);
+}

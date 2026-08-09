@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::{
     types::{
@@ -23,6 +24,8 @@ pub struct AdmissionTrigger {
     pub applicant_id: String,
     pub application_id: String,
     pub admission_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crm_lead_id: Option<Uuid>,
     pub admission_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub academic_year: Option<String>,
@@ -108,6 +111,7 @@ pub fn evaluate_intake(
         entry.applicant_id == trigger.applicant_id
             || entry.application_id == trigger.application_id
             || entry.admission_id == trigger.admission_id
+            || (trigger.crm_lead_id.is_some() && entry.crm_lead_id == trigger.crm_lead_id)
     });
 
     if let Some(duplicate) = duplicate
@@ -163,6 +167,7 @@ pub fn create_case(
         applicant_id: trigger.applicant_id.clone(),
         application_id: trigger.application_id.clone(),
         admission_id: trigger.admission_id.clone(),
+        crm_lead_id: trigger.crm_lead_id,
         stage: OnboardingStage::DataReview,
         status: OnboardingStatus::Active,
         resume_stage: None,

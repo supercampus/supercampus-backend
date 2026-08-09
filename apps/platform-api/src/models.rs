@@ -168,6 +168,19 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForgotPasswordRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResetPasswordRequest {
+    pub token: String,
+    pub password: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantSummary {
     pub id: String,

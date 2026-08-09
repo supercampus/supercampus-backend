@@ -79,7 +79,14 @@ pub async fn run() -> anyhow::Result<()> {
     control_database.migrate().await?;
     let tenant_databases =
         TenantDatabaseManager::clustered(control_database.clone(), &control_database_url)?;
-    let state = AppState::with_tenant_databases(tenant_databases.clone()).with_auth(auth);
+    let mailer = supercampus_notifications::mailer_from_environment()?;
+    tracing::info!(
+        transport = mailer.transport(),
+        "outbound email transport ready"
+    );
+    let state = AppState::with_tenant_databases(tenant_databases.clone())
+        .with_auth(auth)
+        .with_mailer(mailer);
     let seeded = state.seed_test_identities_from_environment().await?;
     if seeded > 0 {
         tracing::info!(count = seeded, "testing identities seeded from environment");

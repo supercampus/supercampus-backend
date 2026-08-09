@@ -102,8 +102,32 @@ impl AuthService {
         session_id: Uuid,
         roles: Vec<String>,
     ) -> Result<IssuedAccessToken, AuthError> {
+        self.issue_access_token_with_ttl(
+            user_id,
+            tenant_id,
+            session_id,
+            roles,
+            self.access_token_ttl_seconds,
+        )
+    }
+
+    /// Issues an access token with an explicit lifetime.
+    ///
+    /// Used for the realtime WebSocket handshake, which needs a token that expires in
+    /// seconds rather than minutes because it travels in a URL.
+    pub fn issue_access_token_with_ttl(
+        &self,
+        user_id: &str,
+        tenant_id: &str,
+        session_id: Uuid,
+        roles: Vec<String>,
+        ttl_seconds: i64,
+    ) -> Result<IssuedAccessToken, AuthError> {
+        if ttl_seconds <= 0 {
+            return Err(AuthError::InvalidLifetime);
+        }
         let issued_at = Utc::now();
-        let expires_at = issued_at + Duration::seconds(self.access_token_ttl_seconds);
+        let expires_at = issued_at + Duration::seconds(ttl_seconds);
         let claims = AccessClaims {
             sub: user_id.to_owned(),
             tid: tenant_id.to_owned(),

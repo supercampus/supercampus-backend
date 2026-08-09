@@ -14,9 +14,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::domain::{
-    AuditEntry, OnboardingCase, OnboardingEvent, OnboardingServices, ServiceError,
-    StudentNumberFormat, StudentNumberInput, WorkflowDefinition, default_workflow, department_code,
-    format_student_number, intake::IntakeTriggerMode, sequence_scope,
+    AuditEntry, OnboardingCase, OnboardingEvent, OnboardingServices, OnboardingStatus,
+    ServiceError, StudentNumberFormat, StudentNumberInput, WorkflowDefinition, default_workflow,
+    department_code, format_student_number, intake::IntakeTriggerMode, sequence_scope,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -283,7 +283,93 @@ impl PostgresDeskRepository {
         .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Some(lead_id) = onboarding.crm_lead_id {
+                    let linked = sqlx::query(
+                        r#"INSERT INTO crm.lead_application_links
+                           (tenant_id, lead_id, case_id, application_id, admission_id, application_status)
+                           SELECT $1, lead.id, $3, $4, $5, $6
+                           FROM crm.leads lead
+                           WHERE lead.tenant_id = $1 AND lead.id = $2 AND lead.deleted_at IS NULL
+                           ON CONFLICT (tenant_id, lead_id) DO UPDATE SET
+                               case_id = EXCLUDED.case_id,
+                               application_id = EXCLUDED.application_id,
+                               admission_id = EXCLUDED.admission_id,
+                               application_status = EXCLUDED.application_status,
+                               updated_at = now()"#,
+                    )
+                    .bind(tenant_id)
+                    .bind(lead_id)
+                    .bind(&onboarding.id)
+                    .bind(&onboarding.application_id)
+                    .bind(&onboarding.admission_id)
+                    .bind(onboarding.status.as_str())
+                    .execute(&mut **transaction)
+                    .await?;
+                    if linked.rows_affected() != 1 {
+                        return Err(DeskError::Conflict(
+                            "CRM lead does not belong to this tenant".into(),
+                        ));
+                    }
+
+                    let current_crm_stage: Option<String> = sqlx::query_scalar(
+                        "SELECT stage_key FROM crm.leads WHERE tenant_id = $1 AND id = $2",
+                    )
+                    .bind(tenant_id)
+                    .bind(lead_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?;
+                    let (stage, substate) = match onboarding.status {
+                        OnboardingStatus::Completed => ("offer_status", "accepted"),
+                        OnboardingStatus::Rejected
+                        | OnboardingStatus::Cancelled
+                        | OnboardingStatus::Withdrawn
+                        | OnboardingStatus::Expired => ("offer_status", "rejected"),
+                        _ if current_crm_stage.as_deref() == Some("offer_status") => {
+                            ("offer_status", "to_do")
+                        }
+                        _ => ("application_status", "awaiting_decision"),
+                    };
+                    sqlx::query(
+                        r#"UPDATE crm.leads SET
+                               stage_key = $3,
+                               substate_key = $4,
+                               global_status = CASE
+                                   WHEN $5 = 'ON_HOLD' THEN 'on_hold'
+                                   WHEN global_status = 'on_hold' THEN NULL
+                                   ELSE global_status
+                               END,
+                               stage_entered_at = CASE WHEN stage_key <> $3 THEN now() ELSE stage_entered_at END,
+                               updated_at = now()
+                           WHERE tenant_id = $1 AND id = $2"#,
+                    )
+                    .bind(tenant_id)
+                    .bind(lead_id)
+                    .bind(stage)
+                    .bind(substate)
+                    .bind(onboarding.status.as_str())
+                    .execute(&mut **transaction)
+                    .await?;
+                    sqlx::query(
+                        r#"INSERT INTO crm.outbox_events
+                           (tenant_id, aggregate_id, event_type, payload)
+                           VALUES ($1, $2, 'application.status_synced', $3)"#,
+                    )
+                    .bind(tenant_id)
+                    .bind(lead_id)
+                    .bind(serde_json::json!({
+                        "leadId": lead_id,
+                        "caseId": onboarding.id,
+                        "applicationId": onboarding.application_id,
+                        "applicationStatus": onboarding.status.as_str(),
+                        "toStage": stage,
+                        "toSubstate": substate
+                    }))
+                    .execute(&mut **transaction)
+                    .await?;
+                }
+                Ok(())
+            }
             Err(sqlx::Error::Database(error)) if error.is_unique_violation() => Err(
                 DeskError::Conflict("A live onboarding case already exists for this applicant, application or admission".into()),
             ),

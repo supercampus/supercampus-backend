@@ -9,7 +9,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use supercampus_application_desk::{
+    application::{ActorContext as DeskActorContext, ApplicationDeskService},
+    domain::{AdmissionTrigger, ApplicantSnapshot},
+};
 use supercampus_database::TenantDatabaseManager;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
@@ -22,6 +27,7 @@ use crate::{
 pub struct CrmApiState {
     pub databases: Option<TenantDatabaseManager>,
     pub catalog_service: CrmService,
+    pub realtime_wake: broadcast::Sender<()>,
 }
 
 impl CrmApiState {
@@ -35,6 +41,57 @@ impl CrmApiState {
             .await
             .map_err(|error| CrmHttpError(CrmError::Storage(error.to_string())))?;
         Ok(CrmService::new(Some(database)))
+    }
+
+    async fn reflect_offer_in_application_desk(
+        &self,
+        context: &RequestContext,
+        lead: &crate::domain::Lead,
+    ) -> Result<(), CrmHttpError> {
+        if lead.stage_key != "offer_status" {
+            return Ok(());
+        }
+        let databases = self
+            .databases
+            .as_ref()
+            .ok_or(CrmHttpError(CrmError::Unavailable))?;
+        let database = databases
+            .tenant(&context.tenant)
+            .await
+            .map_err(|error| CrmHttpError(CrmError::Storage(error.to_string())))?;
+        let desk = ApplicationDeskService::new(database);
+        let actor = DeskActorContext {
+            user_id: context.actor.user_id.clone(),
+            roles: context.actor.roles.clone(),
+            permissions: vec!["application-desk.create".into()],
+        };
+        let program_id = lead
+            .academic
+            .get("programId")
+            .or_else(|| lead.academic.get("program"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let trigger = AdmissionTrigger {
+            applicant_id: lead.id.to_string(),
+            application_id: format!("CRM-APP-{}", lead.id),
+            admission_id: format!("CRM-OFFER-{}", lead.id),
+            crm_lead_id: Some(lead.id),
+            admission_status: "CONFIRMED".into(),
+            program_id,
+            fee_paid: lead.fee_payment_confirmed,
+            applicant: ApplicantSnapshot {
+                full_name: Some(lead.full_name.clone()),
+                email: lead.email.clone(),
+                phone: lead.phone.clone(),
+                guardian_name: lead.parent_name.clone(),
+                guardian_email: None,
+            },
+            ..AdmissionTrigger::default()
+        };
+        desk.open_case(&context.tenant, &actor, trigger)
+            .await
+            .map_err(|error| CrmHttpError(CrmError::Storage(error.to_string())))?;
+        Ok(())
     }
 }
 
@@ -224,6 +281,18 @@ pub async fn list_leads(
         .await?))
 }
 
+pub async fn list_unassigned_leads(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Query(filters): Query<LeadFilters>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .unassigned_leads(&context.tenant, &context.actor, filters)
+        .await?))
+}
+
 pub async fn get_lead(
     State(state): State<CrmApiState>,
     headers: HeaderMap,
@@ -275,6 +344,19 @@ pub async fn assign_lead(
         .await?))
 }
 
+pub async fn claim_lead(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<ClaimLeadRequest>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .claim(&context.tenant, &context.actor, id, request)
+        .await?))
+}
+
 pub async fn reassign_lead(
     State(state): State<CrmApiState>,
     headers: HeaderMap,
@@ -296,9 +378,14 @@ pub async fn move_stage(
 ) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
     let context = RequestContext::from_headers(&headers)?;
     let service = state.service(&context.tenant).await?;
-    Ok(ok(service
+    let moved = service
         .move_stage(&context.tenant, &context.actor, id, request)
-        .await?))
+        .await?;
+    state
+        .reflect_offer_in_application_desk(&context, &moved)
+        .await?;
+    let _ = state.realtime_wake.send(());
+    Ok(ok(moved))
 }
 
 pub async fn mark_prospect(
@@ -403,6 +490,116 @@ pub async fn board(
         .await?))
 }
 
+pub async fn add_lead_note(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<CreateLeadNoteRequest>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .add_lead_note(&context.tenant, &context.actor, id, request)
+        .await?))
+}
+
+pub async fn add_lead_task(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<CreateLeadTaskRequest>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .add_lead_task(&context.tenant, &context.actor, id, request)
+        .await?))
+}
+
+pub async fn request_stage_move(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<MoveStageRequest>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .request_stage_move(&context.tenant, &context.actor, id, request)
+        .await?))
+}
+
+pub async fn list_move_requests(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .move_requests(&context.tenant, &context.actor)
+        .await?))
+}
+
+pub async fn approve_move_request(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<MoveRequestDecision>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    let decision = service
+        .decide_stage_move(&context.tenant, &context.actor, id, true, request)
+        .await?;
+    if decision.status == "approved" && decision.to_stage == "offer_status" {
+        let moved = service
+            .get_lead(&context.tenant, &context.actor, decision.lead_id)
+            .await?;
+        state
+            .reflect_offer_in_application_desk(&context, &moved)
+            .await?;
+    }
+    let _ = state.realtime_wake.send(());
+    Ok(ok(decision))
+}
+
+pub async fn reject_move_request(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<MoveRequestDecision>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .decide_stage_move(&context.tenant, &context.actor, id, false, request)
+        .await?))
+}
+
+pub async fn application_link(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<Value>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .application_link(&context.tenant, &context.actor, id)
+        .await?))
+}
+
+pub async fn my_board(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Query(filters): Query<LeadFilters>,
+) -> Result<Json<ApiResponse<Value>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .my_board(&context.tenant, &context.actor, filters)
+        .await?))
+}
+
 pub async fn operations_dashboard(
     State(state): State<CrmApiState>,
     headers: HeaderMap,
@@ -411,6 +608,17 @@ pub async fn operations_dashboard(
     let service = state.service(&context.tenant).await?;
     Ok(ok(service
         .operations_dashboard(&context.tenant, &context.actor)
+        .await?))
+}
+
+pub async fn recent_activity(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<Vec<Value>>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .recent_activity(&context.tenant, &context.actor)
         .await?))
 }
 
@@ -431,8 +639,9 @@ pub async fn realtime_events(
     let initial = service
         .realtime_events(&context.tenant, &context.actor, query.cursor)
         .await?;
+    let wake = state.realtime_wake.subscribe();
     Ok(ws.on_upgrade(move |socket| {
-        stream_realtime_events(socket, service, context.tenant, query.cursor, initial)
+        stream_realtime_events(socket, service, context.tenant, query.cursor, initial, wake)
     }))
 }
 
@@ -442,6 +651,7 @@ async fn stream_realtime_events(
     tenant: String,
     mut cursor: i64,
     mut events: Vec<Value>,
+    mut wake: broadcast::Receiver<()>,
 ) {
     loop {
         for event in events {
@@ -456,7 +666,27 @@ async fn stream_realtime_events(
                 return;
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Wait for the next poll tick, but abandon the stream the moment the client
+        // goes away. Watching only for send failures is not enough: a quiet tenant
+        // produces no sends, so a disconnected socket would otherwise keep polling the
+        // database once a second for the lifetime of the process.
+        let client_disconnected = tokio::select! {
+            incoming = socket.recv() => matches!(
+                incoming,
+                // Close frame, transport error, or end of stream: the client is gone.
+                None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+            ),
+            // Movement handlers wake every connected tenant stream immediately.
+            // The heartbeat preserves outbox recovery for events written by jobs or
+            // another process that cannot access this in-memory notifier.
+            _ = wake.recv() => false,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => false,
+        };
+        if client_disconnected {
+            return;
+        }
+
         events = match service.realtime_events_raw(&tenant, cursor).await {
             Ok(events) => events,
             Err(error) => {
@@ -537,6 +767,31 @@ pub async fn published_lead_capture_form(
     let service = state.service(&context.tenant).await?;
     Ok(ok(service
         .published_lead_capture_form(&context.tenant, &context.actor)
+        .await?))
+}
+
+/// Every published form, so the workspace can discover what an administrator offers.
+pub async fn published_forms(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .published_forms(&context.tenant, &context.actor)
+        .await?))
+}
+
+/// The published form of one type, for example `application` or `document_checklist`.
+pub async fn published_form_by_type(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(form_type): Path<String>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .published_form_by_type(&context.tenant, &context.actor, &form_type)
         .await?))
 }
 

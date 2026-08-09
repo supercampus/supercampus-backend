@@ -100,7 +100,10 @@ mod tests {
     fn access(permissions: &[&str]) -> EffectiveAccess {
         EffectiveAccess {
             roles: Vec::new(),
-            permissions: permissions.iter().map(|permission| permission.to_string()).collect(),
+            permissions: permissions
+                .iter()
+                .map(|permission| permission.to_string())
+                .collect(),
             scopes: HashMap::new(),
         }
     }

@@ -185,6 +185,32 @@ fn intake_blocks_a_duplicate_applicant_but_allows_readmission_after_a_closed_cas
 }
 
 #[test]
+fn intake_blocks_a_duplicate_crm_lead_even_when_external_ids_differ() {
+    let lead_id = uuid::Uuid::new_v4();
+    let definition = default_workflow(TENANT);
+    let mut original = trigger();
+    original.crm_lead_id = Some(lead_id);
+    let existing = create_case(
+        &original,
+        &definition,
+        CreateCaseOptions {
+            id: "ONB-CRM-1".into(),
+            now: now(),
+            assigned_to: None,
+        },
+    );
+    let mut replay = trigger();
+    replay.applicant_id = "different-applicant-id".into();
+    replay.application_id = "different-application-id".into();
+    replay.admission_id = "different-admission-id".into();
+    replay.crm_lead_id = Some(lead_id);
+
+    let decision = evaluate_intake(&replay, &[existing], IntakeTriggerMode::OnConfirmed);
+    assert!(!decision.create);
+    assert_eq!(decision.duplicate_of.as_deref(), Some("ONB-CRM-1"));
+}
+
+#[test]
 fn intake_honours_the_fee_paid_trigger_mode() {
     assert!(!evaluate_intake(&trigger(), &[], IntakeTriggerMode::OnFeePaid).create);
     let mut paid = trigger();

@@ -20,6 +20,7 @@ uuid.workspace = true
 supercampus-authn = { path = "../../crates/authn" }
 supercampus-observability.workspace = true
 supercampus-database = { path = "../../crates/database" }
+supercampus-notifications = { path = "../../crates/notifications" }
 supercampus-crm = { path = "../../modules/crm" }
 supercampus-application-desk = { path = "../../modules/application-desk" }
 

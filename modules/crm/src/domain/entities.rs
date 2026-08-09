@@ -61,6 +61,27 @@ pub struct StageHistoryEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LeadMoveRequest {
+    pub id: Uuid,
+    pub lead_id: Uuid,
+    pub lead_name: String,
+    pub requested_by: String,
+    pub owner_id: String,
+    pub from_stage: String,
+    pub from_substate: String,
+    pub to_stage: String,
+    pub to_substate: String,
+    pub reason: Option<String>,
+    pub notes: Option<String>,
+    pub status: String,
+    pub decision_reason: Option<String>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub decided_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Communication {
     pub id: Uuid,
     pub lead_id: Uuid,
@@ -115,6 +136,7 @@ pub struct Campaign {
     pub status: String,
     pub starts_on: Option<NaiveDate>,
     pub ends_on: Option<NaiveDate>,
+    pub form_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

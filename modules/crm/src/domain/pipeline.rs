@@ -194,9 +194,7 @@ pub fn validate_transition(
         (PrimaryStage::Application, PrimaryStage::ApplicationStatus) => {
             to_substate == "awaiting_decision"
         }
-        (PrimaryStage::ApplicationStatus, PrimaryStage::OfferStatus) => {
-            to_substate == "to_do"
-        }
+        (PrimaryStage::ApplicationStatus, PrimaryStage::OfferStatus) => to_substate == "to_do",
         (_, PrimaryStage::Archived) => true,
         _ => false,
     };

@@ -232,7 +232,7 @@ pub fn validate_database_name(database_name: &str) -> anyhow::Result<()> {
 pub const CRATE_NAME: &str = "supercampus-database";
 
 /// Latest forward-only runtime migration embedded in this build.
-pub const RUNTIME_MIGRATION_VERSION: i64 = 15;
+pub const RUNTIME_MIGRATION_VERSION: i64 = 26;
 
 #[cfg(test)]
 mod tests {

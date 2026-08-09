@@ -16,11 +16,15 @@ use crate::{
     error::{ApiError, ApiResult},
     models::{
         ApiResponse, AssignUserRolesRequest, BootstrapDocument, CreateAuthorizationRoleRequest,
-        CreateRecordRequest, CreateTenantUserRequest, HealthDocument, LoginData, LoginRequest,
-        NavigationItem, PutConfigurationRequest, SaveAppStateRequest, SessionData,
-        SetRolePermissionsRequest, UpdateAuthorizationRoleRequest, UpdateRecordRequest,
+        CreateRecordRequest, CreateTenantUserRequest, ForgotPasswordRequest, HealthDocument,
+        LoginData, LoginRequest, NavigationItem, PutConfigurationRequest, ResetPasswordRequest,
+        SaveAppStateRequest, SessionData, SetRolePermissionsRequest,
+        UpdateAuthorizationRoleRequest, UpdateRecordRequest,
     },
-    state::{AppState, AuthPrincipal, CreatedAuthSession, EffectiveAccess, RefreshSessionResult},
+    state::{
+        AppState, AuthPrincipal, CreatedAuthSession, EffectiveAccess, MINIMUM_PASSWORD_LENGTH,
+        RefreshSessionResult,
+    },
 };
 
 pub fn router(state: AppState) -> Router {
@@ -59,6 +63,7 @@ pub fn router(state: AppState) -> Router {
             "/configuration/{namespace}",
             get(get_configuration).put(put_configuration),
         )
+        .route("/navigation", get(get_navigation))
         .route("/dashboard/effective", get(get_effective_dashboard))
         .route(
             "/{module_key}/records",
@@ -71,7 +76,10 @@ pub fn router(state: AppState) -> Router {
 
     let api = Router::new()
         .route("/auth/login", post(login))
+        .route("/auth/forgot-password", post(forgot_password))
+        .route("/auth/reset-password", post(reset_password))
         .route("/auth/refresh", post(refresh))
+        .route("/auth/realtime-token", post(realtime_token))
         .route("/auth/me", get(me))
         .route("/auth/logout", post(logout))
         .route("/state", get(get_app_state).put(save_app_state))
@@ -528,6 +536,59 @@ async fn login(
     Ok(login_response(session))
 }
 
+/// Public reset request. Always answers 202 with the same body so the endpoint cannot
+/// be used to discover which email addresses have accounts.
+async fn forgot_password(
+    State(state): State<AppState>,
+    Json(request): Json<ForgotPasswordRequest>,
+) -> ApiResult<impl IntoResponse> {
+    state
+        .request_password_reset(&request.email, &public_base_url())
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::new(json!({
+            "message": "If that email has an account, a reset link is on its way."
+        }))),
+    ))
+}
+
+/// Public reset completion. Consumes a one-time token and signs out every session.
+async fn reset_password(
+    State(state): State<AppState>,
+    Json(request): Json<ResetPasswordRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let token = request.token.trim();
+    if token.is_empty() {
+        return Err(ApiError::BadRequest("A reset token is required".into()));
+    }
+    if request.password.chars().count() < MINIMUM_PASSWORD_LENGTH {
+        return Err(ApiError::BadRequest(format!(
+            "Password must be at least {MINIMUM_PASSWORD_LENGTH} characters"
+        )));
+    }
+    if state.reset_password(token, &request.password).await? {
+        Ok((
+            StatusCode::OK,
+            Json(ApiResponse::new(json!({
+                "message": "Your password has been updated. Sign in with your new password."
+            }))),
+        ))
+    } else {
+        Err(ApiError::BadRequest(
+            "This reset link is invalid or has expired. Request a new one.".into(),
+        ))
+    }
+}
+
+/// Origin used to build reset links. Must match where the frontend is served.
+fn public_base_url() -> String {
+    std::env::var("APP_PUBLIC_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http://localhost:3000".into())
+}
+
 async fn me(
     Extension(principal): Extension<AuthPrincipal>,
 ) -> ApiResult<Json<ApiResponse<SessionData>>> {
@@ -592,12 +653,42 @@ async fn save_app_state(
     Ok(Json(ApiResponse::new(json!(document))))
 }
 
+/// Navigation the caller is allowed to see, recomputed from live grants.
+async fn get_navigation(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let navigation = state
+        .navigation(&principal.student.tenant_id, &access)
+        .await?;
+    Ok(Json(ApiResponse::new(navigation)))
+}
+
+/// Mints a short-lived token for the realtime WebSocket.
+///
+/// Authenticated with the normal session, so it travels safely through the Next.js
+/// proxy. The returned token lives for one minute: long enough to open a socket,
+/// short enough to bound its exposure in a URL.
+async fn realtime_token(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let issued = state.issue_realtime_token(&principal)?;
+    Ok(Json(ApiResponse::new(json!({
+        "token": issued.token,
+        "expiresAt": issued.expires_at,
+    }))))
+}
+
 async fn get_effective_dashboard(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     let tenant_id = &principal.student.tenant_id;
-    let access = state.effective_access(tenant_id, &principal.student.id).await?;
+    let access = state
+        .effective_access(tenant_id, &principal.student.id)
+        .await?;
     let widgets = crate::dashboard::effective_widgets(None, &access);
     Ok(Json(ApiResponse::new(json!({ "widgets": widgets }))))
 }
@@ -679,7 +770,13 @@ pub async fn authorize_request(
     if !requires_authorization(request.method(), request.uri().path()) {
         return Ok(next.run(request).await);
     }
-    let token = access_token(request.headers()).ok_or(ApiError::Unauthorized)?;
+    let token = access_token(request.headers())
+        .or_else(|| {
+            is_realtime_stream(request.uri().path())
+                .then(|| realtime_query_token(request.uri()))
+                .flatten()
+        })
+        .ok_or(ApiError::Unauthorized)?;
     let mut principal = state
         .authenticate_access_token(&token)
         .await?
@@ -747,7 +844,46 @@ fn requires_authorization(method: &Method, path: &str) -> bool {
         && (path == "/api/state"
             || path == "/api/v1"
             || path.starts_with("/api/v1/")
-            || path == "/api/auth/me")
+            || path == "/api/auth/me"
+            || path == "/api/auth/realtime-token")
+}
+
+/// The realtime stream is the one route that cannot present a bearer header.
+///
+/// Browsers cannot set headers on a WebSocket handshake, and Next.js does not proxy
+/// upgrade requests, so the socket connects straight to this API from a different
+/// origin than the one holding the session cookie. It therefore carries a short-lived
+/// token minted by `POST /api/auth/realtime-token` in the query string instead.
+fn is_realtime_stream(path: &str) -> bool {
+    path == "/api/v1/crm/events"
+}
+
+/// Reads the realtime token from the query string of a WebSocket handshake.
+fn realtime_query_token(uri: &axum::http::Uri) -> Option<String> {
+    let query = uri.query()?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "access_token").then(|| percent_decode(value))
+    })
+}
+
+/// Minimal percent-decoding for a JWT, which only ever needs `%2E`-style escapes.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
+                out.push(byte as char);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index] as char);
+        index += 1;
+    }
+    out
 }
 
 fn login_response(session: CreatedAuthSession) -> (HeaderMap, Json<ApiResponse<LoginData>>) {

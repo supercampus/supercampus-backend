@@ -162,6 +162,114 @@
                                                                        }
                                                    }
                                       },
+                  "/api/auth/forgot-password":  {
+                                                    "post":  {
+                                                                 "tags":  [
+                                                                              "Authentication"
+                                                                          ],
+                                                                 "summary":  "Request a password reset link",
+                                                                 "operationId":  "forgotPassword",
+                                                                 "description":  "Emails a single-use reset link when the address belongs to an active account. Always answers 202 with an identical body so the endpoint cannot be used to discover registered addresses. Throttled to 3 requests per account per 15 minutes.",
+                                                                 "responses":  {
+                                                                                   "202":  {
+                                                                                               "description":  "Request accepted, whether or not the address has an account",
+                                                                                               "content":  {
+                                                                                                               "application/json":  {
+                                                                                                                                        "schema":  {
+                                                                                                                                                       "$ref":  "#/components/schemas/DataResponse"
+                                                                                                                                                   }
+                                                                                                                                    }
+                                                                                                           }
+                                                                                           },
+                                                                                   "400":  {
+                                                                                               "$ref":  "#/components/responses/BadRequest"
+                                                                                           },
+                                                                                   "500":  {
+                                                                                               "$ref":  "#/components/responses/InternalError"
+                                                                                           }
+                                                                               },
+                                                                 "security":  [
+
+                                                                              ],
+                                                                 "requestBody":  {
+                                                                                     "required":  true,
+                                                                                     "content":  {
+                                                                                                     "application/json":  {
+                                                                                                                              "schema":  {
+                                                                                                                                             "$ref":  "#/components/schemas/ForgotPasswordRequest"
+                                                                                                                                         }
+                                                                                                                          }
+                                                                                                 }
+                                                                                 }
+                                                             }
+                                                },
+                  "/api/auth/reset-password":  {
+                                                   "post":  {
+                                                                "tags":  [
+                                                                             "Authentication"
+                                                                         ],
+                                                                "summary":  "Complete a password reset",
+                                                                "operationId":  "resetPassword",
+                                                                "description":  "Consumes a single-use reset token, replaces the password, and revokes every active session for the account. Returns 400 when the token is unknown, expired, or already used.",
+                                                                "responses":  {
+                                                                                  "200":  {
+                                                                                              "description":  "Password updated and all sessions revoked",
+                                                                                              "content":  {
+                                                                                                              "application/json":  {
+                                                                                                                                       "schema":  {
+                                                                                                                                                      "$ref":  "#/components/schemas/DataResponse"
+                                                                                                                                                  }
+                                                                                                                                   }
+                                                                                                          }
+                                                                                          },
+                                                                                  "400":  {
+                                                                                              "$ref":  "#/components/responses/BadRequest"
+                                                                                          },
+                                                                                  "500":  {
+                                                                                              "$ref":  "#/components/responses/InternalError"
+                                                                                          }
+                                                                              },
+                                                                "security":  [
+
+                                                                             ],
+                                                                "requestBody":  {
+                                                                                    "required":  true,
+                                                                                    "content":  {
+                                                                                                    "application/json":  {
+                                                                                                                             "schema":  {
+                                                                                                                                            "$ref":  "#/components/schemas/ResetPasswordRequest"
+                                                                                                                                        }
+                                                                                                                         }
+                                                                                                }
+                                                                                }
+                                                            }
+                                               },
+                  "/api/auth/realtime-token":  {
+                                                   "post":  {
+                                                                "tags":  ["Authentication"],
+                                                                "summary":  "Mint a short-lived realtime handshake token",
+                                                                "operationId":  "realtimeToken",
+                                                                "description":  "Returns a 60-second token for the CRM WebSocket. Browsers cannot set headers on a WebSocket handshake and Next.js does not proxy upgrades, so the socket dials the API directly and presents this token as ?access_token=. The query credential is honoured only on /api/v1/crm/events.",
+                                                                "responses":  {
+                                                                                  "200":  {
+                                                                                              "description":  "Token and its expiry",
+                                                                                              "content":  {
+                                                                                                              "application/json":  {
+                                                                                                                                       "schema":  {
+                                                                                                                                                      "$ref":  "#/components/schemas/DataResponse"
+                                                                                                                                                  }
+                                                                                                                                   }
+                                                                                                          }
+                                                                                          },
+                                                                                  "401":  {
+                                                                                              "$ref":  "#/components/responses/Unauthorized"
+                                                                                          },
+                                                                                  "500":  {
+                                                                                              "$ref":  "#/components/responses/InternalError"
+                                                                                          }
+                                                                              }
+                                                            }
+                                               },
                   "/api/auth/refresh":  {
                                             "post":  {
                                                          "tags":  [
@@ -378,7 +486,7 @@
                                                                  }
                                              }
                                  },
-                  "/api/v1/":  {
+                  "/api/v1":  {
                                    "get":  {
                                                "tags":  [
                                                             "Platform"
@@ -421,6 +529,32 @@
                                                             ]
                                            }
                                },
+                  "/api/v1/navigation":  {
+                                            "get":  {
+                                                        "tags":  ["Platform"],
+                                                        "summary":  "Navigation the caller may see",
+                                                        "operationId":  "getNavigation",
+                                                        "description":  "Workspace and settings sections resolved from the institution's navigation configuration and the caller's live effective grants. A tenant administrator controls what a user can reach by composing role permissions; changes apply without a new token or redeploy. Returns permissions, roles and scopes alongside the sections.",
+                                                        "responses":  {
+                                                                          "200":  {
+                                                                                      "description":  "Sections visible to the caller",
+                                                                                      "content":  {
+                                                                                                      "application/json":  {
+                                                                                                                               "schema":  {
+                                                                                                                                              "$ref":  "#/components/schemas/DataResponse"
+                                                                                                                                          }
+                                                                                                                           }
+                                                                                                  }
+                                                                                  },
+                                                                          "401":  {
+                                                                                      "$ref":  "#/components/responses/Unauthorized"
+                                                                                  },
+                                                                          "500":  {
+                                                                                      "$ref":  "#/components/responses/InternalError"
+                                                                                  }
+                                                                      }
+                                                    }
+                                        },
                   "/api/v1/bootstrap":  {
                                             "get":  {
                                                         "tags":  [
@@ -3737,6 +3871,60 @@
                                                                         ]
                                                      }
                                          },
+                  "/api/v1/crm/forms/published":  {
+                                                      "get":  {
+                                                                  "tags":  ["CRM Forms"],
+                                                                  "summary":  "List every published form",
+                                                                  "operationId":  "listPublishedCrmForms",
+                                                                  "description":  "All forms the tenant administrator has published, whatever types they defined. Lets the workspace discover available forms without knowing type names at build time.",
+                                                                  "responses":  {
+                                                                                    "200":  {
+                                                                                                "description":  "Published forms",
+                                                                                                "content":  {
+                                                                                                                "application/json":  {
+                                                                                                                                         "schema":  {
+                                                                                                                                                        "$ref":  "#/components/schemas/DataResponse"
+                                                                                                                                                    }
+                                                                                                                                     }
+                                                                                                            }
+                                                                                            },
+                                                                                    "401":  {
+                                                                                                "$ref":  "#/components/responses/Unauthorized"
+                                                                                            }
+                                                                                }
+                                                              }
+                                                  },
+                  "/api/v1/crm/forms/published/type/{form_type}":  {
+                                                                       "get":  {
+                                                                                   "tags":  ["CRM Forms"],
+                                                                                   "summary":  "Published form of one type",
+                                                                                   "operationId":  "getPublishedCrmFormByType",
+                                                                                   "description":  "The newest published form of the given type, for example application or document_checklist. enquiry and lead_capture are interchangeable aliases for the intake form. Returns 404 while the form is still a draft.",
+                                                                                   "parameters":  [
+                                                                                                      {
+                                                                                                          "name":  "form_type",
+                                                                                                          "in":  "path",
+                                                                                                          "required":  true,
+                                                                                                          "schema":  { "type":  "string" }
+                                                                                                      }
+                                                                                                  ],
+                                                                                   "responses":  {
+                                                                                                     "200":  {
+                                                                                                                 "description":  "Published form definition",
+                                                                                                                 "content":  {
+                                                                                                                                 "application/json":  {
+                                                                                                                                                          "schema":  {
+                                                                                                                                                                         "$ref":  "#/components/schemas/DataResponse"
+                                                                                                                                                                     }
+                                                                                                                                                      }
+                                                                                                                             }
+                                                                                                             },
+                                                                                                     "404":  {
+                                                                                                                 "$ref":  "#/components/responses/NotFound"
+                                                                                                             }
+                                                                                                 }
+                                                                               }
+                                                                   },
                   "/api/v1/crm/forms":  {
                                             "get":  {
                                                         "tags":  [
@@ -5234,6 +5422,38 @@
                                                                                             }
                                                                            }
                                                         },
+                                       "ForgotPasswordRequest":  {
+                                                                     "type":  "object",
+                                                                     "required":  [
+                                                                                      "email"
+                                                                                  ],
+                                                                     "properties":  {
+                                                                                        "email":  {
+                                                                                                      "type":  "string",
+                                                                                                      "format":  "email",
+                                                                                                      "example":  "admin@supercampus.local"
+                                                                                                  }
+                                                                                    }
+                                                                 },
+                                       "ResetPasswordRequest":  {
+                                                                    "type":  "object",
+                                                                    "required":  [
+                                                                                     "token",
+                                                                                     "password"
+                                                                                 ],
+                                                                    "properties":  {
+                                                                                       "token":  {
+                                                                                                     "type":  "string",
+                                                                                                     "description":  "Single-use token from the emailed reset link"
+                                                                                                 },
+                                                                                       "password":  {
+                                                                                                        "type":  "string",
+                                                                                                        "format":  "password",
+                                                                                                        "minLength":  12,
+                                                                                                        "writeOnly":  true
+                                                                                                    }
+                                                                                   }
+                                                                },
                                        "SaveStateRequest":  {
                                                                 "type":  "object",
                                                                 "required":  [

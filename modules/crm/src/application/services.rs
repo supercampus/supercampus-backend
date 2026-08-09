@@ -11,13 +11,17 @@ use uuid::Uuid;
 use crate::{
     api::dto::{
         ArchiveRequest, AssignLeadRequest, AutomationToggleRequest, BulkImportLeadResult,
-        BulkImportLeadsRequest, BulkImportLeadsResponse, CounselorCapacityRequest,
-        CreateCampaignRequest, CreateFormRequest, CreateLeadRequest, CreateTemplateRequest,
-        HoldRequest, IntakeStatusRequest, LeadFilters, MoveStageRequest, ReasonRequest,
+        BulkImportLeadsRequest, BulkImportLeadsResponse, ClaimLeadRequest,
+        CounselorCapacityRequest, CreateCampaignRequest, CreateFormRequest, CreateLeadNoteRequest,
+        CreateLeadRequest, CreateLeadTaskRequest, CreateTemplateRequest, HoldRequest,
+        IntakeStatusRequest, LeadFilters, MoveRequestDecision, MoveStageRequest, ReasonRequest,
         SendCommunicationRequest, SubmitFormRequest, UnarchiveRequest, UpdateFormRequest,
         UpdateLeadRequest, WorkflowToggleRequest,
     },
-    domain::{Campaign, CrmError, FormDefinition, Lead, PrimaryStage, validate_transition},
+    domain::{
+        Campaign, CrmError, FormDefinition, Lead, LeadMoveRequest, PrimaryStage,
+        validate_transition,
+    },
     infrastructure::postgres::{LeadPatch, NewLead, PostgresCrmRepository},
 };
 
@@ -339,6 +343,26 @@ impl CrmService {
         self.repo()?.list_leads(tenant, filters, owner_scope).await
     }
 
+    pub async fn unassigned_leads(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+        mut filters: LeadFilters,
+    ) -> Result<Vec<Lead>, CrmError> {
+        self.require(
+            tenant,
+            actor,
+            "crm.leads.claim",
+            actor.has("crm.leads.claim") && actor.has("crm.leads.read"),
+            None,
+        )
+        .await?;
+        filters.stage = Some("enquiry".into());
+        filters.owner = None;
+        filters.unassigned = Some(true);
+        self.repo()?.list_leads(tenant, &filters, None).await
+    }
+
     pub async fn get_lead(
         &self,
         tenant: &str,
@@ -416,11 +440,15 @@ impl CrmService {
         request: AssignLeadRequest,
         reassignment: bool,
     ) -> Result<Lead, CrmError> {
-        let current = self.repo()?.find_lead(tenant, lead_id).await?;
-        let claiming = current.assigned_to.is_none() && request.user_id == actor.user_id;
-        let allowed = actor.has("crm.leads.assign") || (claiming && actor.has("crm.leads.claim"));
-        self.require(tenant, actor, "crm.leads.assign", allowed, Some(lead_id))
-            .await?;
+        self.repo()?.find_lead(tenant, lead_id).await?;
+        self.require(
+            tenant,
+            actor,
+            "crm.leads.assign",
+            actor.has("crm.leads.assign"),
+            Some(lead_id),
+        )
+        .await?;
         if reassignment && request.reason.as_deref().unwrap_or("").trim().is_empty() {
             return Err(CrmError::Validation(
                 "reassignment reason is required".into(),
@@ -442,6 +470,27 @@ impl CrmService {
             .await
     }
 
+    pub async fn claim(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+        lead_id: Uuid,
+        _request: ClaimLeadRequest,
+    ) -> Result<Lead, CrmError> {
+        self.require(
+            tenant,
+            actor,
+            "crm.leads.claim",
+            actor.has("crm.leads.claim"),
+            Some(lead_id),
+        )
+        .await?;
+        self.repo()?.find_lead(tenant, lead_id).await?;
+        Err(CrmError::Conflict(
+            "move the Enquiry to its next stage to claim it".into(),
+        ))
+    }
+
     pub async fn move_stage(
         &self,
         tenant: &str,
@@ -450,26 +499,23 @@ impl CrmService {
         request: MoveStageRequest,
     ) -> Result<Lead, CrmError> {
         let lead = self.repo()?.find_lead(tenant, lead_id).await?;
+        let is_owner = lead.assigned_to.as_deref() == Some(actor.user_id.as_str());
+        let is_first_move = lead.assigned_to.is_none() && lead.stage_key == "enquiry";
+        let can_override = actor.has("crm.leads.stage.override");
         let can_update =
-            actor.can_access_assigned("crm.leads.stage.move", lead.assigned_to.as_deref());
+            actor.has("crm.leads.stage.move") && (is_owner || is_first_move || can_override);
         let target = PrimaryStage::from_str(&request.to_stage)?;
         let target_substate = request
             .to_substate
             .unwrap_or_else(|| target.default_substate().into());
         let current = PrimaryStage::from_str(&lead.stage_key)?;
-        if target.order() < current.order() {
-            let is_admin = actor.has("crm.leads.stage.backward")
-                || actor.roles.iter().any(|r| {
-                    let r_lower = r.to_lowercase();
-                    r_lower.contains("admin")
-                        || r_lower.contains("principal")
-                        || r_lower.contains("owner")
-                });
-            if !is_admin {
-                return Err(CrmError::Validation(
-                    "only administrators can move leads backward in the pipeline".into(),
-                ));
-            }
+        if target.order() < current.order()
+            && !actor.has("crm.leads.stage.backward")
+            && !can_override
+        {
+            return Err(CrmError::Validation(
+                "the backward-stage permission is required".into(),
+            ));
         }
         validate_transition(current, &lead.substate_key, target, &target_substate)?;
         let allowed = can_update;
@@ -485,6 +531,15 @@ impl CrmService {
             .await?;
 
         let repository = self.repo()?;
+        let automation_trigger =
+            if target == PrimaryStage::OfferStatus && target_substate == "accepted" {
+                "offer_accepted"
+            } else {
+                "on_enter"
+            };
+        let automation_template = repository
+            .enabled_communication_template(tenant, &target.to_string(), automation_trigger)
+            .await?;
         let mut moved = repository
             .transition(
                 tenant,
@@ -496,7 +551,9 @@ impl CrmService {
                 request.reason.as_deref(),
                 request.notes.as_deref(),
                 actor.ip_address.as_deref(),
-                automation_template(target, &target_substate),
+                automation_template.as_deref(),
+                true,
+                can_override,
             )
             .await?;
 
@@ -513,6 +570,8 @@ impl CrmService {
                     None,
                     None,
                     Some("application_submitted"),
+                    false,
+                    true,
                 )
                 .await?;
         } else if target == PrimaryStage::ApplicationStatus
@@ -530,6 +589,8 @@ impl CrmService {
                     None,
                     None,
                     Some("offer_issued"),
+                    false,
+                    true,
                 )
                 .await?;
         } else if target == PrimaryStage::OfferStatus && target_substate == "rejected" {
@@ -545,6 +606,117 @@ impl CrmService {
                 .await?;
         }
         Ok(moved)
+    }
+
+    pub async fn request_stage_move(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+        lead_id: Uuid,
+        request: MoveStageRequest,
+    ) -> Result<LeadMoveRequest, CrmError> {
+        self.require(
+            tenant,
+            actor,
+            "crm.leads.stage.request",
+            actor.has("crm.leads.stage.request"),
+            Some(lead_id),
+        )
+        .await?;
+        let lead = self.repo()?.find_lead(tenant, lead_id).await?;
+        let current = PrimaryStage::from_str(&lead.stage_key)?;
+        let target = PrimaryStage::from_str(&request.to_stage)?;
+        let target_substate = request
+            .to_substate
+            .unwrap_or_else(|| target.default_substate().into());
+        if target.order() < current.order() && !actor.has("crm.leads.stage.backward") {
+            return Err(CrmError::Validation(
+                "the backward-stage permission is required".into(),
+            ));
+        }
+        validate_transition(current, &lead.substate_key, target, &target_substate)?;
+        self.ensure_toggle_allows(tenant, actor, current, target)
+            .await?;
+        self.repo()?
+            .create_move_request(
+                tenant,
+                lead_id,
+                &actor.user_id,
+                &target.to_string(),
+                &target_substate,
+                request.reason.as_deref(),
+                request.notes.as_deref(),
+            )
+            .await
+    }
+
+    pub async fn move_requests(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+    ) -> Result<Vec<LeadMoveRequest>, CrmError> {
+        let allowed = actor.has_any(&[
+            "crm.leads.stage.request",
+            "crm.leads.stage.approve",
+            "crm.leads.stage.override",
+        ]);
+        self.require(tenant, actor, "crm.leads.stage.request", allowed, None)
+            .await?;
+        self.repo()?
+            .list_move_requests(
+                tenant,
+                &actor.user_id,
+                actor.has("crm.leads.stage.override"),
+            )
+            .await
+    }
+
+    pub async fn decide_stage_move(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+        request_id: Uuid,
+        approve: bool,
+        decision: MoveRequestDecision,
+    ) -> Result<LeadMoveRequest, CrmError> {
+        self.require(
+            tenant,
+            actor,
+            "crm.leads.stage.approve",
+            actor.has("crm.leads.stage.approve"),
+            None,
+        )
+        .await?;
+        let requests = self
+            .repo()?
+            .list_move_requests(tenant, &actor.user_id, false)
+            .await?;
+        let movement = requests
+            .into_iter()
+            .find(|item| item.id == request_id)
+            .ok_or(CrmError::NotFound)?;
+        if approve {
+            let current = PrimaryStage::from_str(&movement.from_stage)?;
+            let target = PrimaryStage::from_str(&movement.to_stage)?;
+            validate_transition(
+                current,
+                &movement.from_substate,
+                target,
+                &movement.to_substate,
+            )?;
+            self.ensure_toggle_allows(tenant, actor, current, target)
+                .await?;
+        }
+        self.repo()?
+            .decide_move_request(
+                tenant,
+                request_id,
+                &actor.user_id,
+                approve,
+                decision.reason.as_deref(),
+                actor.primary_role(),
+            )
+            .await
     }
 
     pub async fn prospect_or_defer(
@@ -703,7 +875,23 @@ impl CrmService {
         mut filters: LeadFilters,
     ) -> Result<Value, CrmError> {
         filters.limit = Some(500);
-        let leads = self.list_leads(tenant, actor, &filters).await?;
+        self.require(
+            tenant,
+            actor,
+            "crm.leads.read",
+            actor.has("crm.leads.read"),
+            None,
+        )
+        .await?;
+        // Users who can request owner approval need the shared card board even when
+        // their lead-detail read scope is otherwise assigned-only.
+        let collaborative = actor.has("crm.leads.stage.request");
+        let owner_scope = (!collaborative && !actor.has_all_scope("crm.leads.read"))
+            .then_some(actor.user_id.as_str());
+        let leads = self
+            .repo()?
+            .list_leads(tenant, &filters, owner_scope)
+            .await?;
         let stages: Vec<Value> = PrimaryStage::ALL
             .into_iter()
             .map(|stage| {
@@ -723,10 +911,22 @@ impl CrmService {
             .collect();
         Ok(json!({
             "pipeline": { "key": "pre-admission", "name": "Pre-Admission Pipeline" },
-            "scope": actor.scope_for("crm.leads.read"),
+            "scope": if collaborative { "collaborative" } else { actor.scope_for("crm.leads.read") },
             "stages": stages,
             "total": leads.len()
         }))
+    }
+
+    pub async fn my_board(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+        mut filters: LeadFilters,
+    ) -> Result<Value, CrmError> {
+        filters.owner = Some(actor.user_id.clone());
+        let mut board = self.board(tenant, actor, filters).await?;
+        board["scope"] = json!("assigned");
+        Ok(board)
     }
 
     pub async fn operations_dashboard(
@@ -1046,6 +1246,23 @@ impl CrmService {
     ) -> Result<Vec<Value>, CrmError> {
         self.repo()?.events_after(tenant, cursor.max(0)).await
     }
+    pub async fn recent_activity(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+    ) -> Result<Vec<Value>, CrmError> {
+        self.require(
+            tenant,
+            actor,
+            "crm.dashboard.read",
+            actor.has("crm.dashboard.read"),
+            None,
+        )
+        .await?;
+        let owner_scope =
+            (!actor.has_all_scope("crm.leads.read")).then_some(actor.user_id.as_str());
+        self.repo()?.recent_activity(tenant, owner_scope, 25).await
+    }
     pub async fn timeline(
         &self,
         tenant: &str,
@@ -1054,6 +1271,86 @@ impl CrmService {
     ) -> Result<Value, CrmError> {
         self.get_lead(tenant, actor, lead_id).await?;
         self.repo()?.timeline(tenant, lead_id).await
+    }
+
+    pub async fn add_lead_note(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+        lead_id: Uuid,
+        request: CreateLeadNoteRequest,
+    ) -> Result<crate::domain::Communication, CrmError> {
+        let content = request.content.trim();
+        if content.is_empty() {
+            return Err(CrmError::Validation("note content is required".into()));
+        }
+        let lead = self.repo()?.find_lead(tenant, lead_id).await?;
+        // Notes are safe collaboration metadata. Let an authorised user add the
+        // first context to a legacy/unclaimed card without weakening ownership
+        // checks for cards that already have an owner.
+        let allowed = (lead.assigned_to.is_none() && actor.has("crm.leads.update"))
+            || actor.can_access_assigned("crm.leads.update", lead.assigned_to.as_deref());
+        self.require(tenant, actor, "crm.leads.update", allowed, Some(lead_id))
+            .await?;
+        self.repo()?
+            .send_communication(
+                tenant,
+                lead_id,
+                "note",
+                None,
+                Some("Lead note"),
+                json!({ "text": content }),
+                None,
+                &actor.user_id,
+            )
+            .await
+    }
+
+    pub async fn add_lead_task(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+        lead_id: Uuid,
+        request: CreateLeadTaskRequest,
+    ) -> Result<Value, CrmError> {
+        let title = request.title.trim();
+        if title.is_empty() {
+            return Err(CrmError::Validation("task title is required".into()));
+        }
+        let priority = request.priority.as_deref().unwrap_or("medium");
+        if !matches!(priority, "low" | "medium" | "high" | "urgent") {
+            return Err(CrmError::Validation("invalid task priority".into()));
+        }
+        let lead = self.repo()?.find_lead(tenant, lead_id).await?;
+        // Follow-up tasks follow the same unclaimed-card rule as notes. Once a
+        // card has an owner, assigned-scope users still need to be that owner.
+        let allowed = (lead.assigned_to.is_none() && actor.has("crm.leads.update"))
+            || actor.can_access_assigned("crm.leads.update", lead.assigned_to.as_deref());
+        self.require(tenant, actor, "crm.leads.update", allowed, Some(lead_id))
+            .await?;
+        self.repo()?
+            .create_lead_task(
+                tenant,
+                lead_id,
+                &actor.user_id,
+                title,
+                request.due_at,
+                priority,
+            )
+            .await
+    }
+    pub async fn application_link(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+        lead_id: Uuid,
+    ) -> Result<Value, CrmError> {
+        self.get_lead(tenant, actor, lead_id).await?;
+        Ok(self
+            .repo()?
+            .application_link(tenant, lead_id)
+            .await?
+            .unwrap_or(Value::Null))
     }
 
     pub async fn create_form(
@@ -1113,6 +1410,33 @@ impl CrmService {
         self.require(tenant, actor, "crm.forms.read", allowed, None)
             .await?;
         self.repo()?.find_published_lead_capture_form(tenant).await
+    }
+
+    /// Returns the published form of a given type, whatever the administrator named it.
+    pub async fn published_form_by_type(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+        form_type: &str,
+    ) -> Result<FormDefinition, CrmError> {
+        let allowed = actor.has_any(&["crm.forms.read", "crm.leads.create", "crm.forms.submit"]);
+        self.require(tenant, actor, "crm.forms.read", allowed, None)
+            .await?;
+        self.repo()?
+            .find_published_form_by_type(tenant, form_type)
+            .await
+    }
+
+    /// Lists every published form so the workspace can render whatever exists.
+    pub async fn published_forms(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+    ) -> Result<Vec<FormDefinition>, CrmError> {
+        let allowed = actor.has_any(&["crm.forms.read", "crm.leads.create", "crm.forms.submit"]);
+        self.require(tenant, actor, "crm.forms.read", allowed, None)
+            .await?;
+        self.repo()?.list_published_forms(tenant).await
     }
 
     pub async fn get_form(
@@ -1232,6 +1556,21 @@ impl CrmService {
             ));
         }
 
+        let campaign_id = request.campaign_id;
+        let idempotency_key = request
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if idempotency_key
+            .as_deref()
+            .is_some_and(|value| value.len() > 200)
+        {
+            return Err(CrmError::Validation(
+                "idempotencyKey must not exceed 200 characters".into(),
+            ));
+        }
         let mut lead_id = request.lead_id;
         let mut created_lead_id = None;
         if creates_lead && lead_id.is_none() {
@@ -1258,7 +1597,12 @@ impl CrmService {
                             .and_then(Value::as_str)
                             .unwrap_or("Public Enquiry Form")
                             .to_owned(),
-                        source_detail: json!({ "formId": form_id, "formVersion": form.version }),
+                        source_detail: json!({
+                            "formId": form_id,
+                            "formVersion": form.version,
+                            "campaignId": campaign_id,
+                            "idempotencyKey": idempotency_key
+                        }),
                         full_name,
                         email,
                         phone,
@@ -1304,11 +1648,29 @@ impl CrmService {
         }
 
         match repository
-            .submit_form(tenant, form_id, lead_id, request.data, &actor.user_id)
+            .submit_form(
+                tenant,
+                form_id,
+                lead_id,
+                campaign_id,
+                idempotency_key.as_deref(),
+                request.data,
+                &actor.user_id,
+            )
             .await
         {
             Ok(mut submission) => {
-                if let (Some(object), Some(id)) = (submission.as_object_mut(), created_lead_id) {
+                let replayed = submission
+                    .get("replayed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if replayed {
+                    if let Some(id) = created_lead_id {
+                        let _ = repository.soft_delete(tenant, id).await;
+                    }
+                } else if let (Some(object), Some(id)) =
+                    (submission.as_object_mut(), created_lead_id)
+                {
                     object.insert("createdLeadId".into(), json!(id));
                 }
                 Ok(submission)
@@ -1848,20 +2210,6 @@ fn validate_priority(priority: &str) -> Result<(), CrmError> {
         Err(CrmError::Validation(
             "priority must be low, medium, high, or urgent".into(),
         ))
-    }
-}
-
-fn automation_template(stage: PrimaryStage, substate: &str) -> Option<&'static str> {
-    match (stage, substate) {
-        (PrimaryStage::Qualified, _) => Some("qualified_confirmation"),
-        (PrimaryStage::Application, "documents_required") => Some("documents_required"),
-        (PrimaryStage::Application, "application_fee_pending") => Some("application_fee_pending"),
-        (PrimaryStage::Application, "application_submitted") => Some("application_submitted"),
-        (PrimaryStage::ApplicationStatus, "interview_scheduled") => Some("interview_scheduled"),
-        (PrimaryStage::ApplicationStatus, "waitlisted") => Some("waitlisted"),
-        (PrimaryStage::ApplicationStatus, "unconditional_offer") => Some("offer_issued"),
-        (PrimaryStage::OfferStatus, "accepted") => Some("offer_accepted"),
-        _ => None,
     }
 }
 

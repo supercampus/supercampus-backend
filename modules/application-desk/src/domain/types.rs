@@ -9,6 +9,7 @@
 //! structures directly; the field names are part of the API contract.
 
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -279,6 +280,8 @@ pub struct OnboardingCase {
     pub applicant_id: String,
     pub application_id: String,
     pub admission_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub crm_lead_id: Option<Uuid>,
 
     pub stage: OnboardingStage,
     pub status: OnboardingStatus,

@@ -109,6 +109,7 @@ pub struct LeadFilters {
     pub created_from: Option<DateTime<Utc>>,
     pub created_to: Option<DateTime<Utc>>,
     pub include_archived: Option<bool>,
+    pub unassigned: Option<bool>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -117,6 +118,13 @@ pub struct LeadFilters {
 #[serde(rename_all = "camelCase")]
 pub struct AssignLeadRequest {
     pub user_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ClaimLeadRequest {
     pub reason: Option<String>,
 }
 
@@ -188,6 +196,8 @@ pub struct UpdateFormRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SubmitFormRequest {
     pub lead_id: Option<Uuid>,
+    pub campaign_id: Option<Uuid>,
+    pub idempotency_key: Option<String>,
     pub data: Value,
 }
 
@@ -266,6 +276,27 @@ pub struct CreateCampaignRequest {
     pub status: Option<String>,
     pub starts_on: Option<NaiveDate>,
     pub ends_on: Option<NaiveDate>,
+    pub form_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveRequestDecision {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateLeadNoteRequest {
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateLeadTaskRequest {
+    pub title: String,
+    pub due_at: DateTime<Utc>,
+    pub priority: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

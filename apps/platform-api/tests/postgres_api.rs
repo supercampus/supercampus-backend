@@ -307,6 +307,21 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
     .unwrap();
     let role_id = role_body["data"]["id"].as_str().unwrap();
 
+    let missing_password = application
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/authorization/users")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, &admin_authorization)
+                .body(Body::from(format!(
+                    r#"{{"name":"CRM Reader","email":"{reader_email}","roleIds":["{role_id}"]}}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_password.status(), StatusCode::BAD_REQUEST);
+
     let user_created = application
         .clone()
         .oneshot(
@@ -314,13 +329,22 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, &admin_authorization)
                 .body(Body::from(format!(
-                    r#"{{"name":"CRM Reader","email":"{reader_email}","temporaryPassword":"{reader_password}","roleIds":["{role_id}"]}}"#,
+                    r#"{{"name":"CRM Reader","email":"{reader_email}","password":"{reader_password}","roleIds":["{role_id}"]}}"#,
                 )))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(user_created.status(), StatusCode::CREATED);
+    let user_created_body: Value = serde_json::from_slice(
+        &to_bytes(user_created.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(user_created_body["data"]["created"], true);
+    assert!(user_created_body["data"].get("password").is_none());
+    assert!(user_created_body["data"].get("temporaryPassword").is_none());
 
     let reader_login = application
         .clone()

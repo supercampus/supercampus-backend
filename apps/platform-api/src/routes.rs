@@ -341,12 +341,12 @@ async fn create_tenant_user(
         || !request.email.contains('@')
         || request.role_ids.is_empty()
         || request
-            .temporary_password
+            .password
             .as_ref()
-            .is_some_and(|password| password.len() < 12)
+            .is_none_or(|password| password.chars().count() < 12 || password.len() > 72)
     {
         return Err(ApiError::BadRequest(
-            "name, valid email, at least one role, and a 12-character temporary password are required".into(),
+            "name, valid email, at least one role, and a password between 12 characters and 72 bytes are required".into(),
         ));
     }
     let user = state

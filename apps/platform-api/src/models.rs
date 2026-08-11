@@ -148,7 +148,7 @@ pub struct CreateTenantUserRequest {
     pub email: String,
     #[serde(default)]
     pub role_ids: Vec<Uuid>,
-    pub temporary_password: Option<String>,
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

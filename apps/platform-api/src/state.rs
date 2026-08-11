@@ -1028,14 +1028,27 @@ impl AppState {
         let database = self.database.as_ref().context("PostgreSQL is required")?;
         let tenant_id = ensure_tenant(database, tenant_slug).await?;
         let email = request.email.trim().to_ascii_lowercase();
-        let temporary_password = request
-            .temporary_password
-            .clone()
-            .unwrap_or_else(|| format!("SC-{}!Aa9", Uuid::new_v4().simple()));
+        let password = request
+            .password
+            .as_deref()
+            .context("an explicit password is required")?;
+        let mut transaction = database.pool().begin().await?;
+
+        let role_keys: Vec<String> = sqlx::query_scalar(
+            "SELECT role_key FROM authz.roles WHERE tenant_id = $1 AND id = ANY($2) AND active ORDER BY name",
+        )
+        .bind(tenant_id)
+        .bind(&request.role_ids)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if role_keys.len() != request.role_ids.len() {
+            bail!("one or more roles do not belong to this tenant");
+        }
+
         let existing_user: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM identity.users WHERE email = $1")
                 .bind(&email)
-                .fetch_optional(database.pool())
+                .fetch_optional(&mut *transaction)
                 .await?;
         let created = existing_user.is_none();
         let user_id = if let Some(user_id) = existing_user {
@@ -1048,24 +1061,13 @@ impl AppState {
                    RETURNING id"#,
             )
             .bind(&email)
-            .bind(&temporary_password)
+            .bind(password)
             .bind(request.name.trim())
             .bind(initials(request.name.trim()))
-            .fetch_one(database.pool())
+            .fetch_one(&mut *transaction)
             .await?
         };
 
-        let mut transaction = database.pool().begin().await?;
-        let role_keys: Vec<String> = sqlx::query_scalar(
-            "SELECT role_key FROM authz.roles WHERE tenant_id = $1 AND id = ANY($2) AND active ORDER BY name",
-        )
-        .bind(tenant_id)
-        .bind(&request.role_ids)
-        .fetch_all(&mut *transaction)
-        .await?;
-        if role_keys.len() != request.role_ids.len() {
-            bail!("one or more roles do not belong to this tenant");
-        }
         let membership = sqlx::query(
             r#"INSERT INTO identity.tenant_memberships
                (tenant_id, user_id, roles, is_primary, profile)
@@ -1096,7 +1098,7 @@ impl AppState {
             "email": email,
             "name": request.name.trim(),
             "roleIds": request.role_ids,
-            "temporaryPassword": created.then_some(temporary_password),
+            "created": created,
         })))
     }
 
@@ -1969,17 +1971,8 @@ fn default_navigation_sections() -> Vec<NavigationSection> {
         (
             "dashboard",
             "workspace",
-            "Dashboard",
+            "Overview",
             "LayoutDashboard",
-            &["crm.dashboard.read"],
-            None,
-            false,
-        ),
-        (
-            "crm",
-            "workspace",
-            "CRM",
-            "Target",
             &["crm.dashboard.read"],
             None,
             false,
@@ -1987,7 +1980,7 @@ fn default_navigation_sections() -> Vec<NavigationSection> {
         (
             "pipeline",
             "workspace",
-            "Pipeline",
+            "Lead",
             "Kanban",
             &["crm.leads.read"],
             None,

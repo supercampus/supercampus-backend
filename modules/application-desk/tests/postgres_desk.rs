@@ -41,6 +41,28 @@ async fn tenant_uuid(database: &Database, slug: &str) -> Uuid {
         .expect("tenant uuid")
 }
 
+async fn create_crm_lead(database: &Database, tenant: &str, suffix: &str) -> Uuid {
+    let repository = PostgresDeskRepository::new(database.clone());
+    let (tenant_id, mut transaction) = repository
+        .begin_tenant(tenant)
+        .await
+        .expect("tenant transaction");
+    let lead_id = sqlx::query_scalar(
+        r#"INSERT INTO crm.leads
+           (tenant_id, full_name, email, source, created_by)
+           VALUES ($1, $2, $3, 'integration-test', 'integration-test')
+           RETURNING id"#,
+    )
+    .bind(tenant_id)
+    .bind(format!("Application link {suffix}"))
+    .bind(format!("application-link-{suffix}@supercampus.test"))
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("create CRM lead");
+    transaction.commit().await.expect("commit CRM lead");
+    lead_id
+}
+
 fn actor() -> ActorContext {
     ActorContext {
         user_id: "officer-1".into(),
@@ -461,6 +483,142 @@ async fn a_closed_case_does_not_block_re_admission() {
         reopened,
         "a withdrawn case must not block re-admission: {reason:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL and writes temporary rows"]
+async fn lead_application_relationship_is_tenant_safe_stable_and_authoritative() {
+    let database = connect().await;
+    let service = ApplicationDeskService::new(database.clone());
+    let tenant = tenant_slug();
+    let other_tenant = tenant_slug();
+    let suffix = Uuid::new_v4().to_string();
+    let lead_id = create_crm_lead(&database, &tenant, &suffix).await;
+    let mut linked_trigger = trigger(&suffix);
+    linked_trigger.crm_lead_id = Some(lead_id);
+
+    let (created, refusal, snapshot) = service
+        .open_case(&tenant, &actor(), linked_trigger.clone())
+        .await
+        .expect("open linked application");
+    assert!(created, "linked intake refused: {refusal:?}");
+    let case_id = snapshot.cases.first().expect("linked case").id.clone();
+
+    let (duplicate, _, _) = service
+        .open_case(&tenant, &actor(), linked_trigger.clone())
+        .await
+        .expect("idempotent duplicate intake");
+    assert!(!duplicate, "a live application must not be duplicated");
+
+    let cross_tenant = service
+        .open_case(&other_tenant, &actor(), linked_trigger.clone())
+        .await;
+    assert!(
+        cross_tenant.is_err(),
+        "another tenant must not be able to connect the lead"
+    );
+    assert!(
+        service
+            .snapshot(&other_tenant)
+            .await
+            .expect("other tenant snapshot")
+            .cases
+            .is_empty(),
+        "the rejected cross-tenant transaction must not leave a case behind"
+    );
+
+    let repository = PostgresDeskRepository::new(database.clone());
+    let (tenant_id, mut transaction) = repository
+        .begin_tenant(&tenant)
+        .await
+        .expect("tenant transaction");
+    let relationship_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM crm.lead_application_links WHERE tenant_id = $1 AND lead_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(lead_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("relationship count");
+    assert_eq!(relationship_count, 1);
+    let copied_status_columns: i64 = sqlx::query_scalar(
+        r#"SELECT count(*) FROM information_schema.columns
+           WHERE table_schema = 'crm' AND table_name = 'lead_application_links'
+             AND column_name IN ('application_id', 'admission_id', 'application_status')"#,
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("relationship columns");
+    assert_eq!(
+        copied_status_columns, 0,
+        "CRM must store only the relationship, not an application copy"
+    );
+    let linked_status: String = sqlx::query_scalar(
+        r#"SELECT desk.status
+           FROM crm.lead_application_links link
+           JOIN application_desk.cases desk
+             ON desk.tenant_id = link.tenant_id AND desk.id = link.case_id
+           WHERE link.tenant_id = $1 AND link.lead_id = $2"#,
+    )
+    .bind(tenant_id)
+    .bind(lead_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("authoritative application status");
+    assert_eq!(linked_status, "ACTIVE");
+    let sync_history: i64 = sqlx::query_scalar(
+        r#"SELECT count(*) FROM crm.stage_history
+           WHERE tenant_id = $1 AND lead_id = $2 AND reason = 'application_status_sync'"#,
+    )
+    .bind(tenant_id)
+    .bind(lead_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("CRM conversion history");
+    assert_eq!(sync_history, 1, "the initial conversion must be traceable");
+    transaction.commit().await.expect("commit assertions");
+
+    let withdrawn = service
+        .act(
+            &tenant,
+            &actor(),
+            ActionRequest {
+                case_id,
+                action: ActionKind::Withdraw,
+                reason: Some("applicant withdrew".into()),
+                payload: ActionPayload::default(),
+            },
+        )
+        .await
+        .expect("withdraw application");
+    assert!(withdrawn.ok);
+
+    let (reopened, refusal, _) = service
+        .open_case(&tenant, &actor(), linked_trigger)
+        .await
+        .expect("re-admission");
+    assert!(
+        reopened,
+        "a closed application must not block a valid re-admission: {refusal:?}"
+    );
+
+    let (_, mut transaction) = repository
+        .begin_tenant(&tenant)
+        .await
+        .expect("tenant transaction");
+    let relationships_after_readmission: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM crm.lead_application_links WHERE tenant_id = $1 AND lead_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(lead_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("relationship history");
+    assert_eq!(
+        relationships_after_readmission, 2,
+        "each Application Desk case keeps its own immutable conversion link"
+    );
+    transaction.commit().await.expect("commit assertions");
 }
 
 #[tokio::test]

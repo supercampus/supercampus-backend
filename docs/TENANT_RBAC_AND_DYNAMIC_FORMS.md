@@ -143,12 +143,14 @@ Create a user:
 {
   "name": "Asha Rao",
   "email": "asha@example.edu",
+  "password": "administrator-chosen-password",
   "roleIds": ["<tenant-role-uuid>"]
 }
 ```
 
-For a new identity, the response includes `temporaryPassword` once.
-Passwords are hashed with PostgreSQL `pgcrypto`.
+The administrator must supply a password between 12 characters and 72 bytes.
+The API never returns that password. Passwords are hashed with PostgreSQL
+`pgcrypto` before the user is committed.
 
 ## Dynamic lead-capture forms
 

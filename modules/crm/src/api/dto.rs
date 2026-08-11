@@ -79,6 +79,7 @@ pub struct CommunicationPreferences {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateLeadRequest {
+    pub source: Option<String>,
     pub full_name: Option<String>,
     pub email: Option<String>,
     pub phone: Option<String>,
@@ -119,6 +120,14 @@ pub struct LeadFilters {
 pub struct AssignLeadRequest {
     pub user_id: String,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct TransferLeadRequest {
+    pub user_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Default, Deserialize)]

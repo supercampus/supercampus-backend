@@ -4,6 +4,7 @@
 use chrono::{Duration, Utc};
 use serde_json::json;
 use supercampus_crm::{
+    api::dto::LeadFilters,
     domain::CrmError,
     infrastructure::postgres::{NewLead, PostgresCrmRepository},
 };
@@ -15,6 +16,87 @@ async fn connect() -> Database {
     let database = Database::connect(&url).await.expect("database connection");
     database.migrate().await.expect("database migration");
     database
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL and writes temporary tenant rows"]
+async fn pipeline_visibility_is_shared_enquiry_plus_current_owner() {
+    let database = connect().await;
+    let repository = PostgresCrmRepository::new(database.clone());
+    let suffix = Uuid::new_v4().to_string();
+    let tenant = format!("crm-visibility-{suffix}");
+
+    let shared = repository
+        .create_lead(
+            &tenant,
+            "creator",
+            "test",
+            new_lead(&format!("shared-{suffix}")),
+        )
+        .await
+        .expect("create shared enquiry");
+    let owner_a = repository
+        .create_lead(
+            &tenant,
+            "creator",
+            "test",
+            new_lead(&format!("owner-a-{suffix}")),
+        )
+        .await
+        .expect("create owner-a lead");
+    let owner_b = repository
+        .create_lead(
+            &tenant,
+            "creator",
+            "test",
+            new_lead(&format!("owner-b-{suffix}")),
+        )
+        .await
+        .expect("create owner-b lead");
+
+    for (lead_id, owner) in [(owner_a.id, "owner-a"), (owner_b.id, "owner-b")] {
+        repository
+            .transition(
+                &tenant,
+                lead_id,
+                "contact_attempted",
+                "contacted",
+                owner,
+                "counsellor",
+                Some("claim from shared Enquiry"),
+                None,
+                None,
+                None,
+                true,
+                false,
+            )
+            .await
+            .expect("claim by first movement");
+    }
+
+    let visible = repository
+        .list_leads(&tenant, &LeadFilters::default(), Some("owner-a"), true)
+        .await
+        .expect("list owner pipeline");
+    let visible_ids = visible.iter().map(|lead| lead.id).collect::<Vec<_>>();
+    assert!(
+        visible_ids.contains(&shared.id),
+        "shared Enquiry must be visible"
+    );
+    assert!(
+        visible_ids.contains(&owner_a.id),
+        "owner card must be visible"
+    );
+    assert!(
+        !visible_ids.contains(&owner_b.id),
+        "another owner's claimed card must be hidden"
+    );
+
+    sqlx::query("DELETE FROM platform.tenants WHERE slug = $1")
+        .bind(&tenant)
+        .execute(database.pool())
+        .await
+        .expect("cleanup test tenant");
 }
 
 fn new_lead(suffix: &str) -> NewLead {

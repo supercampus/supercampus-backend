@@ -344,6 +344,32 @@ pub async fn assign_lead(
         .await?))
 }
 
+pub async fn transfer_candidates(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .transfer_candidates(&context.tenant, &context.actor)
+        .await?))
+}
+
+pub async fn transfer_lead(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<TransferLeadRequest>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    let transferred = service
+        .transfer_lead(&context.tenant, &context.actor, id, request)
+        .await?;
+    let _ = state.realtime_wake.send(());
+    Ok(ok(transferred))
+}
+
 pub async fn claim_lead(
     State(state): State<CrmApiState>,
     headers: HeaderMap,

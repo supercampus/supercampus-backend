@@ -12,7 +12,8 @@ use uuid::Uuid;
 use crate::{
     api::dto::{CounselorCapacityRequest, CreateCampaignRequest, LeadFilters},
     domain::{
-        Campaign, Communication, CrmError, FormDefinition, Lead, LeadMoveRequest, StageHistoryEntry,
+        Campaign, Communication, CrmError, FormDefinition, Lead, LeadMoveRequest,
+        PipelineTransferCandidate, StageHistoryEntry,
     },
 };
 
@@ -41,6 +42,7 @@ pub struct NewLead {
 
 #[derive(Debug, Clone, Default)]
 pub struct LeadPatch {
+    pub source: Option<String>,
     pub full_name: Option<String>,
     pub email: Option<String>,
     pub phone: Option<String>,
@@ -199,6 +201,7 @@ impl PostgresCrmRepository {
         tenant_slug: &str,
         filters: &LeadFilters,
         scope_owner: Option<&str>,
+        include_shared_enquiry: bool,
     ) -> Result<Vec<Lead>, CrmError> {
         let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
         let mut builder =
@@ -214,8 +217,17 @@ impl PostgresCrmRepository {
         if let Some(substate) = filters.substate.as_deref() {
             builder.push(" AND l.substate_key = ").push_bind(substate);
         }
-        let owner = scope_owner.or(filters.owner.as_deref());
-        if let Some(owner) = owner {
+        if let Some(owner) = scope_owner {
+            if include_shared_enquiry {
+                builder
+                    .push(" AND (l.stage_key = 'enquiry' OR l.assigned_to = ")
+                    .push_bind(owner)
+                    .push(")");
+            } else {
+                builder.push(" AND l.assigned_to = ").push_bind(owner);
+            }
+        }
+        if let Some(owner) = filters.owner.as_deref() {
             builder.push(" AND l.assigned_to = ").push_bind(owner);
         }
         if filters.unassigned.unwrap_or(false) {
@@ -301,7 +313,7 @@ impl PostgresCrmRepository {
                    fee_payment_confirmed = coalesce($13, fee_payment_confirmed),
                    documents_verified = coalesce($14, documents_verified),
                    scholarship_status = coalesce($15, scholarship_status),
-                   custom_fields = coalesce($16, custom_fields), updated_at = now()
+                   custom_fields = coalesce($16, custom_fields), source = coalesce($17, source), updated_at = now()
                WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL
                RETURNING *"#,
         )
@@ -321,6 +333,7 @@ impl PostgresCrmRepository {
         .bind(patch.documents_verified)
         .bind(patch.scholarship_status)
         .bind(patch.custom_fields)
+        .bind(patch.source)
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(CrmError::NotFound)?;
@@ -396,6 +409,151 @@ impl PostgresCrmRepository {
         .await?;
         transaction.commit().await?;
         row_to_lead(&row, tenant_slug)
+    }
+
+    pub async fn pipeline_transfer_candidates(
+        &self,
+        tenant_slug: &str,
+        exclude_user_id: &str,
+    ) -> Result<Vec<PipelineTransferCandidate>, CrmError> {
+        let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
+        let rows = sqlx::query(
+            r#"SELECT DISTINCT account.id::text AS user_id, account.display_name, account.email
+               FROM identity.tenant_memberships membership
+               JOIN identity.users account ON account.id = membership.user_id AND account.active
+               WHERE membership.tenant_id = $1 AND membership.active
+                 AND account.id::text <> $2
+                 AND EXISTS (
+                     SELECT 1
+                     FROM authz.user_roles user_role
+                     JOIN authz.roles role ON role.tenant_id = user_role.tenant_id
+                         AND role.id = user_role.role_id AND role.active
+                     LEFT JOIN authz.role_permissions grant_row
+                         ON grant_row.tenant_id = role.tenant_id AND grant_row.role_id = role.id
+                     WHERE user_role.tenant_id = membership.tenant_id
+                       AND user_role.user_id = membership.user_id
+                       AND grant_row.permission_key = 'crm.leads.read'
+                 )
+               ORDER BY account.display_name, account.email"#,
+        )
+        .bind(tenant_id)
+        .bind(exclude_user_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        rows.iter()
+            .map(|row| {
+                Ok(PipelineTransferCandidate {
+                    user_id: row.try_get("user_id")?,
+                    name: row.try_get("display_name")?,
+                    email: row.try_get("email")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn transfer_lead(
+        &self,
+        tenant_slug: &str,
+        lead_id: Uuid,
+        current_owner: &str,
+        new_owner: Uuid,
+        reason: &str,
+    ) -> Result<Lead, CrmError> {
+        let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
+        let lead = sqlx::query(
+            "SELECT assigned_to, stage_key FROM crm.leads WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(lead_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(CrmError::NotFound)?;
+        let assigned_to: Option<String> = lead.try_get("assigned_to")?;
+        let stage_key: String = lead.try_get("stage_key")?;
+        if assigned_to.as_deref() != Some(current_owner) {
+            return Err(CrmError::Forbidden(
+                "only the current card owner can transfer this lead".into(),
+            ));
+        }
+        if stage_key == "enquiry" {
+            return Err(CrmError::Validation(
+                "Enquiry is a shared queue; move the card to claim it before transferring".into(),
+            ));
+        }
+        if new_owner.to_string() == current_owner {
+            return Err(CrmError::Validation(
+                "select another pipeline user for the transfer".into(),
+            ));
+        }
+        let eligible: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                   SELECT 1
+                   FROM identity.tenant_memberships membership
+                   JOIN identity.users account ON account.id = membership.user_id AND account.active
+                   JOIN authz.user_roles user_role ON user_role.tenant_id = membership.tenant_id
+                       AND user_role.user_id = membership.user_id
+                   JOIN authz.roles role ON role.tenant_id = user_role.tenant_id
+                       AND role.id = user_role.role_id AND role.active
+                   LEFT JOIN authz.role_permissions grant_row
+                       ON grant_row.tenant_id = role.tenant_id AND grant_row.role_id = role.id
+                   WHERE membership.tenant_id = $1 AND membership.user_id = $2
+                     AND membership.active
+                     AND grant_row.permission_key = 'crm.leads.read'
+               )"#,
+        )
+        .bind(tenant_id)
+        .bind(new_owner)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !eligible {
+            return Err(CrmError::Validation(
+                "the selected user does not have access to this tenant pipeline".into(),
+            ));
+        }
+        let new_owner_text = new_owner.to_string();
+        let row = sqlx::query(
+            r#"UPDATE crm.leads
+               SET assigned_to = $3, assigned_by = $4,
+                   assignment_type = 'owner_transfer', updated_at = now()
+               WHERE tenant_id = $1 AND id = $2 AND assigned_to = $4 AND deleted_at IS NULL
+               RETURNING *"#,
+        )
+        .bind(tenant_id)
+        .bind(lead_id)
+        .bind(&new_owner_text)
+        .bind(current_owner)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| CrmError::Conflict("card ownership changed before transfer".into()))?;
+        self.insert_assignment_history(
+            &mut transaction,
+            tenant_id,
+            lead_id,
+            Some(current_owner),
+            &new_owner_text,
+            "owner_transfer",
+            Some(reason),
+            current_owner,
+        )
+        .await?;
+        let realtime_lead = row_to_lead(&row, tenant_slug)?;
+        self.insert_event(
+            &mut transaction,
+            tenant_id,
+            lead_id,
+            "lead.transferred",
+            json!({
+                "leadId": lead_id,
+                "oldOwner": current_owner,
+                "newOwner": new_owner_text,
+                "reason": reason,
+                "lead": realtime_lead,
+            }),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(realtime_lead)
     }
 
     /// Atomically claim one eligible pool lead for the authenticated actor.
@@ -1332,29 +1490,84 @@ impl PostgresCrmRepository {
         lead_id: Uuid,
     ) -> Result<Option<Value>, CrmError> {
         let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
-        let row = sqlx::query(
-            r#"SELECT case_id, application_id, admission_id, application_status,
-                      created_at, updated_at
-               FROM crm.lead_application_links
-               WHERE tenant_id = $1 AND lead_id = $2"#,
+        let rows = sqlx::query(
+            r#"SELECT link.case_id, desk.application_id, desk.admission_id,
+                      desk.stage AS application_stage,
+                      desk.status AS application_status,
+                      link.created_at AS relationship_created_at,
+                      desk.created_at, desk.updated_at
+               FROM crm.lead_application_links link
+               JOIN application_desk.cases desk
+                 ON desk.tenant_id = link.tenant_id AND desk.id = link.case_id
+               WHERE link.tenant_id = $1 AND link.lead_id = $2
+               ORDER BY desk.created_at DESC, link.created_at DESC"#,
         )
         .bind(tenant_id)
         .bind(lead_id)
-        .fetch_optional(&mut *transaction)
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        let Some(latest) = rows.first() else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let latest_case_id: String = latest.try_get("case_id")?;
+        let audit_rows = sqlx::query(
+            r#"SELECT action, from_stage, to_stage, from_status, to_status,
+                      reason, actor, created_at
+               FROM application_desk.audit_log
+               WHERE tenant_id = $1 AND case_id = $2
+               ORDER BY id ASC"#,
+        )
+        .bind(tenant_id)
+        .bind(&latest_case_id)
+        .fetch_all(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        row.map(|row| {
-            Ok(json!({
-                "leadId": lead_id,
-                "caseId": row.try_get::<String, _>("case_id")?,
-                "applicationId": row.try_get::<String, _>("application_id")?,
-                "admissionId": row.try_get::<String, _>("admission_id")?,
-                "applicationStatus": row.try_get::<String, _>("application_status")?,
-                "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?,
-                "updatedAt": row.try_get::<DateTime<Utc>, _>("updated_at")?
-            }))
-        })
-        .transpose()
+
+        let applications = rows
+            .iter()
+            .map(|row| {
+                Ok(json!({
+                    "caseId": row.try_get::<String, _>("case_id")?,
+                    "applicationId": row.try_get::<String, _>("application_id")?,
+                    "admissionId": row.try_get::<String, _>("admission_id")?,
+                    "applicationStage": row.try_get::<String, _>("application_stage")?,
+                    "applicationStatus": row.try_get::<String, _>("application_status")?,
+                    "relationshipCreatedAt": row.try_get::<DateTime<Utc>, _>("relationship_created_at")?,
+                    "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?,
+                    "updatedAt": row.try_get::<DateTime<Utc>, _>("updated_at")?
+                }))
+            })
+            .collect::<Result<Vec<Value>, CrmError>>()?;
+        let application_history = audit_rows
+            .iter()
+            .map(|row| {
+                Ok(json!({
+                    "action": row.try_get::<String, _>("action")?,
+                    "fromStage": row.try_get::<String, _>("from_stage")?,
+                    "toStage": row.try_get::<String, _>("to_stage")?,
+                    "fromStatus": row.try_get::<String, _>("from_status")?,
+                    "toStatus": row.try_get::<String, _>("to_status")?,
+                    "reason": row.try_get::<Option<String>, _>("reason")?,
+                    "actor": row.try_get::<String, _>("actor")?,
+                    "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?
+                }))
+            })
+            .collect::<Result<Vec<Value>, CrmError>>()?;
+
+        Ok(Some(json!({
+            "leadId": lead_id,
+            "caseId": latest_case_id,
+            "applicationId": latest.try_get::<String, _>("application_id")?,
+            "admissionId": latest.try_get::<String, _>("admission_id")?,
+            "applicationStage": latest.try_get::<String, _>("application_stage")?,
+            "applicationStatus": latest.try_get::<String, _>("application_status")?,
+            "createdAt": latest.try_get::<DateTime<Utc>, _>("created_at")?,
+            "updatedAt": latest.try_get::<DateTime<Utc>, _>("updated_at")?,
+            "applications": applications,
+            "applicationHistory": application_history
+        })))
     }
     pub async fn create_form(
         &self,

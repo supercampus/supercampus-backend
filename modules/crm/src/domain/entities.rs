@@ -82,6 +82,14 @@ pub struct LeadMoveRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PipelineTransferCandidate {
+    pub user_id: String,
+    pub name: String,
+    pub email: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Communication {
     pub id: Uuid,
     pub lead_id: Uuid,

@@ -55,6 +55,86 @@ impl Default for DeskSettings {
     }
 }
 
+/// Project only the CRM position that the authoritative application lifecycle
+/// requires. Active desk work must not overwrite a later offer decision or an
+/// archived CRM record; terminal application outcomes do synchronize.
+fn crm_projection<'a>(
+    status: OnboardingStatus,
+    current_stage: &'a str,
+    current_substate: &'a str,
+    new_relationship: bool,
+) -> (&'a str, &'a str) {
+    match status {
+        OnboardingStatus::Completed => ("offer_status", "accepted"),
+        OnboardingStatus::Rejected
+        | OnboardingStatus::Cancelled
+        | OnboardingStatus::Withdrawn
+        | OnboardingStatus::Expired => ("offer_status", "rejected"),
+        _ if new_relationship
+            && current_stage == "offer_status"
+            && matches!(current_substate, "accepted" | "rejected") =>
+        {
+            ("application_status", "awaiting_decision")
+        }
+        _ if matches!(
+            current_stage,
+            "application_status" | "offer_status" | "archived"
+        ) =>
+        {
+            (current_stage, current_substate)
+        }
+        _ => ("application_status", "awaiting_decision"),
+    }
+}
+
+#[cfg(test)]
+mod application_projection_tests {
+    use super::crm_projection;
+    use crate::domain::OnboardingStatus;
+
+    #[test]
+    fn active_application_advances_only_an_earlier_crm_stage() {
+        assert_eq!(
+            crm_projection(OnboardingStatus::Active, "qualified", "eligible", true),
+            ("application_status", "awaiting_decision")
+        );
+        assert_eq!(
+            crm_projection(OnboardingStatus::Active, "offer_status", "to_do", false),
+            ("offer_status", "to_do")
+        );
+    }
+
+    #[test]
+    fn terminal_application_outcomes_drive_the_required_crm_position() {
+        assert_eq!(
+            crm_projection(
+                OnboardingStatus::Completed,
+                "application_status",
+                "awaiting_decision",
+                false,
+            ),
+            ("offer_status", "accepted")
+        );
+        assert_eq!(
+            crm_projection(
+                OnboardingStatus::Withdrawn,
+                "application_status",
+                "awaiting_decision",
+                false,
+            ),
+            ("offer_status", "rejected")
+        );
+    }
+
+    #[test]
+    fn a_new_readmission_resets_a_closed_offer_without_rewriting_history() {
+        assert_eq!(
+            crm_projection(OnboardingStatus::Active, "offer_status", "rejected", true),
+            ("application_status", "awaiting_decision")
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct PostgresDeskRepository {
     database: Database,
@@ -287,86 +367,148 @@ impl PostgresDeskRepository {
                 if let Some(lead_id) = onboarding.crm_lead_id {
                     let linked = sqlx::query(
                         r#"INSERT INTO crm.lead_application_links
-                           (tenant_id, lead_id, case_id, application_id, admission_id, application_status)
-                           SELECT $1, lead.id, $3, $4, $5, $6
+                           (tenant_id, lead_id, case_id)
+                           SELECT $1, lead.id, $3
                            FROM crm.leads lead
                            WHERE lead.tenant_id = $1 AND lead.id = $2 AND lead.deleted_at IS NULL
-                           ON CONFLICT (tenant_id, lead_id) DO UPDATE SET
-                               case_id = EXCLUDED.case_id,
-                               application_id = EXCLUDED.application_id,
-                               admission_id = EXCLUDED.admission_id,
-                               application_status = EXCLUDED.application_status,
-                               updated_at = now()"#,
+                           ON CONFLICT (tenant_id, case_id) DO NOTHING"#,
                     )
                     .bind(tenant_id)
                     .bind(lead_id)
                     .bind(&onboarding.id)
-                    .bind(&onboarding.application_id)
-                    .bind(&onboarding.admission_id)
-                    .bind(onboarding.status.as_str())
                     .execute(&mut **transaction)
                     .await?;
-                    if linked.rows_affected() != 1 {
-                        return Err(DeskError::Conflict(
-                            "CRM lead does not belong to this tenant".into(),
-                        ));
+
+                    if linked.rows_affected() == 0 {
+                        let existing_lead: Option<Uuid> = sqlx::query_scalar(
+                            r#"SELECT lead_id FROM crm.lead_application_links
+                               WHERE tenant_id = $1 AND case_id = $2"#,
+                        )
+                        .bind(tenant_id)
+                        .bind(&onboarding.id)
+                        .fetch_optional(&mut **transaction)
+                        .await?;
+                        match existing_lead {
+                            Some(existing) if existing == lead_id => {}
+                            Some(_) => {
+                                return Err(DeskError::Conflict(
+                                    "onboarding case is already linked to another CRM lead".into(),
+                                ));
+                            }
+                            None => {
+                                return Err(DeskError::Conflict(
+                                    "CRM lead does not belong to this tenant".into(),
+                                ));
+                            }
+                        }
                     }
 
-                    let current_crm_stage: Option<String> = sqlx::query_scalar(
-                        "SELECT stage_key FROM crm.leads WHERE tenant_id = $1 AND id = $2",
+                    let current = sqlx::query(
+                        r#"SELECT stage_key, substate_key, global_status, global_status_data
+                           FROM crm.leads WHERE tenant_id = $1 AND id = $2"#,
                     )
                     .bind(tenant_id)
                     .bind(lead_id)
-                    .fetch_optional(&mut **transaction)
+                    .fetch_one(&mut **transaction)
                     .await?;
-                    let (stage, substate) = match onboarding.status {
-                        OnboardingStatus::Completed => ("offer_status", "accepted"),
-                        OnboardingStatus::Rejected
-                        | OnboardingStatus::Cancelled
-                        | OnboardingStatus::Withdrawn
-                        | OnboardingStatus::Expired => ("offer_status", "rejected"),
-                        _ if current_crm_stage.as_deref() == Some("offer_status") => {
-                            ("offer_status", "to_do")
-                        }
-                        _ => ("application_status", "awaiting_decision"),
-                    };
-                    sqlx::query(
+                    let from_stage: String = current.try_get("stage_key")?;
+                    let from_substate: String = current.try_get("substate_key")?;
+                    let global_status: Option<String> = current.try_get("global_status")?;
+                    let global_status_data: Value = current.try_get("global_status_data")?;
+                    let (stage, substate) = crm_projection(
+                        onboarding.status,
+                        &from_stage,
+                        &from_substate,
+                        linked.rows_affected() == 1,
+                    );
+                    let application_hold = onboarding.status == OnboardingStatus::OnHold;
+                    let linked_hold = global_status.as_deref() == Some("on_hold")
+                        && global_status_data.get("source").and_then(Value::as_str)
+                            == Some("application_desk");
+                    let position_changed = from_stage != stage || from_substate != substate;
+                    let hold_changed = application_hold != linked_hold;
+
+                    if position_changed || hold_changed {
+                        sqlx::query(
                         r#"UPDATE crm.leads SET
                                stage_key = $3,
                                substate_key = $4,
                                global_status = CASE
-                                   WHEN $5 = 'ON_HOLD' THEN 'on_hold'
-                                   WHEN global_status = 'on_hold' THEN NULL
+                                   WHEN $5 THEN 'on_hold'
+                                   WHEN global_status = 'on_hold'
+                                        AND global_status_data ->> 'source' = 'application_desk'
+                                       THEN NULL
                                    ELSE global_status
+                               END,
+                               global_status_data = CASE
+                                   WHEN $5 THEN jsonb_build_object(
+                                       'source', 'application_desk', 'caseId', $6::text)
+                                   WHEN global_status = 'on_hold'
+                                        AND global_status_data ->> 'source' = 'application_desk'
+                                       THEN '{}'::jsonb
+                                   ELSE global_status_data
                                END,
                                stage_entered_at = CASE WHEN stage_key <> $3 THEN now() ELSE stage_entered_at END,
                                updated_at = now()
                            WHERE tenant_id = $1 AND id = $2"#,
-                    )
-                    .bind(tenant_id)
-                    .bind(lead_id)
-                    .bind(stage)
-                    .bind(substate)
-                    .bind(onboarding.status.as_str())
-                    .execute(&mut **transaction)
-                    .await?;
-                    sqlx::query(
+                        )
+                        .bind(tenant_id)
+                        .bind(lead_id)
+                        .bind(stage)
+                        .bind(substate)
+                        .bind(application_hold)
+                        .bind(&onboarding.id)
+                        .execute(&mut **transaction)
+                        .await?;
+
+                        if position_changed {
+                            sqlx::query(
+                                r#"INSERT INTO crm.stage_history
+                                   (tenant_id, lead_id, from_stage, from_substate,
+                                    to_stage, to_substate, actor_id, actor_role, reason, notes)
+                                   VALUES ($1, $2, $3, $4, $5, $6, 'application-desk',
+                                           'system', 'application_status_sync', $7)"#,
+                            )
+                            .bind(tenant_id)
+                            .bind(lead_id)
+                            .bind(&from_stage)
+                            .bind(&from_substate)
+                            .bind(stage)
+                            .bind(substate)
+                            .bind(format!(
+                                "caseId={}; applicationId={}",
+                                onboarding.id, onboarding.application_id
+                            ))
+                            .execute(&mut **transaction)
+                            .await?;
+                        }
+                    }
+
+                    if linked.rows_affected() == 1 || position_changed || hold_changed {
+                        let event_type = if linked.rows_affected() == 1 {
+                            "lead.application_linked"
+                        } else {
+                            "application.status_synced"
+                        };
+                        sqlx::query(
                         r#"INSERT INTO crm.outbox_events
                            (tenant_id, aggregate_id, event_type, payload)
-                           VALUES ($1, $2, 'application.status_synced', $3)"#,
-                    )
-                    .bind(tenant_id)
-                    .bind(lead_id)
-                    .bind(serde_json::json!({
-                        "leadId": lead_id,
-                        "caseId": onboarding.id,
-                        "applicationId": onboarding.application_id,
-                        "applicationStatus": onboarding.status.as_str(),
-                        "toStage": stage,
-                        "toSubstate": substate
-                    }))
-                    .execute(&mut **transaction)
-                    .await?;
+                           VALUES ($1, $2, $3, $4)"#,
+                        )
+                        .bind(tenant_id)
+                        .bind(lead_id)
+                        .bind(event_type)
+                        .bind(serde_json::json!({
+                            "leadId": lead_id,
+                            "caseId": onboarding.id,
+                            "applicationId": onboarding.application_id,
+                            "applicationStatus": onboarding.status.as_str(),
+                            "toStage": stage,
+                            "toSubstate": substate
+                        }))
+                        .execute(&mut **transaction)
+                        .await?;
+                    }
                 }
                 Ok(())
             }

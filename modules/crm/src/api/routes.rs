@@ -36,6 +36,11 @@ pub fn router(databases: Option<TenantDatabaseManager>) -> Router {
                 .delete(handlers::delete_lead),
         )
         .route("/leads/{id}/assign", post(handlers::assign_lead))
+        .route("/leads/{id}/transfer", post(handlers::transfer_lead))
+        .route(
+            "/pipeline/transfer-candidates",
+            get(handlers::transfer_candidates),
+        )
         .route("/leads/{id}/claim", post(handlers::claim_lead))
         .route("/leads/{id}/reassign", post(handlers::reassign_lead))
         .route("/leads/{id}/stage/move", post(handlers::move_stage))

@@ -15,12 +15,12 @@ use crate::{
         CounselorCapacityRequest, CreateCampaignRequest, CreateFormRequest, CreateLeadNoteRequest,
         CreateLeadRequest, CreateLeadTaskRequest, CreateTemplateRequest, HoldRequest,
         IntakeStatusRequest, LeadFilters, MoveRequestDecision, MoveStageRequest, ReasonRequest,
-        SendCommunicationRequest, SubmitFormRequest, UnarchiveRequest, UpdateFormRequest,
-        UpdateLeadRequest, WorkflowToggleRequest,
+        SendCommunicationRequest, SubmitFormRequest, TransferLeadRequest, UnarchiveRequest,
+        UpdateFormRequest, UpdateLeadRequest, WorkflowToggleRequest,
     },
     domain::{
-        Campaign, CrmError, FormDefinition, Lead, LeadMoveRequest, PrimaryStage,
-        validate_transition,
+        Campaign, CrmError, FormDefinition, Lead, LeadMoveRequest, PipelineTransferCandidate,
+        PrimaryStage, canonical_lead_source, validate_transition,
     },
     infrastructure::postgres::{LeadPatch, NewLead, PostgresCrmRepository},
 };
@@ -116,13 +116,14 @@ impl CrmService {
         }
         let priority = request.priority.unwrap_or_else(|| "medium".into());
         validate_priority(&priority)?;
+        let source = canonical_lead_source(&request.source)?;
         self.repo()?
             .create_lead(
                 tenant,
                 &actor.user_id,
                 actor.primary_role(),
                 NewLead {
-                    source: request.source,
+                    source,
                     source_detail: request.source_detail,
                     full_name: request.student.name,
                     email: request.student.email,
@@ -222,6 +223,24 @@ impl CrmService {
                 });
                 continue;
             }
+            let source = if lead.source.is_empty() {
+                "Other".to_owned()
+            } else {
+                match canonical_lead_source(&lead.source) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        failed += 1;
+                        results.push(BulkImportLeadResult {
+                            row_number,
+                            status: "failed".into(),
+                            lead_id: None,
+                            duplicate_of: None,
+                            message: Some(error.to_string()),
+                        });
+                        continue;
+                    }
+                }
+            };
 
             let contact_keys =
                 import_contact_keys(lead.student.phone.as_deref(), lead.student.email.as_deref());
@@ -262,11 +281,7 @@ impl CrmService {
             }
 
             let new_lead = NewLead {
-                source: if lead.source.is_empty() {
-                    "Bulk import".into()
-                } else {
-                    lead.source
-                },
+                source,
                 source_detail: lead.source_detail,
                 full_name: lead.student.name,
                 email: lead.student.email,
@@ -340,7 +355,9 @@ impl CrmService {
         .await?;
         let owner_scope =
             (!actor.has_all_scope("crm.leads.read")).then_some(actor.user_id.as_str());
-        self.repo()?.list_leads(tenant, filters, owner_scope).await
+        self.repo()?
+            .list_leads(tenant, filters, owner_scope, false)
+            .await
     }
 
     pub async fn unassigned_leads(
@@ -360,7 +377,7 @@ impl CrmService {
         filters.stage = Some("enquiry".into());
         filters.owner = None;
         filters.unassigned = Some(true);
-        self.repo()?.list_leads(tenant, &filters, None).await
+        self.repo()?.list_leads(tenant, &filters, None, false).await
     }
 
     pub async fn get_lead(
@@ -390,11 +407,17 @@ impl CrmService {
         if let Some(priority) = request.priority.as_deref() {
             validate_priority(priority)?;
         }
+        let source = request
+            .source
+            .as_deref()
+            .map(canonical_lead_source)
+            .transpose()?;
         self.repo()?
             .update_lead(
                 tenant,
                 lead_id,
                 LeadPatch {
+                    source,
                     full_name: request.full_name,
                     email: request.email,
                     phone: request.phone,
@@ -489,6 +512,50 @@ impl CrmService {
         Err(CrmError::Conflict(
             "move the Enquiry to its next stage to claim it".into(),
         ))
+    }
+
+    pub async fn transfer_candidates(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+    ) -> Result<Vec<PipelineTransferCandidate>, CrmError> {
+        self.require(
+            tenant,
+            actor,
+            "crm.leads.read",
+            actor.has("crm.leads.read"),
+            None,
+        )
+        .await?;
+        self.repo()?
+            .pipeline_transfer_candidates(tenant, &actor.user_id)
+            .await
+    }
+
+    pub async fn transfer_lead(
+        &self,
+        tenant: &str,
+        actor: &ActorContext,
+        lead_id: Uuid,
+        request: TransferLeadRequest,
+    ) -> Result<Lead, CrmError> {
+        self.require(
+            tenant,
+            actor,
+            "crm.leads.read",
+            actor.has("crm.leads.read"),
+            Some(lead_id),
+        )
+        .await?;
+        let reason = request.reason.trim();
+        if reason.is_empty() {
+            return Err(CrmError::Validation("transfer reason is required".into()));
+        }
+        let new_owner = Uuid::parse_str(request.user_id.trim())
+            .map_err(|_| CrmError::Validation("invalid transfer user".into()))?;
+        self.repo()?
+            .transfer_lead(tenant, lead_id, &actor.user_id, new_owner, reason)
+            .await
     }
 
     pub async fn move_stage(
@@ -883,14 +950,12 @@ impl CrmService {
             None,
         )
         .await?;
-        // Users who can request owner approval need the shared card board even when
-        // their lead-detail read scope is otherwise assigned-only.
-        let collaborative = actor.has("crm.leads.stage.request");
-        let owner_scope = (!collaborative && !actor.has_all_scope("crm.leads.read"))
-            .then_some(actor.user_id.as_str());
+        // Enquiry is the shared intake queue. Once a first movement claims a card,
+        // the pipeline only returns it to its current owner, regardless of broad
+        // reporting/read scope.
         let leads = self
             .repo()?
-            .list_leads(tenant, &filters, owner_scope)
+            .list_leads(tenant, &filters, Some(actor.user_id.as_str()), true)
             .await?;
         let stages: Vec<Value> = PrimaryStage::ALL
             .into_iter()
@@ -911,7 +976,7 @@ impl CrmService {
             .collect();
         Ok(json!({
             "pipeline": { "key": "pre-admission", "name": "Pre-Admission Pipeline" },
-            "scope": if collaborative { "collaborative" } else { actor.scope_for("crm.leads.read") },
+            "scope": "shared_enquiry_and_owned",
             "stages": stages,
             "total": leads.len()
         }))
@@ -952,7 +1017,7 @@ impl CrmService {
         };
         let leads = self
             .repo()?
-            .list_leads(tenant, &filters, owner_scope)
+            .list_leads(tenant, &filters, owner_scope, false)
             .await?;
         let configuration = self.repo()?.list_configuration(tenant).await?;
         let counselors = self.repo()?.list_counselors(tenant).await?;
@@ -1585,18 +1650,20 @@ impl CrmService {
                     "enquiry form requires student phone or email".into(),
                 ));
             }
+            let source = canonical_lead_source(
+                request
+                    .data
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Institution Website"),
+            )?;
             let lead = repository
                 .create_lead(
                     tenant,
                     &actor.user_id,
                     actor.primary_role(),
                     NewLead {
-                        source: request
-                            .data
-                            .get("source")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Public Enquiry Form")
-                            .to_owned(),
+                        source,
                         source_detail: json!({
                             "formId": form_id,
                             "formVersion": form.version,

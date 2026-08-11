@@ -52,6 +52,10 @@ paths:
     delete: { tags: [Leads], operationId: deleteCrmLead, responses: { "204": { description: Lead soft deleted } } }
   /api/v1/crm/leads/{id}/assign:
     post: { tags: [Leads], operationId: assignCrmLead, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Lead assigned } } }
+  /api/v1/crm/leads/{id}/transfer:
+    post: { tags: [Leads], operationId: transferCrmLead, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Ownership transferred by the current owner with assignment history } } }
+  /api/v1/crm/pipeline/transfer-candidates:
+    get: { tags: [Pipeline], operationId: listCrmPipelineTransferCandidates, responses: { "200": { description: Active same-tenant users with effective pipeline read access } } }
   /api/v1/crm/leads/{id}/reassign:
     post: { tags: [Leads], operationId: reassignCrmLead, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Lead reassigned with history } } }
   /api/v1/crm/leads/{id}/stage/move:
@@ -71,7 +75,7 @@ paths:
   /api/v1/crm/leads/{id}/timeline:
     get: { tags: [Leads], operationId: getCrmLeadTimeline, parameters: [ { $ref: "#/components/parameters/Id" } ], responses: { "200": { description: Stage and communication history } } }
   /api/v1/crm/kanban/board:
-    get: { tags: [Dashboard], operationId: getCrmKanban, responses: { "200": { description: Nine-column role-scoped board } } }
+    get: { tags: [Dashboard], operationId: getCrmKanban, responses: { "200": { description: Shared Enquiry plus current-owner cards in later stages } } }
   /api/v1/crm/kanban/my-board:
     get: { tags: [Dashboard], operationId: getMyCrmKanban, responses: { "200": { description: Assigned lead board } } }
   /api/v1/crm/kanban/stages:

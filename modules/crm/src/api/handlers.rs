@@ -43,12 +43,13 @@ impl CrmApiState {
         Ok(CrmService::new(Some(database)))
     }
 
-    async fn reflect_offer_in_application_desk(
+    async fn reflect_application_in_desk(
         &self,
         context: &RequestContext,
         lead: &crate::domain::Lead,
+        application_submitted: bool,
     ) -> Result<(), CrmHttpError> {
-        if lead.stage_key != "offer_status" {
+        if !application_submitted {
             return Ok(());
         }
         let databases = self
@@ -76,7 +77,7 @@ impl CrmApiState {
             application_id: format!("CRM-APP-{}", lead.id),
             admission_id: format!("CRM-OFFER-{}", lead.id),
             crm_lead_id: Some(lead.id),
-            admission_status: "CONFIRMED".into(),
+            admission_status: "APPLICATION".into(),
             program_id,
             fee_paid: lead.fee_payment_confirmed,
             applicant: ApplicantSnapshot {
@@ -86,6 +87,23 @@ impl CrmApiState {
                 guardian_name: lead.parent_name.clone(),
                 guardian_email: None,
             },
+            attributes: json!({
+                "source": lead.source,
+                "sourceDetail": lead.source_detail,
+                "whatsapp": lead.whatsapp,
+                "parentPhone": lead.parent_phone,
+                "interest": lead.interest,
+                "priority": lead.priority,
+                "leadOwner": lead.assigned_to,
+                "preferredChannel": lead.preferred_channel,
+                "customFields": lead.custom_fields,
+                "crmStage": lead.stage_key,
+                "crmSubstate": lead.substate_key,
+                "leadCreatedAt": lead.created_at,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
             ..AdmissionTrigger::default()
         };
         desk.open_case(&context.tenant, &actor, trigger)
@@ -93,6 +111,10 @@ impl CrmApiState {
             .map_err(|error| CrmHttpError(CrmError::Storage(error.to_string())))?;
         Ok(())
     }
+}
+
+fn opens_application_desk(to_stage: &str, to_substate: Option<&str>) -> bool {
+    to_stage == "application" && to_substate == Some("application_submitted")
 }
 
 pub struct RequestContext {
@@ -403,12 +425,14 @@ pub async fn move_stage(
     Json(request): Json<MoveStageRequest>,
 ) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
     let context = RequestContext::from_headers(&headers)?;
+    let application_submitted =
+        opens_application_desk(&request.to_stage, request.to_substate.as_deref());
     let service = state.service(&context.tenant).await?;
     let moved = service
         .move_stage(&context.tenant, &context.actor, id, request)
         .await?;
     state
-        .reflect_offer_in_application_desk(&context, &moved)
+        .reflect_application_in_desk(&context, &moved, application_submitted)
         .await?;
     let _ = state.realtime_wake.send(());
     Ok(ok(moved))
@@ -577,16 +601,41 @@ pub async fn approve_move_request(
     let decision = service
         .decide_stage_move(&context.tenant, &context.actor, id, true, request)
         .await?;
-    if decision.status == "approved" && decision.to_stage == "offer_status" {
+    if decision.status == "approved"
+        && opens_application_desk(&decision.to_stage, Some(&decision.to_substate))
+    {
         let moved = service
             .get_lead(&context.tenant, &context.actor, decision.lead_id)
             .await?;
         state
-            .reflect_offer_in_application_desk(&context, &moved)
+            .reflect_application_in_desk(&context, &moved, true)
             .await?;
     }
     let _ = state.realtime_wake.send(());
     Ok(ok(decision))
+}
+
+#[cfg(test)]
+mod application_desk_trigger_tests {
+    use super::opens_application_desk;
+
+    #[test]
+    fn application_desk_opens_only_after_application_submission() {
+        assert!(!opens_application_desk("application", None));
+        assert!(!opens_application_desk("application", Some("to_do")));
+        assert!(!opens_application_desk(
+            "application",
+            Some("application_in_progress")
+        ));
+        assert!(opens_application_desk(
+            "application",
+            Some("application_submitted")
+        ));
+        assert!(!opens_application_desk(
+            "application_status",
+            Some("awaiting_decision")
+        ));
+    }
 }
 
 pub async fn reject_move_request(

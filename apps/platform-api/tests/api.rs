@@ -589,7 +589,9 @@ async fn navigation_returns_sections_the_grants_allow() {
         .map(|section| section["key"].as_str().unwrap())
         .collect();
     // The in-memory identity holds "*", so every default section resolves.
-    assert!(keys.contains(&"crm"), "expected crm section, got {keys:?}");
+    // Lead operations now live entirely under Pipeline; the retired standalone
+    // CRM workspace must not reappear even for identities granted `*`.
+    assert!(!keys.contains(&"crm"), "unexpected crm section: {keys:?}");
     assert!(keys.contains(&"pipeline"));
     // Settings is only emitted once at least one settings child is reachable.
     assert!(keys.contains(&"settings"));
@@ -602,6 +604,27 @@ async fn navigation_returns_sections_the_grants_allow() {
         );
         assert!(section["key"].is_string());
     }
+}
+
+#[tokio::test]
+async fn tenant_branding_returns_defaults_before_the_first_saved_customization() {
+    let app = test_app();
+    let session = login_session(&app, "tenant-local").await;
+    let response = app
+        .oneshot(
+            Request::get("/api/v1/configuration/tenant-branding")
+                .header(header::AUTHORIZATION, session.bearer())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["data"]["namespace"], "tenant-branding");
+    assert_eq!(body["data"]["version"], 0);
+    assert_eq!(body["data"]["value"]["suiteName"], "Admin Suite");
 }
 
 #[tokio::test]

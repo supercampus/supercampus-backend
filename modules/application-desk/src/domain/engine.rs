@@ -67,6 +67,9 @@ impl ServiceError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActionPayload {
+    /// A draft or submitted response to the tenant's published Application form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_form: Option<ApplicationFormUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_match: Option<IdentityMatchKind>,
     /// Document states to merge into the checklist, keyed by document type.
@@ -89,6 +92,16 @@ pub struct ActionPayload {
     pub approval_step: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_to: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApplicationFormUpdate {
+    pub form_id: String,
+    pub form_version: i32,
+    pub status: String,
+    #[serde(default)]
+    pub data: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -225,6 +238,39 @@ pub fn effect_key(case_id: &str, effect: EffectKind) -> String {
 fn apply_payload(onboarding: &OnboardingCase, context: &EngineContext<'_>) -> OnboardingCase {
     let payload = &context.payload;
     let mut draft = onboarding.clone();
+
+    if let Some(application) = &payload.application_form {
+        let previous_revision = draft
+            .attributes
+            .get("applicationForm")
+            .and_then(|value| value.get("revision"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let mut revisions = draft
+            .attributes
+            .get("applicationFormHistory")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let revision = previous_revision + 1;
+        let snapshot = json!({
+            "formId": application.form_id,
+            "formVersion": application.form_version,
+            "status": application.status,
+            "data": application.data,
+            "revision": revision,
+            "updatedAt": context.now,
+            "updatedBy": context.actor,
+        });
+        revisions.push(snapshot.clone());
+        draft.attributes.insert("applicationForm".into(), snapshot);
+        draft
+            .attributes
+            .insert("applicationFormHistory".into(), json!(revisions));
+        draft
+            .attributes
+            .insert("applicationFormRequired".into(), json!(true));
+    }
 
     if let Some(identity) = payload.identity_match {
         draft.identity_match = Some(identity);
@@ -466,6 +512,20 @@ pub async fn apply_action(
     }
 
     match action {
+        ActionKind::SaveApplication => {
+            if context.payload.application_form.is_none() {
+                return refuse(onboarding, "No application form data supplied");
+            }
+            let after = apply_payload(onboarding, context);
+            return TransitionResult {
+                ok: true,
+                events: Vec::new(),
+                audit: vec![audit_entry(onboarding, &after, "save_application", context)],
+                case: after,
+                exception: None,
+                error: None,
+            };
+        }
         ActionKind::Hold => {
             return side_transition(
                 onboarding,
@@ -553,6 +613,29 @@ pub async fn apply_action(
 
     // Record what the operator supplied, then judge the case as it now stands.
     let staged = apply_payload(onboarding, context);
+
+    // Collecting the full application is an Application Desk invariant, not a
+    // CRM stage field. Tenants without a published Application form remain
+    // compatible; once a case is marked as requiring one, Data Review cannot
+    // be left until a submitted revision exists.
+    if staged.stage == OnboardingStage::DataReview
+        && staged
+            .attributes
+            .get("applicationFormRequired")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        && staged
+            .attributes
+            .get("applicationForm")
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            != Some("submitted")
+    {
+        return refuse(
+            &staged,
+            "Complete and submit the application form before identity verification",
+        );
+    }
 
     let Some(current) = definition.stage(staged.stage) else {
         return refuse(

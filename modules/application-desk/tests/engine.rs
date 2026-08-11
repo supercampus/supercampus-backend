@@ -145,6 +145,80 @@ fn ready_case(stage: OnboardingStage) -> OnboardingCase {
 
 // -- intake -----------------------------------------------------------------
 
+#[tokio::test]
+async fn a_required_application_is_versioned_and_must_be_submitted_before_data_review_advances() {
+    let definition = default_workflow(TENANT);
+    let mut required = ready_case(OnboardingStage::DataReview);
+    required
+        .attributes
+        .insert("applicationFormRequired".into(), serde_json::json!(true));
+    let (services, _) = CountingServices::new();
+    let context = EngineContext::new("officer-1", now(), &services);
+
+    let blocked = apply_action(&definition, &required, ActionKind::Advance, &context).await;
+    assert!(!blocked.ok);
+    assert!(
+        blocked
+            .error
+            .unwrap()
+            .contains("submit the application form")
+    );
+
+    let draft_payload = serde_json::from_value(serde_json::json!({
+        "applicationForm": {
+            "formId": "form-1",
+            "formVersion": 3,
+            "status": "draft",
+            "data": { "full_name": "Integration Applicant" }
+        }
+    }))
+    .expect("application payload");
+    let draft_context =
+        EngineContext::new("officer-1", now(), &services).with_payload(draft_payload);
+    let draft = apply_action(
+        &definition,
+        &required,
+        ActionKind::SaveApplication,
+        &draft_context,
+    )
+    .await;
+    assert!(draft.ok);
+    assert_eq!(
+        draft.case.attributes["applicationForm"]["revision"],
+        serde_json::json!(1)
+    );
+
+    let submitted_payload = serde_json::from_value(serde_json::json!({
+        "applicationForm": {
+            "formId": "form-1",
+            "formVersion": 3,
+            "status": "submitted",
+            "data": { "full_name": "Integration Applicant", "program": "B.Tech" }
+        }
+    }))
+    .expect("application payload");
+    let submitted_context =
+        EngineContext::new("officer-1", now(), &services).with_payload(submitted_payload);
+    let submitted = apply_action(
+        &definition,
+        &draft.case,
+        ActionKind::SaveApplication,
+        &submitted_context,
+    )
+    .await;
+    assert!(submitted.ok);
+    assert_eq!(
+        submitted.case.attributes["applicationFormHistory"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    let advanced = apply_action(&definition, &submitted.case, ActionKind::Advance, &context).await;
+    assert!(advanced.ok);
+    assert_eq!(advanced.case.stage, OnboardingStage::IdentityVerification);
+}
+
 #[test]
 fn intake_refuses_admissions_that_are_not_confirmed() {
     let mut pending = trigger();
@@ -181,6 +255,34 @@ fn intake_blocks_a_duplicate_applicant_but_allows_readmission_after_a_closed_cas
     assert!(
         reopened.create,
         "a withdrawn case must not block re-admission"
+    );
+}
+
+#[test]
+fn crm_application_stage_can_open_a_desk_case_before_admission_confirmation() {
+    let mut application = trigger();
+    application.admission_status = "APPLICATION".into();
+    application.crm_lead_id = Some(uuid::Uuid::new_v4());
+    application
+        .attributes
+        .insert("source".into(), serde_json::json!("Google Search"));
+
+    let decision = evaluate_intake(&application, &[], IntakeTriggerMode::OnConfirmed);
+    assert!(decision.create);
+
+    let case = create_case(
+        &application,
+        &default_workflow(TENANT),
+        CreateCaseOptions {
+            id: "ONB-CRM-APPLICATION".into(),
+            now: now(),
+            assigned_to: None,
+        },
+    );
+    assert_eq!(case.crm_lead_id, application.crm_lead_id);
+    assert_eq!(
+        case.attributes.get("source"),
+        Some(&serde_json::json!("Google Search"))
     );
 }
 

@@ -17,7 +17,7 @@ use supercampus_database::TenantDatabaseManager;
 
 use crate::{
     application::{ActorContext, ApplicationDeskService},
-    domain::{ActionKind, ActionPayload, AdmissionTrigger},
+    domain::{ActionKind, ActionPayload, AdmissionTrigger, OnboardingStage},
     infrastructure::postgres::DeskError,
 };
 
@@ -165,14 +165,53 @@ pub async fn act_on_case(
             .into_response()
     })?;
 
-    // Each action carries its own permission so verification, approval and
-    // activation can be held by different teams.
-    require(&actor, request.action.required_permission()).map_err(IntoResponse::into_response)?;
-
     let service = state
         .service(&tenant)
         .await
         .map_err(IntoResponse::into_response)?;
+    let payload = request.payload.unwrap_or_default();
+
+    // Permission follows the work being performed. In particular, a generic
+    // `verify` transport action cannot be used to assign a section or change
+    // academic mapping without the corresponding grant.
+    let permission = match request.action {
+        ActionKind::Advance => {
+            let snapshot = service
+                .snapshot(&tenant)
+                .await
+                .map_err(|error| DeskHttpError(error).into_response())?;
+            let onboarding = snapshot
+                .cases
+                .iter()
+                .find(|entry| entry.id == case_id)
+                .ok_or_else(|| {
+                    DeskHttpError(DeskError::NotFound(case_id.clone())).into_response()
+                })?;
+            match onboarding.stage {
+                OnboardingStage::Approval => "application-desk.approve",
+                OnboardingStage::StudentCreation
+                | OnboardingStage::AccountProvisioning
+                | OnboardingStage::AccessProvisioning
+                | OnboardingStage::Activation => "application-desk.activate",
+                _ => "application-desk.verify",
+            }
+        }
+        ActionKind::Verify if payload.section_id.is_some() || payload.assigned_to.is_some() => {
+            "application-desk.assign"
+        }
+        ActionKind::SaveApplication => "application-desk.edit",
+        ActionKind::Verify
+            if payload.program_id.is_some()
+                || payload.department_id.is_some()
+                || payload.batch_id.is_some()
+                || payload.academic_year.is_some() =>
+        {
+            "application-desk.edit"
+        }
+        _ => request.action.required_permission(),
+    };
+    require(&actor, permission).map_err(IntoResponse::into_response)?;
+
     let outcome = service
         .act(
             &tenant,
@@ -181,7 +220,7 @@ pub async fn act_on_case(
                 case_id,
                 action: request.action,
                 reason: request.reason,
-                payload: request.payload.unwrap_or_default(),
+                payload,
             },
         )
         .await

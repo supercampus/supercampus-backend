@@ -57,6 +57,8 @@ pub enum ActionKind {
     Advance,
     Verify,
     Approve,
+    #[serde(rename = "save_application")]
+    SaveApplication,
     Reject,
     Return,
     Hold,
@@ -72,6 +74,7 @@ impl ActionKind {
             Self::Advance => "advance",
             Self::Verify => "verify",
             Self::Approve => "approve",
+            Self::SaveApplication => "save_application",
             Self::Reject => "reject",
             Self::Return => "return",
             Self::Hold => "hold",
@@ -88,6 +91,7 @@ impl ActionKind {
     pub fn required_permission(self) -> &'static str {
         match self {
             Self::Advance => "application-desk.edit",
+            Self::SaveApplication => "application-desk.edit",
             Self::Verify => "application-desk.verify",
             Self::Approve => "application-desk.approve",
             Self::Reject => "application-desk.reject",

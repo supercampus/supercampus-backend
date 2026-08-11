@@ -155,16 +155,7 @@ async fn bootstrap(
         .configuration(&principal.student.tenant_id, "tenant-branding")
         .await?
         .map(|document| document.value)
-        .unwrap_or_else(|| {
-            json!({
-                "collegeName": principal.student.tenant.name,
-                "suiteName": "Admin Suite",
-                "logoDataUrl": null,
-                "primary": "#1A6B3C",
-                "secondary": "#F5A623",
-                "surface": "#EAF5EE"
-            })
-        });
+        .unwrap_or_else(|| default_tenant_brand(&principal));
     let modules = state
         .modules()
         .into_iter()
@@ -616,9 +607,34 @@ async fn get_configuration(
     require_effective_permission(&access, "platform.configuration.read")?;
     let document = state
         .configuration(&principal.student.tenant_id, &namespace)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Configuration not found: {namespace}")))?;
-    Ok(Json(ApiResponse::new(json!(document))))
+        .await?;
+    let response = match document {
+        Some(document) => json!(document),
+        None if namespace == "tenant-branding" => json!({
+            "tenantId": principal.student.tenant_id,
+            "namespace": namespace,
+            "version": 0,
+            "value": default_tenant_brand(&principal),
+            "updatedAt": Utc::now(),
+        }),
+        None => {
+            return Err(ApiError::NotFound(format!(
+                "Configuration not found: {namespace}"
+            )));
+        }
+    };
+    Ok(Json(ApiResponse::new(response)))
+}
+
+fn default_tenant_brand(principal: &AuthPrincipal) -> Value {
+    json!({
+        "collegeName": principal.student.tenant.name,
+        "suiteName": "Admin Suite",
+        "logoDataUrl": null,
+        "primary": "#1A6B3C",
+        "secondary": "#F5A623",
+        "surface": "#EAF5EE"
+    })
 }
 
 async fn put_configuration(
@@ -1056,12 +1072,13 @@ fn percent_decode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
-                out.push(byte as char);
-                index += 3;
-                continue;
-            }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16)
+        {
+            out.push(byte as char);
+            index += 3;
+            continue;
         }
         out.push(bytes[index] as char);
         index += 1;

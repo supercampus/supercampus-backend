@@ -708,10 +708,10 @@ impl AppState {
             let mut denied_permissions = Vec::new();
             for row in rows {
                 let role_key: Option<String> = row.try_get("role_key")?;
-                if let Some(role_key) = role_key {
-                    if !roles.contains(&role_key) {
-                        roles.push(role_key);
-                    }
+                if let Some(role_key) = role_key
+                    && !roles.contains(&role_key)
+                {
+                    roles.push(role_key);
                 }
                 let permission_key: Option<String> = row.try_get("permission_key")?;
                 let scope: Option<String> = row.try_get("scope")?;
@@ -2359,12 +2359,22 @@ struct NavigationSection {
     always_visible: bool,
 }
 
+type DefaultNavigationSection = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    Option<&'static str>,
+    bool,
+);
+
 /// Platform defaults, mirroring migration 0019.
 ///
 /// Used only when an institution has no navigation rows of its own, which happens for
 /// tenants provisioned after that migration ran.
 fn default_navigation_sections() -> Vec<NavigationSection> {
-    const DEFAULTS: &[(&str, &str, &str, &str, &[&str], Option<&str>, bool)] = &[
+    const DEFAULTS: &[DefaultNavigationSection] = &[
         (
             "dashboard",
             "workspace",
@@ -2657,15 +2667,6 @@ fn display_name_from_email(email: &str) -> String {
 fn environment_flag(name: &str) -> bool {
     std::env::var(name)
         .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-}
-
-fn required_environment(name: &str) -> anyhow::Result<String> {
-    let value = std::env::var(name)
-        .with_context(|| format!("{name} is required when SEED_TEST_USERS=true"))?;
-    if value.trim().is_empty() {
-        bail!("{name} cannot be empty");
-    }
-    Ok(value)
 }
 
 async fn seed_identity(

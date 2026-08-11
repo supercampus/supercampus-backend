@@ -33,26 +33,68 @@ impl Database {
         options: PgConnectOptions,
         max_connections: u32,
     ) -> anyhow::Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .min_connections(1)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect_with(options)
-            .await
-            .context("failed to connect to PostgreSQL")?;
-        Ok(Self { pool })
+        const ATTEMPTS: u32 = 3;
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+        let mut last_error = String::from("connection attempt timed out");
+
+        for attempt in 1..=ATTEMPTS {
+            let connect = PgPoolOptions::new()
+                .max_connections(max_connections)
+                .min_connections(1)
+                .acquire_timeout(Duration::from_secs(10))
+                .connect_with(options.clone());
+
+            match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+                Ok(Ok(pool)) => return Ok(Self { pool }),
+                Ok(Err(error)) => last_error = error.to_string(),
+                Err(_) => last_error = format!("attempt exceeded {CONNECT_TIMEOUT:?}"),
+            }
+
+            if attempt < ATTEMPTS {
+                tracing::warn!(
+                    attempt,
+                    attempts = ATTEMPTS,
+                    "PostgreSQL connection attempt failed; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+            }
+        }
+
+        bail!("failed to connect to PostgreSQL after {ATTEMPTS} attempts: {last_error}")
     }
 
     pub async fn migrate(&self) -> anyhow::Result<()> {
         if let Err(error) = MIGRATOR.run(&self.pool).await {
             let error_str = format!("{error:?}");
             if error_str.contains("VersionMismatch") {
-                tracing::warn!(error = %error, "sqlx migration version mismatch detected; truncating _sqlx_migrations and re-synchronizing");
-                let _ = sqlx::query("TRUNCATE TABLE _sqlx_migrations")
-                    .execute(&self.pool)
-                    .await;
-                if let Err(retry_err) = MIGRATOR.run(&self.pool).await {
-                    tracing::warn!(retry_error = %retry_err, "sqlx migration re-sync notice: continuing startup");
+                tracing::warn!(error = %error, "sqlx migration version mismatch detected; reconciling applied migration checksums");
+                for migration in MIGRATOR.iter() {
+                    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2")
+                        .bind(migration.checksum.as_ref())
+                        .bind(migration.version)
+                        .execute(&self.pool)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to reconcile checksum for migration {}",
+                                migration.version
+                            )
+                        })?;
+                }
+                // A VersionMismatch can leave SQLx's advisory lock attached to the
+                // pooled connection used by the failed pass. Reconciliation is
+                // already serialized by the first pass, so reacquiring that same
+                // lock here can deadlock against our own pool.
+                let reconciled_migrator = sqlx::migrate::Migrator {
+                    migrations: MIGRATOR.migrations.clone(),
+                    ignore_missing: MIGRATOR.ignore_missing,
+                    locking: false,
+                    no_tx: MIGRATOR.no_tx,
+                };
+                if let Err(retry_err) = reconciled_migrator.run(&self.pool).await {
+                    anyhow::bail!(
+                        "failed to run PostgreSQL migrations after checksum reconciliation: {retry_err:?}"
+                    );
                 }
             } else {
                 anyhow::bail!("failed to run PostgreSQL migrations: {error:?}");

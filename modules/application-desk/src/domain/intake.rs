@@ -44,6 +44,10 @@ pub struct AdmissionTrigger {
     /// Contact facts frozen onto the case so provisioning stays reproducible.
     #[serde(default)]
     pub applicant: ApplicantSnapshot,
+    /// Source-system facts copied at intake for operator context. The source
+    /// record remains authoritative; this is an immutable onboarding snapshot.
+    #[serde(default)]
+    pub attributes: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -92,7 +96,12 @@ pub fn evaluate_intake(
     existing: &[OnboardingCase],
     mode: IntakeTriggerMode,
 ) -> IntakeDecision {
-    if mode == IntakeTriggerMode::OnConfirmed && trigger.admission_status != "CONFIRMED" {
+    let crm_application =
+        trigger.crm_lead_id.is_some() && trigger.admission_status == "APPLICATION";
+    if mode == IntakeTriggerMode::OnConfirmed
+        && trigger.admission_status != "CONFIRMED"
+        && !crm_application
+    {
         return IntakeDecision {
             create: false,
             reason: format!("Admission is {}, not CONFIRMED", trigger.admission_status),
@@ -215,7 +224,7 @@ pub fn create_case(
         updated_at: options.now,
         completed_at: None,
         applied_effects: BTreeMap::new(),
-        attributes: serde_json::Map::new(),
+        attributes: trigger.attributes.clone(),
     }
 }
 

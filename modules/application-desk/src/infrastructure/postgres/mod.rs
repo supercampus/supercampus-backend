@@ -70,6 +70,7 @@ fn crm_projection<'a>(
         | OnboardingStatus::Cancelled
         | OnboardingStatus::Withdrawn
         | OnboardingStatus::Expired => ("offer_status", "rejected"),
+        _ if current_stage == "application" => (current_stage, current_substate),
         _ if new_relationship
             && current_stage == "offer_status"
             && matches!(current_substate, "accepted" | "rejected") =>
@@ -94,6 +95,10 @@ mod application_projection_tests {
 
     #[test]
     fn active_application_advances_only_an_earlier_crm_stage() {
+        assert_eq!(
+            crm_projection(OnboardingStatus::Active, "application", "to_do", true),
+            ("application", "to_do")
+        );
         assert_eq!(
             crm_projection(OnboardingStatus::Active, "qualified", "eligible", true),
             ("application_status", "awaiting_decision")
@@ -262,6 +267,37 @@ impl PostgresDeskRepository {
             number_format: serde_json::from_value(number_format).unwrap_or_default(),
             student_role,
         })
+    }
+
+    /// The newest tenant-published Admissions Application form. The definition
+    /// is read from the shared form catalog; responses remain owned by the desk.
+    pub async fn published_application_form(
+        transaction: &mut Transaction<'static, Postgres>,
+        tenant_id: Uuid,
+    ) -> Result<Option<Value>, DeskError> {
+        let row: Option<PgRow> = sqlx::query(
+            r#"SELECT id, name, form_type, status, version, schema, updated_at
+               FROM crm.forms
+               WHERE tenant_id = $1 AND status = 'published' AND deleted_at IS NULL
+                 AND replace(lower(form_type), '-', '_') = 'application'
+               ORDER BY updated_at DESC LIMIT 1"#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+
+        row.map(|row| {
+            Ok(json!({
+                "id": row.try_get::<Uuid, _>("id")?.to_string(),
+                "name": row.try_get::<String, _>("name")?,
+                "formType": row.try_get::<String, _>("form_type")?,
+                "status": row.try_get::<String, _>("status")?,
+                "version": row.try_get::<i32, _>("version")?,
+                "schema": row.try_get::<Value, _>("schema")?,
+                "updatedAt": row.try_get::<chrono::DateTime<Utc>, _>("updated_at")?,
+            }))
+        })
+        .transpose()
     }
 
     pub async fn list_cases(

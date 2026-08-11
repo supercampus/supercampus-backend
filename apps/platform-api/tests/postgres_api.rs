@@ -39,6 +39,13 @@ async fn postgres_state_survives_app_state_recreation() {
     .fetch_one(database.pool())
     .await
     .expect("create integration identity");
+    let tenant_admin_role_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM authz.roles WHERE tenant_id = $1 AND role_key = 'tenant_admin'",
+    )
+    .bind(tenant_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("tenant admin bootstrap role");
     sqlx::query(
         r#"INSERT INTO identity.tenant_memberships
            (tenant_id, user_id, roles, is_primary, profile)
@@ -46,10 +53,20 @@ async fn postgres_state_survives_app_state_recreation() {
     )
     .bind(tenant_id)
     .bind(user_id)
-    .bind(vec!["admissions_manager"])
+    .bind(vec!["tenant_admin"])
     .execute(database.pool())
     .await
     .expect("create integration membership");
+    sqlx::query(
+        r#"INSERT INTO authz.user_roles (tenant_id, user_id, role_id, assigned_by)
+           VALUES ($1, $2, $3, 'integration-test')"#,
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(tenant_admin_role_id)
+    .execute(database.pool())
+    .await
+    .expect("assign tenant admin role");
     let first_app = app(AppState::with_database(database.clone()));
     let login = first_app
         .clone()
@@ -349,7 +366,7 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, &admin_authorization)
                 .body(Body::from(format!(
-                    r#"{{"name":"CRM Reader","email":"{reader_email}","temporaryPassword":"{reader_password}","roleIds":["{role_id}"]}}"#,
+                    r#"{{"name":"CRM Reader","email":"{reader_email}","password":"{reader_password}","roleIds":["{role_id}"]}}"#,
                 )))
                 .unwrap(),
         )
@@ -374,7 +391,7 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, &admin_authorization)
                 .body(Body::from(format!(
-                    r#"{{"name":"CRM Reader","email":"{reader_email}","temporaryPassword":"{refreshed_password}","roleIds":["{role_id}"]}}"#,
+                    r#"{{"name":"CRM Reader","email":"{reader_email}","password":"{refreshed_password}","roleIds":["{role_id}"]}}"#,
                 )))
                 .unwrap(),
         )

@@ -93,6 +93,7 @@ fn trigger(suffix: &str) -> AdmissionTrigger {
             guardian_name: None,
             guardian_email: None,
         },
+        attributes: serde_json::Map::new(),
     }
 }
 

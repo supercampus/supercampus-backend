@@ -13,7 +13,7 @@ use crate::{
     domain::{
         ActionKind, ActionPayload, AdmissionTrigger, CreateCaseOptions, EngineContext,
         OnboardingCase, OnboardingEventName, OnboardingStatus, apply_action, create_case,
-        evaluate_intake, summarise_queues,
+        engine::ApplicationFormUpdate, evaluate_intake, summarise_queues,
     },
     infrastructure::postgres::{
         DeskError, DeskSettings, PostgresDeskRepository, PostgresOnboardingServices,
@@ -51,6 +51,7 @@ impl ActorContext {
 #[derive(Debug, Clone)]
 pub struct DeskSnapshot {
     pub definition: Value,
+    pub application_form: Option<Value>,
     pub cases: Vec<OnboardingCase>,
     pub audit: Vec<Value>,
     pub events: Vec<Value>,
@@ -61,6 +62,7 @@ impl DeskSnapshot {
     pub fn to_json(&self) -> Value {
         json!({
             "definition": self.definition,
+            "applicationForm": self.application_form,
             "cases": self.cases,
             "audit": self.audit,
             "events": self.events,
@@ -106,14 +108,31 @@ impl ApplicationDeskService {
         let definition =
             PostgresDeskRepository::active_workflow(&mut transaction, tenant_id, tenant_slug)
                 .await?;
-        let cases = PostgresDeskRepository::list_cases(&mut transaction, tenant_id).await?;
+        let application_form =
+            PostgresDeskRepository::published_application_form(&mut transaction, tenant_id).await?;
+        let mut cases = PostgresDeskRepository::list_cases(&mut transaction, tenant_id).await?;
+        if application_form.is_some() {
+            for onboarding in &mut cases {
+                if onboarding.stage == crate::domain::OnboardingStage::DataReview {
+                    onboarding
+                        .attributes
+                        .insert("applicationFormRequired".into(), json!(true));
+                }
+            }
+        }
         let audit =
             PostgresDeskRepository::recent_audit(&mut transaction, tenant_id, AUDIT_LIMIT).await?;
         let events =
             PostgresDeskRepository::recent_events(&mut transaction, tenant_id, EVENT_LIMIT).await?;
         transaction.commit().await?;
 
-        Ok(build_snapshot(&definition, cases, audit, events))
+        Ok(build_snapshot(
+            &definition,
+            application_form,
+            cases,
+            audit,
+            events,
+        ))
     }
 
     /// Open a case for a confirmed admission.
@@ -130,6 +149,18 @@ impl ApplicationDeskService {
             PostgresDeskRepository::active_workflow(&mut transaction, tenant_id, tenant_slug)
                 .await?;
         let settings = PostgresDeskRepository::settings(&mut transaction, tenant_id).await?;
+        let application_form =
+            PostgresDeskRepository::published_application_form(&mut transaction, tenant_id).await?;
+        if let Some(form) = application_form.as_ref() {
+            trigger
+                .attributes
+                .insert("applicationFormRequired".into(), json!(true));
+            if let Some(id) = form.get("id") {
+                trigger
+                    .attributes
+                    .insert("applicationFormId".into(), id.clone());
+            }
+        }
         let existing = PostgresDeskRepository::list_cases(&mut transaction, tenant_id).await?;
 
         let decision = evaluate_intake(&trigger, &existing, settings.intake_mode);
@@ -186,8 +217,20 @@ impl ApplicationDeskService {
         } = request;
         let case_id = case_id.as_str();
         let (tenant_id, mut transaction) = self.repository.begin_tenant(tenant_slug).await?;
-        let onboarding =
+        let mut onboarding =
             PostgresDeskRepository::lock_case(&mut transaction, tenant_id, case_id).await?;
+        let published_application =
+            PostgresDeskRepository::published_application_form(&mut transaction, tenant_id).await?;
+        if let Some(update) = payload.application_form.as_ref() {
+            validate_application_update(update, published_application.as_ref())?;
+        }
+        if published_application.is_some()
+            && onboarding.stage == crate::domain::OnboardingStage::DataReview
+        {
+            onboarding
+                .attributes
+                .insert("applicationFormRequired".into(), json!(true));
+        }
         // The case runs under the workflow version it was opened with.
         let definition = PostgresDeskRepository::pinned_workflow(
             &mut transaction,
@@ -237,8 +280,108 @@ impl ApplicationDeskService {
     }
 }
 
+fn validate_application_update(
+    update: &ApplicationFormUpdate,
+    published: Option<&Value>,
+) -> Result<(), DeskError> {
+    let form = published.ok_or_else(|| {
+        DeskError::Conflict("No published Admissions Application form is available".into())
+    })?;
+    let expected_id = form.get("id").and_then(Value::as_str).unwrap_or_default();
+    let expected_version = form
+        .get("version")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    if update.form_id != expected_id || i64::from(update.form_version) != expected_version {
+        return Err(DeskError::Conflict(
+            "The Application form changed; refresh the desk before saving".into(),
+        ));
+    }
+    if !matches!(update.status.as_str(), "draft" | "submitted") {
+        return Err(DeskError::Conflict(
+            "Application status must be draft or submitted".into(),
+        ));
+    }
+    if update.status != "submitted" {
+        return Ok(());
+    }
+
+    let sections = form
+        .get("schema")
+        .and_then(|schema| schema.get("sections"))
+        .and_then(Value::as_array)
+        .or_else(|| form.get("schema").and_then(Value::as_array));
+    let Some(sections) = sections else {
+        return Ok(());
+    };
+    let missing = sections
+        .iter()
+        .filter_map(|section| section.get("fields").and_then(Value::as_array))
+        .flatten()
+        .filter(|field| {
+            field
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|field| {
+            let label = field
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("Required field");
+            let key = field
+                .get("key")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| application_field_key(label));
+            let present = update.data.get(&key).is_some_and(application_value_present);
+            (!present).then(|| label.to_owned())
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(DeskError::Conflict(format!(
+            "Complete required application field(s): {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+fn application_field_key(label: &str) -> String {
+    label
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn application_value_present(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+        Value::Number(_) => true,
+    }
+}
+
 fn build_snapshot(
     definition: &crate::domain::WorkflowDefinition,
+    application_form: Option<Value>,
     cases: Vec<OnboardingCase>,
     audit: Vec<Value>,
     events: Vec<Value>,
@@ -246,9 +389,53 @@ fn build_snapshot(
     let queues = summarise_queues(&cases);
     DeskSnapshot {
         definition: serde_json::to_value(definition).unwrap_or(Value::Null),
+        application_form,
         queues: json!(queues),
         cases,
         audit,
         events,
+    }
+}
+
+#[cfg(test)]
+mod application_form_validation_tests {
+    use super::*;
+
+    fn published_form() -> Value {
+        json!({
+            "id": "form-1",
+            "version": 2,
+            "schema": { "sections": [{
+                "section": "Applicant",
+                "fields": [
+                    { "key": "full_name", "label": "Full name", "required": true },
+                    { "label": "Programme", "required": true }
+                ]
+            }]}
+        })
+    }
+
+    #[test]
+    fn submitted_application_requires_every_server_defined_field() {
+        let update = ApplicationFormUpdate {
+            form_id: "form-1".into(),
+            form_version: 2,
+            status: "submitted".into(),
+            data: json!({ "full_name": "Asha" }).as_object().cloned().unwrap(),
+        };
+        let error = validate_application_update(&update, Some(&published_form())).unwrap_err();
+        assert!(error.to_string().contains("Programme"));
+    }
+
+    #[test]
+    fn stale_application_form_versions_are_rejected() {
+        let update = ApplicationFormUpdate {
+            form_id: "form-1".into(),
+            form_version: 1,
+            status: "draft".into(),
+            data: serde_json::Map::new(),
+        };
+        let error = validate_application_update(&update, Some(&published_form())).unwrap_err();
+        assert!(error.to_string().contains("changed"));
     }
 }

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use axum::{
     Extension, Json, Router,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -18,8 +18,8 @@ use crate::{
         ApiResponse, AssignUserRolesRequest, BootstrapDocument, CreateAuthorizationRoleRequest,
         CreateRecordRequest, CreateTenantUserRequest, ForgotPasswordRequest, HealthDocument,
         LoginData, LoginRequest, NavigationItem, PutConfigurationRequest, ResetPasswordRequest,
-        SaveAppStateRequest, SessionData, SetRolePermissionsRequest,
-        UpdateAuthorizationRoleRequest, UpdateRecordRequest,
+        SaveAppStateRequest, SessionData, SetRolePermissionsRequest, SetUserAccessRequest,
+        UpdateAuthorizationRoleRequest, UpdateRecordRequest, ValidateWorkflowTransitionRequest,
     },
     state::{
         AppState, AuthPrincipal, CreatedAuthSession, EffectiveAccess, MINIMUM_PASSWORD_LENGTH,
@@ -60,8 +60,20 @@ pub fn router(state: AppState) -> Router {
             put(assign_tenant_user_roles),
         )
         .route(
+            "/authorization/users/{user_id}/access",
+            get(get_tenant_user_access).put(set_tenant_user_access),
+        )
+        .route(
             "/configuration/{namespace}",
             get(get_configuration).put(put_configuration),
+        )
+        .route(
+            "/workflows/{module_key}/{feature_key}",
+            get(get_workflow_definition),
+        )
+        .route(
+            "/workflows/{module_key}/{feature_key}/transitions/validate",
+            post(validate_workflow_transition),
         )
         .route("/navigation", get(get_navigation))
         .route("/dashboard/effective", get(get_effective_dashboard))
@@ -139,6 +151,20 @@ async fn bootstrap(
     Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
 ) -> ApiResult<Json<ApiResponse<BootstrapDocument>>> {
+    let tenant_brand = state
+        .configuration(&principal.student.tenant_id, "tenant-branding")
+        .await?
+        .map(|document| document.value)
+        .unwrap_or_else(|| {
+            json!({
+                "collegeName": principal.student.tenant.name,
+                "suiteName": "Admin Suite",
+                "logoDataUrl": null,
+                "primary": "#1A6B3C",
+                "secondary": "#F5A623",
+                "surface": "#EAF5EE"
+            })
+        });
     let modules = state
         .modules()
         .into_iter()
@@ -155,12 +181,22 @@ async fn bootstrap(
             })
         })
         .collect();
+    let mut workflows = Vec::new();
+    if access.allows("gatepass.outpass.read")
+        && let Some(workflow) = state
+            .workflow_definition(&principal.student.tenant_id, "gatepass", "outpass")
+            .await?
+    {
+        workflows.push(workflow);
+    }
     Ok(Json(ApiResponse::new(BootstrapDocument {
         tenant_id: principal.student.tenant_id,
         user_id: principal.student.id,
+        tenant_brand,
         roles: access.roles,
         permissions: access.permissions,
         permission_scopes: access.scopes,
+        workflows,
         services: state.services(),
         modules,
         navigation,
@@ -341,8 +377,7 @@ async fn create_tenant_user(
         || !request.email.contains('@')
         || request.role_ids.is_empty()
         || request
-            .password
-            .as_ref()
+            .credential_password()
             .is_none_or(|password| password.chars().count() < 12 || password.len() > 72)
     {
         return Err(ApiError::BadRequest(
@@ -385,6 +420,89 @@ async fn assign_tenant_user_roles(
             )
             .await?,
     )))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AccessSurfaceQuery {
+    surface: Option<String>,
+}
+
+async fn get_tenant_user_access(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<AccessSurfaceQuery>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "authorization.users.read")?;
+    let surface = query.surface.unwrap_or_else(|| "app".into());
+    validate_surface(&surface)?;
+    Ok(Json(ApiResponse::new(
+        state
+            .tenant_user_access(&principal.student.tenant_id, user_id, &surface)
+            .await?,
+    )))
+}
+
+async fn set_tenant_user_access(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(user_id): Path<Uuid>,
+    Json(request): Json<SetUserAccessRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "authorization.users.update")?;
+    validate_surface(&request.surface)?;
+    if request.grants.iter().any(|grant| {
+        !matches!(grant.scope.as_str(), "all" | "assigned" | "own")
+            || !matches!(grant.mode.as_str(), "allow" | "deny")
+            || grant.key.trim().is_empty()
+    }) {
+        return Err(ApiError::BadRequest(
+            "each grant needs a non-empty key, valid scope, and valid mode".into(),
+        ));
+    }
+    let keys = request
+        .grants
+        .iter()
+        .map(|grant| grant.key.trim().to_owned())
+        .collect::<HashSet<_>>();
+    if keys.len() != request.grants.len() {
+        return Err(ApiError::BadRequest(
+            "permission keys must be unique".into(),
+        ));
+    }
+    if !state
+        .authorization_permission_keys_exist(
+            &principal.student.tenant_id,
+            &keys.iter().cloned().collect::<Vec<_>>(),
+        )
+        .await?
+    {
+        return Err(ApiError::BadRequest(
+            "one or more permissions are inactive or do not belong to this tenant".into(),
+        ));
+    }
+    Ok(Json(ApiResponse::new(
+        state
+            .set_tenant_user_access(
+                &principal.student.tenant_id,
+                &principal.student.id,
+                user_id,
+                &request,
+            )
+            .await?,
+    )))
+}
+
+fn validate_surface(surface: &str) -> ApiResult<()> {
+    if matches!(surface, "app" | "website") {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "surface must be app or website".into(),
+        ))
+    }
 }
 
 fn require_effective_permission(access: &EffectiveAccess, permission: &str) -> ApiResult<()> {
@@ -491,13 +609,13 @@ async fn delete_record(
 
 async fn get_configuration(
     State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
     Path(namespace): Path<String>,
-    headers: HeaderMap,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require_effective_permission(&access, "platform.configuration.read")?;
     let document = state
-        .configuration(&tenant_id(&headers), &namespace)
+        .configuration(&principal.student.tenant_id, &namespace)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Configuration not found: {namespace}")))?;
     Ok(Json(ApiResponse::new(json!(document))))
@@ -505,9 +623,9 @@ async fn get_configuration(
 
 async fn put_configuration(
     State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
     Path(namespace): Path<String>,
-    headers: HeaderMap,
     Json(request): Json<PutConfigurationRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require_effective_permission(&access, "platform.configuration.update")?;
@@ -517,9 +635,68 @@ async fn put_configuration(
         ));
     }
     let document = state
-        .put_configuration(tenant_id(&headers), namespace, request.value)
+        .put_configuration(principal.student.tenant_id, namespace, request.value)
         .await?;
     Ok(Json(ApiResponse::new(json!(document))))
+}
+
+async fn get_workflow_definition(
+    State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path((module_key, feature_key)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    ensure_module(&state, &module_key)?;
+    require_effective_permission(&access, &format!("{module_key}.{feature_key}.read"))?;
+    let definition = state
+        .workflow_definition(&tenant_id(&headers), &module_key, &feature_key)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Workflow not found: {module_key}.{feature_key}"))
+        })?;
+    Ok(Json(ApiResponse::new(json!(definition))))
+}
+
+async fn validate_workflow_transition(
+    State(state): State<AppState>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path((module_key, feature_key)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<ValidateWorkflowTransitionRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    ensure_module(&state, &module_key)?;
+    let definition = state
+        .workflow_definition(&tenant_id(&headers), &module_key, &feature_key)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Workflow not found: {module_key}.{feature_key}"))
+        })?;
+    let transition = definition
+        .transitions
+        .iter()
+        .find(|transition| {
+            transition.from == request.current_state && transition.action == request.action
+        })
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "Transition {} from {} is not valid for {}.{} v{}",
+                request.action,
+                request.current_state,
+                definition.module,
+                definition.feature,
+                definition.version
+            ))
+        })?;
+    require_effective_permission(&access, &transition.required_permission)?;
+    Ok(Json(ApiResponse::new(json!({
+        "allowed": true,
+        "from": transition.from,
+        "to": transition.to,
+        "action": transition.action,
+        "requiredPermission": transition.required_permission,
+        "requiredRole": transition.required_role,
+        "workflowVersion": definition.version,
+    }))))
 }
 
 async fn login(
@@ -789,8 +966,14 @@ pub async fn authorize_request(
     {
         return Err(ApiError::Forbidden);
     }
+    let surface = request
+        .headers()
+        .get("x-client-surface")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| matches!(*value, "app" | "website"))
+        .unwrap_or("app");
     let access = state
-        .effective_access(&principal.student.tenant_id, &principal.student.id)
+        .effective_access_for_surface(&principal.student.tenant_id, &principal.student.id, surface)
         .await?;
     principal.roles = access.roles.clone();
     principal.student.role = access.roles.first().cloned().unwrap_or_default();

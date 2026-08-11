@@ -20,7 +20,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS crm_leads_tenant_id_id_uidx
     ON crm.leads (tenant_id, id);
 
 ALTER TABLE crm.lead_application_links
-    DROP CONSTRAINT IF EXISTS lead_application_links_lead_id_fkey;
+    DROP CONSTRAINT IF EXISTS lead_application_links_lead_id_fkey,
+    DROP CONSTRAINT IF EXISTS lead_application_links_tenant_lead_fk,
+    DROP CONSTRAINT IF EXISTS lead_application_links_tenant_case_fk;
 
 ALTER TABLE crm.lead_application_links
     ADD CONSTRAINT lead_application_links_tenant_lead_fk

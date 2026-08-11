@@ -15,7 +15,7 @@ use supercampus_database::{Database, TenantDatabaseManager};
 use tower_http::trace::TraceLayer;
 
 use axum::http::{HeaderName, HeaderValue, Method, header};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub fn app(state: AppState) -> axum::Router {
     let tenant_databases = state.tenant_databases();
@@ -46,27 +46,44 @@ fn cors_layer() -> CorsLayer {
         .filter_map(|s| HeaderValue::from_str(s).ok())
         .collect();
 
-    if origins.is_empty() {
-        CorsLayer::permissive()
-    } else {
-        CorsLayer::new()
-            .allow_origin(origins)
-            .allow_methods([
-                Method::GET,
-                Method::POST,
-                Method::PUT,
-                Method::PATCH,
-                Method::DELETE,
-                Method::OPTIONS,
-            ])
-            .allow_headers([
-                header::CONTENT_TYPE,
-                header::AUTHORIZATION,
-                header::ACCEPT,
-                HeaderName::from_static("x-tenant-id"),
-            ])
-            .allow_credentials(true)
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            move |origin: &HeaderValue, _request_head| {
+                origin
+                    .to_str()
+                    .is_ok_and(|value| is_allowed_cors_origin(value, &origins))
+            },
+        ))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::ACCEPT,
+            header::CACHE_CONTROL,
+            HeaderName::from_static("pragma"),
+            HeaderName::from_static("x-tenant-id"),
+            HeaderName::from_static("x-client-surface"),
+        ])
+        .allow_credentials(true)
+}
+
+fn is_allowed_cors_origin(origin: &str, configured: &[HeaderValue]) -> bool {
+    if configured
+        .iter()
+        .any(|allowed| allowed.to_str().is_ok_and(|value| value == origin))
+    {
+        return true;
     }
+    origin.starts_with("http://localhost:")
+        || origin.starts_with("http://127.0.0.1:")
+        || origin.starts_with("http://10.0.2.2:")
 }
 
 pub async fn run() -> anyhow::Result<()> {

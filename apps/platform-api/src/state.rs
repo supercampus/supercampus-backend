@@ -13,7 +13,9 @@ use uuid::Uuid;
 use crate::models::{
     AssignUserRolesRequest, AuthStudent, ConfigurationDocument, CreateAuthorizationRoleRequest,
     CreateTenantUserRequest, DynamicRecord, ModuleDescriptor, PermissionGrantRequest,
-    ServiceDescriptor, StoredAppState, TenantSummary, UpdateAuthorizationRoleRequest,
+    ServiceDescriptor, SetUserAccessRequest, StoredAppState, TenantSummary,
+    UpdateAuthorizationRoleRequest, WorkflowDefinition, WorkflowState, WorkflowStateStatus,
+    WorkflowTransition,
 };
 
 /// Reset links stay valid for one hour.
@@ -548,6 +550,24 @@ impl AppState {
         Ok(document)
     }
 
+    pub async fn workflow_definition(
+        &self,
+        tenant_id: &str,
+        module: &str,
+        feature: &str,
+    ) -> anyhow::Result<Option<WorkflowDefinition>> {
+        let namespace = workflow_namespace(module, feature);
+        if let Some(document) = self.configuration(tenant_id, &namespace).await? {
+            let mut definition: WorkflowDefinition = serde_json::from_value(document.value)
+                .with_context(|| {
+                    format!("invalid workflow configuration for {tenant_id}:{namespace}")
+                })?;
+            definition.tenant_id = tenant_id.to_owned();
+            return Ok(Some(definition));
+        }
+        Ok(seed_workflow_definition(tenant_id, module, feature))
+    }
+
     pub async fn authenticate_credentials(
         &self,
         email: &str,
@@ -631,24 +651,53 @@ impl AppState {
         tenant_slug: &str,
         user_id: &str,
     ) -> anyhow::Result<EffectiveAccess> {
+        self.effective_access_for_surface(tenant_slug, user_id, "app")
+            .await
+    }
+
+    pub async fn effective_access_for_surface(
+        &self,
+        tenant_slug: &str,
+        user_id: &str,
+        surface: &str,
+    ) -> anyhow::Result<EffectiveAccess> {
         if let Some(database) = &self.database {
             let rows = sqlx::query(
-                r#"SELECT role.role_key, role_grant.permission_key, role_grant.scope
+                r#"SELECT role.role_key, role_grant.permission_key, role_grant.scope,
+                          'allow'::text AS mode
                    FROM platform.tenants tenant
-                   JOIN authz.user_roles user_role ON user_role.tenant_id = tenant.id
-                   JOIN authz.roles role ON role.id = user_role.role_id
-                       AND role.tenant_id = tenant.id AND role.active
+                   JOIN identity.tenant_memberships membership
+                       ON membership.tenant_id = tenant.id
+                       AND membership.user_id = $2::uuid
+                       AND membership.active
+                   JOIN authz.roles role ON role.tenant_id = tenant.id
+                       AND role.role_key = ANY(membership.roles)
+                       AND role.active
                    LEFT JOIN authz.role_permissions role_grant ON role_grant.tenant_id = tenant.id
                        AND role_grant.role_id = role.id
                    LEFT JOIN authz.permission_definitions permission
                        ON permission.tenant_id = tenant.id
                        AND permission.permission_key = role_grant.permission_key
                        AND permission.active
-                   WHERE tenant.slug = $1 AND user_role.user_id = $2::uuid
-                   ORDER BY role.name, role_grant.permission_key"#,
+                   WHERE tenant.slug = $1
+                   UNION ALL
+                   SELECT NULL::text AS role_key, assignment.permission AS permission_key,
+                          assignment.scope, assignment.mode
+                   FROM platform.tenants tenant
+                   JOIN authz.assignments assignment ON assignment.tenant_id = tenant.id
+                       AND assignment.principal_id = $2::uuid
+                       AND assignment.surface = $3
+                       AND assignment.active
+                   JOIN authz.permission_definitions permission
+                       ON permission.tenant_id = tenant.id
+                       AND permission.permission_key = assignment.permission
+                       AND permission.active
+                   WHERE tenant.slug = $1
+                   ORDER BY 1 NULLS LAST, 2"#,
             )
             .bind(tenant_slug)
             .bind(user_id)
+            .bind(surface)
             .fetch_all(database.pool())
             .await
             .context("failed to load effective tenant access")?;
@@ -656,14 +705,24 @@ impl AppState {
             let mut roles = Vec::new();
             let mut permissions = Vec::new();
             let mut scopes: HashMap<String, String> = HashMap::new();
+            let mut denied_permissions = Vec::new();
             for row in rows {
-                let role_key: String = row.try_get("role_key")?;
-                if !roles.contains(&role_key) {
-                    roles.push(role_key);
+                let role_key: Option<String> = row.try_get("role_key")?;
+                if let Some(role_key) = role_key {
+                    if !roles.contains(&role_key) {
+                        roles.push(role_key);
+                    }
                 }
                 let permission_key: Option<String> = row.try_get("permission_key")?;
                 let scope: Option<String> = row.try_get("scope")?;
+                let mode: String = row.try_get("mode")?;
                 if let Some(permission_key) = permission_key {
+                    if mode == "deny" {
+                        if !denied_permissions.contains(&permission_key) {
+                            denied_permissions.push(permission_key.clone());
+                        }
+                        continue;
+                    }
                     if !permissions.contains(&permission_key) {
                         permissions.push(permission_key.clone());
                     }
@@ -674,6 +733,12 @@ impl AppState {
                     if should_replace {
                         scopes.insert(permission_key, next_scope);
                     }
+                }
+            }
+            if !denied_permissions.is_empty() {
+                permissions.retain(|permission| !denied_permissions.contains(permission));
+                for permission in denied_permissions {
+                    scopes.remove(&permission);
                 }
             }
 
@@ -715,6 +780,105 @@ impl AppState {
                 scopes: HashMap::from([("*".into(), "all".into())]),
             },
         ))
+    }
+
+    pub async fn tenant_user_access(
+        &self,
+        tenant_slug: &str,
+        user_id: Uuid,
+        surface: &str,
+    ) -> anyhow::Result<Value> {
+        let database = self.database.as_ref().context("PostgreSQL is required")?;
+        let rows = sqlx::query(
+            r#"SELECT assignment.permission AS key, assignment.scope,
+                      assignment.mode, assignment.constraints, permission.module_key AS "moduleKey",
+                      permission.feature_key AS "featureKey",
+                      permission.crud_actions AS "crudActions"
+               FROM authz.assignments assignment
+               JOIN platform.tenants tenant ON tenant.id = assignment.tenant_id
+               JOIN authz.permission_definitions permission
+                 ON permission.tenant_id = assignment.tenant_id
+                AND permission.permission_key = assignment.permission
+                AND permission.active
+               WHERE tenant.slug = $1 AND assignment.principal_id = $2
+                 AND assignment.surface = $3 AND assignment.active
+               ORDER BY permission.module_key, permission.feature_key, assignment.permission"#,
+        )
+        .bind(tenant_slug)
+        .bind(user_id)
+        .bind(surface)
+        .fetch_all(database.pool())
+        .await
+        .context("failed to list direct user access")?;
+        let grants = rows
+            .iter()
+            .map(|row| {
+                Ok(json!({
+                    "key": row.try_get::<String, _>("key")?,
+                    "scope": row.try_get::<String, _>("scope")?,
+                    "mode": row.try_get::<String, _>("mode")?,
+                    "constraints": row.try_get::<Value, _>("constraints")?,
+                    "moduleKey": row.try_get::<String, _>("moduleKey")?,
+                    "featureKey": row.try_get::<String, _>("featureKey")?,
+                    "crudActions": row.try_get::<Vec<String>, _>("crudActions")?,
+                }))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(json!({ "surface": surface, "userId": user_id, "grants": grants }))
+    }
+
+    pub async fn set_tenant_user_access(
+        &self,
+        tenant_slug: &str,
+        actor_id: &str,
+        user_id: Uuid,
+        request: &SetUserAccessRequest,
+    ) -> anyhow::Result<Value> {
+        let database = self.database.as_ref().context("PostgreSQL is required")?;
+        let tenant_id = ensure_tenant(database, tenant_slug).await?;
+        let actor_id = Uuid::parse_str(actor_id).context("invalid actor id")?;
+        let mut transaction = database.pool().begin().await?;
+        let member_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM identity.tenant_memberships WHERE tenant_id = $1 AND user_id = $2 AND active)",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !member_exists {
+            bail!("user does not belong to this tenant");
+        }
+        sqlx::query(
+            "DELETE FROM authz.assignments WHERE tenant_id = $1 AND principal_id = $2 AND surface = $3",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(&request.surface)
+        .execute(&mut *transaction)
+        .await?;
+        for grant in &request.grants {
+            sqlx::query(
+                r#"INSERT INTO authz.assignments
+                   (tenant_id, principal_id, permission, constraints, surface, scope, mode, granted_by, active)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)"#,
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(grant.key.trim())
+            .bind(&grant.constraints)
+            .bind(&request.surface)
+            .bind(&grant.scope)
+            .bind(&grant.mode)
+            .bind(actor_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(json!({
+            "userId": user_id,
+            "surface": request.surface,
+            "grantCount": request.grants.len(),
+        }))
     }
 
     pub async fn authorization_permissions(&self, tenant_slug: &str) -> anyhow::Result<Value> {
@@ -1029,8 +1193,7 @@ impl AppState {
         let tenant_id = ensure_tenant(database, tenant_slug).await?;
         let email = request.email.trim().to_ascii_lowercase();
         let password = request
-            .password
-            .as_deref()
+            .credential_password()
             .context("an explicit password is required")?;
         let mut transaction = database.pool().begin().await?;
 
@@ -1052,6 +1215,21 @@ impl AppState {
                 .await?;
         let created = existing_user.is_none();
         let user_id = if let Some(user_id) = existing_user {
+            sqlx::query(
+                r#"UPDATE identity.users
+                   SET password_hash = crypt($2, gen_salt('bf', 12)),
+                       display_name = $3,
+                       initials = $4,
+                       active = true,
+                       updated_at = now()
+                   WHERE id = $1"#,
+            )
+            .bind(user_id)
+            .bind(password)
+            .bind(request.name.trim())
+            .bind(initials(request.name.trim()))
+            .execute(&mut *transaction)
+            .await?;
             user_id
         } else {
             sqlx::query_scalar(
@@ -1068,21 +1246,20 @@ impl AppState {
             .await?
         };
 
-        let membership = sqlx::query(
+        sqlx::query(
             r#"INSERT INTO identity.tenant_memberships
                (tenant_id, user_id, roles, is_primary, profile)
                VALUES ($1, $2, $3, true, '{}'::jsonb)
-               ON CONFLICT (tenant_id, user_id) DO NOTHING"#,
+               ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+                   roles = EXCLUDED.roles,
+                   active = true,
+                   updated_at = now()"#,
         )
         .bind(tenant_id)
         .bind(user_id)
         .bind(&role_keys)
         .execute(&mut *transaction)
         .await?;
-        if membership.rows_affected() == 0 {
-            transaction.rollback().await?;
-            return Ok(None);
-        }
         replace_user_roles(
             &mut transaction,
             tenant_id,
@@ -1949,6 +2126,226 @@ fn record_key(tenant_id: &str, module_key: &str, id: Uuid) -> String {
 
 fn configuration_key(tenant_id: &str, namespace: &str) -> String {
     format!("{tenant_id}:{namespace}")
+}
+
+fn workflow_namespace(module: &str, feature: &str) -> String {
+    format!("workflows.{module}.{feature}")
+}
+
+fn seed_workflow_definition(
+    tenant_id: &str,
+    module: &str,
+    feature: &str,
+) -> Option<WorkflowDefinition> {
+    if module != "gatepass" || feature != "outpass" {
+        return None;
+    }
+    match tenant_id {
+        "tenant-a" | "college-1" => Some(college_one_gatepass_workflow(tenant_id)),
+        "tenant-b" | "college-2" | "tenant-local" => Some(college_two_gatepass_workflow(tenant_id)),
+        _ => None,
+    }
+}
+
+fn college_one_gatepass_workflow(tenant_id: &str) -> WorkflowDefinition {
+    WorkflowDefinition {
+        tenant_id: tenant_id.to_owned(),
+        module: "gatepass".into(),
+        feature: "outpass".into(),
+        version: 1,
+        initial_state: "draft".into(),
+        terminal_states: vec!["rejected".into(), "completed".into()],
+        states: vec![
+            workflow_state("draft", "Draft", WorkflowStateStatus::Draft),
+            workflow_state(
+                "submitted",
+                "Student submitted",
+                WorkflowStateStatus::Pending,
+            ),
+            workflow_state(
+                "parent_approved",
+                "Parent approved",
+                WorkflowStateStatus::Approved,
+            ),
+            workflow_state(
+                "warden_approved",
+                "Warden approved",
+                WorkflowStateStatus::Approved,
+            ),
+            workflow_state(
+                "security_verified",
+                "Security verified",
+                WorkflowStateStatus::Completed,
+            ),
+            workflow_state("rejected", "Rejected", WorkflowStateStatus::Rejected),
+            workflow_state(
+                "completed",
+                "Exit completed",
+                WorkflowStateStatus::Completed,
+            ),
+        ],
+        transitions: vec![
+            workflow_transition(
+                "draft",
+                "submitted",
+                "submit",
+                "gatepass.outpass.create",
+                None,
+                "Submit request",
+            ),
+            workflow_transition(
+                "submitted",
+                "parent_approved",
+                "approve",
+                "gatepass.outpass.approve",
+                Some("parent"),
+                "Parent approve",
+            ),
+            workflow_transition(
+                "parent_approved",
+                "warden_approved",
+                "approve",
+                "gatepass.outpass.approve",
+                Some("warden"),
+                "Warden approve",
+            ),
+            workflow_transition(
+                "warden_approved",
+                "security_verified",
+                "verify",
+                "gatepass.outpass.verify",
+                Some("security"),
+                "Security verify",
+            ),
+            workflow_transition(
+                "security_verified",
+                "completed",
+                "complete",
+                "gatepass.outpass.update",
+                Some("security"),
+                "Complete exit",
+            ),
+            workflow_transition(
+                "submitted",
+                "rejected",
+                "reject",
+                "gatepass.outpass.reject",
+                None,
+                "Reject",
+            ),
+            workflow_transition(
+                "parent_approved",
+                "rejected",
+                "reject",
+                "gatepass.outpass.reject",
+                None,
+                "Reject",
+            ),
+        ],
+    }
+}
+
+fn college_two_gatepass_workflow(tenant_id: &str) -> WorkflowDefinition {
+    WorkflowDefinition {
+        tenant_id: tenant_id.to_owned(),
+        module: "gatepass".into(),
+        feature: "outpass".into(),
+        version: 1,
+        initial_state: "draft".into(),
+        terminal_states: vec!["rejected".into(), "completed".into()],
+        states: vec![
+            workflow_state("draft", "Draft", WorkflowStateStatus::Draft),
+            workflow_state(
+                "submitted",
+                "Student submitted",
+                WorkflowStateStatus::Pending,
+            ),
+            workflow_state(
+                "warden_approved",
+                "Warden approved",
+                WorkflowStateStatus::Approved,
+            ),
+            workflow_state(
+                "security_verified",
+                "Security verified",
+                WorkflowStateStatus::Completed,
+            ),
+            workflow_state("rejected", "Rejected", WorkflowStateStatus::Rejected),
+            workflow_state(
+                "completed",
+                "Exit completed",
+                WorkflowStateStatus::Completed,
+            ),
+        ],
+        transitions: vec![
+            workflow_transition(
+                "draft",
+                "submitted",
+                "submit",
+                "gatepass.outpass.create",
+                None,
+                "Submit request",
+            ),
+            workflow_transition(
+                "submitted",
+                "warden_approved",
+                "approve",
+                "gatepass.outpass.approve",
+                Some("warden"),
+                "Warden approve",
+            ),
+            workflow_transition(
+                "warden_approved",
+                "security_verified",
+                "verify",
+                "gatepass.outpass.verify",
+                Some("security"),
+                "Security verify",
+            ),
+            workflow_transition(
+                "security_verified",
+                "completed",
+                "complete",
+                "gatepass.outpass.update",
+                Some("security"),
+                "Complete exit",
+            ),
+            workflow_transition(
+                "submitted",
+                "rejected",
+                "reject",
+                "gatepass.outpass.reject",
+                None,
+                "Reject",
+            ),
+        ],
+    }
+}
+
+fn workflow_state(id: &str, label: &str, status: WorkflowStateStatus) -> WorkflowState {
+    WorkflowState {
+        id: id.into(),
+        label: label.into(),
+        status,
+    }
+}
+
+fn workflow_transition(
+    from: &str,
+    to: &str,
+    action: &str,
+    required_permission: &str,
+    required_role: Option<&str>,
+    label: &str,
+) -> WorkflowTransition {
+    WorkflowTransition {
+        from: from.into(),
+        to: to.into(),
+        action: action.into(),
+        required_permission: required_permission.into(),
+        required_role: required_role.map(str::to_owned),
+        label: label.into(),
+    }
 }
 
 struct NavigationSection {

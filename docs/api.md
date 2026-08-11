@@ -54,6 +54,8 @@ for request bodies, database tables, enforcement, and dynamic forms.
 | --- | --- | --- |
 | GET | `/api/v1/configuration/{namespace}` | Active tenant configuration |
 | PUT | `/api/v1/configuration/{namespace}` | Create the next configuration version |
+| GET | `/api/v1/workflows/{moduleKey}/{featureKey}` | Effective tenant workflow definition |
+| POST | `/api/v1/workflows/{moduleKey}/{featureKey}/transitions/validate` | Validate a workflow action and return the next state |
 | GET | `/api/v1/{moduleKey}/records` | Tenant-filtered module records |
 | POST | `/api/v1/{moduleKey}/records` | Create a module record |
 | GET | `/api/v1/{moduleKey}/records/{recordId}` | Read a module record |

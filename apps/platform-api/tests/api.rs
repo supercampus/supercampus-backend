@@ -238,6 +238,116 @@ async fn module_records_are_tenant_scoped_and_mutable() {
 }
 
 #[tokio::test]
+async fn gatepass_workflow_is_tenant_configurable() {
+    let app = test_app();
+    let tenant_a_session = login_session(&app, "tenant-a").await;
+    let tenant_b_session = login_session(&app, "tenant-b").await;
+
+    let college_one = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/workflows/gatepass/outpass")
+                .header(header::AUTHORIZATION, tenant_a_session.bearer())
+                .header("x-tenant-id", "tenant-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(college_one.status(), StatusCode::OK);
+    let college_one_body: Value =
+        serde_json::from_slice(&to_bytes(college_one.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let college_one_states = college_one_body["data"]["states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|state| state["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(college_one_states.contains(&"parent_approved"));
+
+    let college_two = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/workflows/gatepass/outpass")
+                .header(header::AUTHORIZATION, tenant_b_session.bearer())
+                .header("x-tenant-id", "tenant-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(college_two.status(), StatusCode::OK);
+    let college_two_body: Value =
+        serde_json::from_slice(&to_bytes(college_two.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let college_two_states = college_two_body["data"]["states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|state| state["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!college_two_states.contains(&"parent_approved"));
+
+    let college_one_next = validate_gatepass_transition(&app, &tenant_a_session, "tenant-a").await;
+    let college_two_next = validate_gatepass_transition(&app, &tenant_b_session, "tenant-b").await;
+    assert_eq!(college_one_next["data"]["to"], "parent_approved");
+    assert_eq!(college_two_next["data"]["to"], "warden_approved");
+
+    let bootstrap = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/bootstrap")
+                .header(header::AUTHORIZATION, tenant_a_session.bearer())
+                .header("x-tenant-id", "tenant-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bootstrap.status(), StatusCode::OK);
+    let bootstrap_body: Value =
+        serde_json::from_slice(&to_bytes(bootstrap.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(bootstrap_body["data"]["workflows"][0]["module"], "gatepass");
+    assert_eq!(bootstrap_body["data"]["workflows"][0]["feature"], "outpass");
+
+    let invalid_college_two_state = app
+        .oneshot(
+            Request::post("/api/v1/workflows/gatepass/outpass/transitions/validate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, tenant_b_session.bearer())
+                .header("x-tenant-id", "tenant-b")
+                .body(Body::from(
+                    r#"{"currentState":"parent_approved","action":"approve"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_college_two_state.status(), StatusCode::BAD_REQUEST);
+}
+
+async fn validate_gatepass_transition(app: &Router, session: &TestSession, tenant: &str) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/workflows/gatepass/outpass/transitions/validate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, session.bearer())
+                .header("x-tenant-id", tenant)
+                .body(Body::from(
+                    r#"{"currentState":"submitted","action":"approve"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
+#[tokio::test]
 async fn local_login_cookie_unlocks_frontend_state_endpoint() {
     let app = test_app();
     let session = login_session(&app, "tenant-local").await;

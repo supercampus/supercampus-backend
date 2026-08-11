@@ -47,6 +47,8 @@ have the listed permission; `tenant_admin` satisfies every check through
 | GET | `/api/v1/authorization/users` | `authorization.users.read` | Tenant users and roles |
 | POST | `/api/v1/authorization/users` | `authorization.users.create` | Create or join a user; returns `409` if already in the tenant |
 | PUT | `/api/v1/authorization/users/{userId}/roles` | `authorization.users.update` | Replace user roles |
+| GET | `/api/v1/authorization/users/{userId}/access?surface=app|website` | `authorization.users.read` | Read direct user grants |
+| PUT | `/api/v1/authorization/users/{userId}/access` | `authorization.users.update` | Replace direct App/Website grants |
 
 User email is globally normalized and unique. The same identity may join
 different tenants, but a second create request for an existing membership is
@@ -78,6 +80,26 @@ Replace its permissions:
 
 The replacement is transactional. Omitting a previous grant revokes it.
 Protected roles cannot be modified or deleted.
+
+Direct user access is an explicit exception layer for cases where an admin
+must grant a module feature to one person without creating a role. The request
+uses the same permission keys as role grants and is separated by client
+surface:
+
+```json
+{
+  "surface": "app",
+  "grants": [
+    { "key": "library.visit_pass.create", "scope": "own", "constraints": {} },
+    { "key": "library.visit_pass.read", "scope": "own", "constraints": {} }
+  ]
+}
+```
+
+Protected requests identify the surface with `x-client-surface: app` or
+`x-client-surface: website`. The API unions the selected surface's direct
+grants with the user's role grants on every request, so an access change is
+effective without a new token or app deployment.
 
 ### Dynamic CRUD matrix
 

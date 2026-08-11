@@ -278,12 +278,32 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
         .iter()
         .find(|permission| permission["key"] == "crm.dashboard.read")
         .unwrap();
+    let vendor_management_read = permissions
+        .iter()
+        .find(|permission| permission["key"] == "vendor_management.vendors.read")
+        .unwrap();
+    let exam_ai_insights_read = permissions
+        .iter()
+        .find(|permission| permission["key"] == "examination.ai_insights.read")
+        .unwrap();
+    let timetable_publication_publish = permissions
+        .iter()
+        .find(|permission| permission["key"] == "timetable.publication.publish")
+        .unwrap();
     assert_eq!(campaigns_create["crudActions"], json!(["create"]));
     assert_eq!(campaigns_update["crudActions"], json!(["update"]));
     assert_eq!(forms_create["crudActions"], json!(["create"]));
     assert_eq!(forms_update["crudActions"], json!(["update"]));
     assert_eq!(forms_delete["crudActions"], json!(["delete"]));
     assert_eq!(dashboard_read["crudActions"], json!(["read"]));
+    assert_eq!(vendor_management_read["moduleKey"], "vendor_management");
+    assert_eq!(vendor_management_read["featureKey"], "vendors");
+    assert_eq!(vendor_management_read["crudActions"], json!(["read"]));
+    assert_eq!(exam_ai_insights_read["featureKey"], "ai_insights");
+    assert_eq!(
+        timetable_publication_publish["crudActions"],
+        json!(["update"])
+    );
 
     let role_created = application
         .clone()
@@ -329,7 +349,7 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, &admin_authorization)
                 .body(Body::from(format!(
-                    r#"{{"name":"CRM Reader","email":"{reader_email}","password":"{reader_password}","roleIds":["{role_id}"]}}"#,
+                    r#"{{"name":"CRM Reader","email":"{reader_email}","temporaryPassword":"{reader_password}","roleIds":["{role_id}"]}}"#,
                 )))
                 .unwrap(),
         )
@@ -346,13 +366,36 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
     assert!(user_created_body["data"].get("password").is_none());
     assert!(user_created_body["data"].get("temporaryPassword").is_none());
 
+    let refreshed_password = format!("{reader_password}-updated");
+    let user_refreshed = application
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/authorization/users")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, &admin_authorization)
+                .body(Body::from(format!(
+                    r#"{{"name":"CRM Reader","email":"{reader_email}","temporaryPassword":"{refreshed_password}","roleIds":["{role_id}"]}}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_refreshed.status(), StatusCode::CREATED);
+    let user_refreshed_body: Value = serde_json::from_slice(
+        &to_bytes(user_refreshed.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(user_refreshed_body["data"]["created"], false);
+
     let reader_login = application
         .clone()
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"email":"{reader_email}","password":"{reader_password}"}}"#,
+                    r#"{{"email":"{reader_email}","password":"{refreshed_password}"}}"#,
                 )))
                 .unwrap(),
         )

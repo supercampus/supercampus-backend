@@ -51,9 +51,11 @@ pub struct NavigationItem {
 pub struct BootstrapDocument {
     pub tenant_id: String,
     pub user_id: String,
+    pub tenant_brand: Value,
     pub roles: Vec<String>,
     pub permissions: Vec<String>,
     pub permission_scopes: HashMap<String, String>,
+    pub workflows: Vec<WorkflowDefinition>,
     pub services: Vec<ServiceDescriptor>,
     pub modules: Vec<ModuleDescriptor>,
     pub navigation: Vec<NavigationItem>,
@@ -97,6 +99,55 @@ pub struct ConfigurationDocument {
 #[derive(Debug, Deserialize)]
 pub struct PutConfigurationRequest {
     pub value: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowDefinition {
+    pub tenant_id: String,
+    pub module: String,
+    pub feature: String,
+    pub version: u64,
+    pub initial_state: String,
+    pub terminal_states: Vec<String>,
+    pub states: Vec<WorkflowState>,
+    pub transitions: Vec<WorkflowTransition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowState {
+    pub id: String,
+    pub label: String,
+    pub status: WorkflowStateStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkflowStateStatus {
+    Draft,
+    Pending,
+    Approved,
+    Rejected,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowTransition {
+    pub from: String,
+    pub to: String,
+    pub action: String,
+    pub required_permission: String,
+    pub required_role: Option<String>,
+    pub label: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateWorkflowTransitionRequest {
+    pub current_state: String,
+    pub action: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -148,7 +199,18 @@ pub struct CreateTenantUserRequest {
     pub email: String,
     #[serde(default)]
     pub role_ids: Vec<Uuid>,
+    #[serde(default)]
     pub password: Option<String>,
+    #[serde(default)]
+    pub temporary_password: Option<String>,
+}
+
+impl CreateTenantUserRequest {
+    pub fn credential_password(&self) -> Option<&str> {
+        self.temporary_password
+            .as_deref()
+            .or(self.password.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,8 +219,31 @@ pub struct AssignUserRolesRequest {
     pub role_ids: Vec<Uuid>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetUserAccessRequest {
+    pub surface: String,
+    pub grants: Vec<DirectPermissionGrantRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectPermissionGrantRequest {
+    pub key: String,
+    #[serde(default = "default_permission_scope")]
+    pub scope: String,
+    #[serde(default = "default_permission_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub constraints: Value,
+}
+
 fn default_permission_scope() -> String {
     "all".into()
+}
+
+fn default_permission_mode() -> String {
+    "allow".into()
 }
 
 #[derive(Debug, Deserialize)]

@@ -52,6 +52,7 @@ impl ActorContext {
 pub struct DeskSnapshot {
     pub definition: Value,
     pub application_form: Option<Value>,
+    pub desk_form: Option<Value>,
     pub cases: Vec<OnboardingCase>,
     pub audit: Vec<Value>,
     pub events: Vec<Value>,
@@ -63,6 +64,7 @@ impl DeskSnapshot {
         json!({
             "definition": self.definition,
             "applicationForm": self.application_form,
+            "deskForm": self.desk_form,
             "cases": self.cases,
             "audit": self.audit,
             "events": self.events,
@@ -110,6 +112,8 @@ impl ApplicationDeskService {
                 .await?;
         let application_form =
             PostgresDeskRepository::published_application_form(&mut transaction, tenant_id).await?;
+        let desk_form =
+            PostgresDeskRepository::published_desk_form(&mut transaction, tenant_id).await?;
         let mut cases = PostgresDeskRepository::list_cases(&mut transaction, tenant_id).await?;
         if application_form.is_some() {
             for onboarding in &mut cases {
@@ -129,6 +133,7 @@ impl ApplicationDeskService {
         Ok(build_snapshot(
             &definition,
             application_form,
+            desk_form,
             cases,
             audit,
             events,
@@ -382,6 +387,7 @@ fn application_value_present(value: &Value) -> bool {
 fn build_snapshot(
     definition: &crate::domain::WorkflowDefinition,
     application_form: Option<Value>,
+    desk_form: Option<Value>,
     cases: Vec<OnboardingCase>,
     audit: Vec<Value>,
     events: Vec<Value>,
@@ -390,6 +396,7 @@ fn build_snapshot(
     DeskSnapshot {
         definition: serde_json::to_value(definition).unwrap_or(Value::Null),
         application_form,
+        desk_form,
         queues: json!(queues),
         cases,
         audit,

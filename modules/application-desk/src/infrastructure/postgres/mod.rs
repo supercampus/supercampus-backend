@@ -300,6 +300,37 @@ impl PostgresDeskRepository {
         .transpose()
     }
 
+    /// The newest tenant-published form that configures Application Desk
+    /// controls (academic mapping, section allocation, finance, and notes).
+    pub async fn published_desk_form(
+        transaction: &mut Transaction<'static, Postgres>,
+        tenant_id: Uuid,
+    ) -> Result<Option<Value>, DeskError> {
+        let row: Option<PgRow> = sqlx::query(
+            r#"SELECT id, name, form_type, status, version, schema, updated_at
+               FROM crm.forms
+               WHERE tenant_id = $1 AND status = 'published' AND deleted_at IS NULL
+                 AND replace(lower(form_type), '-', '_') = 'application_desk_controls'
+               ORDER BY updated_at DESC LIMIT 1"#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+
+        row.map(|row| {
+            Ok(json!({
+                "id": row.try_get::<Uuid, _>("id")?.to_string(),
+                "name": row.try_get::<String, _>("name")?,
+                "formType": row.try_get::<String, _>("form_type")?,
+                "status": row.try_get::<String, _>("status")?,
+                "version": row.try_get::<i32, _>("version")?,
+                "schema": row.try_get::<Value, _>("schema")?,
+                "updatedAt": row.try_get::<chrono::DateTime<Utc>, _>("updated_at")?,
+            }))
+        })
+        .transpose()
+    }
+
     pub async fn list_cases(
         transaction: &mut Transaction<'static, Postgres>,
         tenant_id: Uuid,

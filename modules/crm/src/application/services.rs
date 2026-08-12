@@ -51,6 +51,16 @@ impl ActorContext {
         permissions.iter().any(|permission| self.has(permission))
     }
 
+    pub fn is_administrator(&self) -> bool {
+        self.permissions.contains("*")
+            || self.roles.iter().any(|role| {
+                let normalized = role.to_ascii_lowercase().replace('_', "-");
+                normalized == "admin"
+                    || normalized.ends_with("-admin")
+                    || normalized.ends_with("-administrator")
+            })
+    }
+
     pub fn scope_for(&self, permission: &str) -> &str {
         if self.permissions.contains("*") {
             "all"
@@ -577,11 +587,11 @@ impl CrmService {
             .unwrap_or_else(|| target.default_substate().into());
         let current = PrimaryStage::from_str(&lead.stage_key)?;
         if target.order() < current.order()
-            && !actor.has("crm.leads.stage.backward")
-            && !can_override
+            && !(actor.is_administrator()
+                && (actor.has("crm.leads.stage.backward") || can_override))
         {
             return Err(CrmError::Validation(
-                "the backward-stage permission is required".into(),
+                "only an administrator can move a lead backward".into(),
             ));
         }
         validate_transition(current, &lead.substate_key, target, &target_substate)?;
@@ -696,9 +706,11 @@ impl CrmService {
         let target_substate = request
             .to_substate
             .unwrap_or_else(|| target.default_substate().into());
-        if target.order() < current.order() && !actor.has("crm.leads.stage.backward") {
+        if target.order() < current.order()
+            && !(actor.is_administrator() && actor.has("crm.leads.stage.backward"))
+        {
             return Err(CrmError::Validation(
-                "the backward-stage permission is required".into(),
+                "only an administrator can request a backward lead movement".into(),
             ));
         }
         validate_transition(current, &lead.substate_key, target, &target_substate)?;
@@ -942,6 +954,9 @@ impl CrmService {
         mut filters: LeadFilters,
     ) -> Result<Value, CrmError> {
         filters.limit = Some(500);
+        // Archived leads remain visible in the final pipeline column as a recoverable,
+        // audited dustbin. Archiving is not the destructive-delete operation.
+        filters.include_archived = Some(true);
         self.require(
             tenant,
             actor,
@@ -2461,6 +2476,17 @@ fn validate_form_for_publish(schema: &Value) -> Result<(), CrmError> {
 mod form_submission_tests {
     use super::*;
 
+    fn actor(role: &str, permissions: &[&str]) -> ActorContext {
+        ActorContext {
+            user_id: "user-1".into(),
+            roles: vec![role.into()],
+            permissions: permissions.iter().map(|value| (*value).into()).collect(),
+            permission_scopes: HashMap::new(),
+            public: false,
+            ip_address: None,
+        }
+    }
+
     fn choice_schema() -> Value {
         json!({
             "sections": [{
@@ -2503,5 +2529,12 @@ mod form_submission_tests {
                 .to_string()
                 .contains("at least one option is required")
         );
+    }
+
+    #[test]
+    fn administrator_detection_does_not_treat_a_permissioned_counselor_as_admin() {
+        assert!(!actor("counselor", &["crm.leads.stage.backward"]).is_administrator());
+        assert!(actor("tenant_admin", &["crm.leads.stage.backward"]).is_administrator());
+        assert!(actor("counselor", &["*"]).is_administrator());
     }
 }

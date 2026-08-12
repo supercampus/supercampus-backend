@@ -585,6 +585,16 @@ impl CrmService {
         let target_substate = request
             .to_substate
             .unwrap_or_else(|| target.default_substate().into());
+        if target == PrimaryStage::OfferStatus && target_substate == "accepted" {
+            self.require(
+                tenant,
+                actor,
+                "crm.erp.handoff",
+                actor.has("crm.erp.handoff"),
+                Some(lead_id),
+            )
+            .await?;
+        }
         let current = PrimaryStage::from_str(&lead.stage_key)?;
         if target.order() < current.order()
             && !(actor.is_administrator()
@@ -777,6 +787,16 @@ impl CrmService {
         if approve {
             let current = PrimaryStage::from_str(&movement.from_stage)?;
             let target = PrimaryStage::from_str(&movement.to_stage)?;
+            if target == PrimaryStage::OfferStatus && movement.to_substate == "accepted" {
+                self.require(
+                    tenant,
+                    actor,
+                    "crm.erp.handoff",
+                    actor.has("crm.erp.handoff"),
+                    Some(movement.lead_id),
+                )
+                .await?;
+            }
             validate_transition(
                 current,
                 &movement.from_substate,

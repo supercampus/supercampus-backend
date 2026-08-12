@@ -37,7 +37,7 @@ impl PlatformModule for ApplicationDeskModule {
     fn manifest(&self) -> ModuleManifest {
         ModuleManifest {
             key: "application-desk".into(),
-            name: "Application Desk".into(),
+            name: "Admission Desk".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             permissions: PERMISSIONS.iter().map(|value| (*value).into()).collect(),
             capabilities: vec![

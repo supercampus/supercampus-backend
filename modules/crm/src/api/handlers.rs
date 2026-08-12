@@ -43,13 +43,13 @@ impl CrmApiState {
         Ok(CrmService::new(Some(database)))
     }
 
-    async fn reflect_application_in_desk(
+    async fn reflect_offer_acceptance_in_desk(
         &self,
         context: &RequestContext,
         lead: &crate::domain::Lead,
-        application_submitted: bool,
+        offer_accepted: bool,
     ) -> Result<(), CrmHttpError> {
-        if !application_submitted {
+        if !offer_accepted {
             return Ok(());
         }
         let databases = self
@@ -77,7 +77,7 @@ impl CrmApiState {
             application_id: format!("CRM-APP-{}", lead.id),
             admission_id: format!("CRM-OFFER-{}", lead.id),
             crm_lead_id: Some(lead.id),
-            admission_status: "APPLICATION".into(),
+            admission_status: "CONFIRMED".into(),
             program_id,
             fee_paid: lead.fee_payment_confirmed,
             applicant: ApplicantSnapshot {
@@ -100,6 +100,12 @@ impl CrmApiState {
                 "crmStage": lead.stage_key,
                 "crmSubstate": lead.substate_key,
                 "leadCreatedAt": lead.created_at,
+                "handoffReason": "offer_accepted",
+                "sourceReferences": {
+                    "leadId": lead.id,
+                    "applicationId": format!("CRM-APP-{}", lead.id),
+                    "offerId": format!("CRM-OFFER-{}", lead.id),
+                },
             })
             .as_object()
             .cloned()
@@ -114,7 +120,7 @@ impl CrmApiState {
 }
 
 fn opens_application_desk(to_stage: &str, to_substate: Option<&str>) -> bool {
-    to_stage == "application" && to_substate == Some("application_submitted")
+    to_stage == "offer_status" && to_substate == Some("accepted")
 }
 
 pub struct RequestContext {
@@ -425,14 +431,13 @@ pub async fn move_stage(
     Json(request): Json<MoveStageRequest>,
 ) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
     let context = RequestContext::from_headers(&headers)?;
-    let application_submitted =
-        opens_application_desk(&request.to_stage, request.to_substate.as_deref());
+    let offer_accepted = opens_application_desk(&request.to_stage, request.to_substate.as_deref());
     let service = state.service(&context.tenant).await?;
     let moved = service
         .move_stage(&context.tenant, &context.actor, id, request)
         .await?;
     state
-        .reflect_application_in_desk(&context, &moved, application_submitted)
+        .reflect_offer_acceptance_in_desk(&context, &moved, offer_accepted)
         .await?;
     let _ = state.realtime_wake.send(());
     Ok(ok(moved))
@@ -608,7 +613,7 @@ pub async fn approve_move_request(
             .get_lead(&context.tenant, &context.actor, decision.lead_id)
             .await?;
         state
-            .reflect_application_in_desk(&context, &moved, true)
+            .reflect_offer_acceptance_in_desk(&context, &moved, true)
             .await?;
     }
     let _ = state.realtime_wake.send(());
@@ -620,14 +625,14 @@ mod application_desk_trigger_tests {
     use super::opens_application_desk;
 
     #[test]
-    fn application_desk_opens_only_after_application_submission() {
+    fn application_desk_opens_only_after_offer_acceptance() {
         assert!(!opens_application_desk("application", None));
         assert!(!opens_application_desk("application", Some("to_do")));
         assert!(!opens_application_desk(
             "application",
             Some("application_in_progress")
         ));
-        assert!(opens_application_desk(
+        assert!(!opens_application_desk(
             "application",
             Some("application_submitted")
         ));
@@ -635,6 +640,9 @@ mod application_desk_trigger_tests {
             "application_status",
             Some("awaiting_decision")
         ));
+        assert!(!opens_application_desk("offer_status", Some("to_do")));
+        assert!(opens_application_desk("offer_status", Some("accepted")));
+        assert!(!opens_application_desk("offer_status", Some("rejected")));
     }
 }
 

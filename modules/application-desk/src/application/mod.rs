@@ -11,9 +11,9 @@ use supercampus_database::Database;
 
 use crate::{
     domain::{
-        ActionKind, ActionPayload, AdmissionTrigger, CreateCaseOptions, EngineContext,
-        OnboardingCase, OnboardingEventName, OnboardingStatus, apply_action, create_case,
-        engine::ApplicationFormUpdate, evaluate_intake, summarise_queues,
+        ActionKind, ActionPayload, AdmissionTrigger, AuditEntry, CreateCaseOptions, EngineContext,
+        OnboardingCase, OnboardingEventName, OnboardingStage, OnboardingStatus, apply_action,
+        create_case, engine::ApplicationFormUpdate, evaluate_intake, summarise_queues,
     },
     infrastructure::postgres::{
         DeskError, DeskSettings, PostgresDeskRepository, PostgresOnboardingServices,
@@ -193,12 +193,36 @@ impl ApplicationDeskService {
         );
 
         PostgresDeskRepository::upsert_case(&mut transaction, tenant_id, &onboarding).await?;
+        PostgresDeskRepository::insert_audit(
+            &mut transaction,
+            tenant_id,
+            &[AuditEntry {
+                case_id: onboarding.id.clone(),
+                actor: actor.user_id.clone(),
+                action: "offer_accepted_handoff".into(),
+                from_stage: OnboardingStage::New,
+                to_stage: OnboardingStage::DataReview,
+                from_status: OnboardingStatus::Active,
+                to_status: OnboardingStatus::Active,
+                timestamp: now,
+                reason: Some("CRM offer accepted; admission onboarding created".into()),
+            }],
+        )
+        .await?;
         let event = crate::domain::OnboardingEvent {
             name: OnboardingEventName::OnboardingCreated,
             case_id: onboarding.id.clone(),
             tenant_id: onboarding.tenant_id.clone(),
             timestamp: now,
-            payload: serde_json::Map::new(),
+            payload: json!({
+                "trigger": "offer_accepted",
+                "crmLeadId": onboarding.crm_lead_id,
+                "applicationId": onboarding.application_id,
+                "offerId": onboarding.admission_id,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
         };
         PostgresDeskRepository::enqueue_events(&mut transaction, tenant_id, &[event]).await?;
         transaction.commit().await?;

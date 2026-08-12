@@ -96,19 +96,19 @@ pub fn evaluate_intake(
     existing: &[OnboardingCase],
     mode: IntakeTriggerMode,
 ) -> IntakeDecision {
-    let crm_application =
-        trigger.crm_lead_id.is_some() && trigger.admission_status == "APPLICATION";
-    if mode == IntakeTriggerMode::OnConfirmed
-        && trigger.admission_status != "CONFIRMED"
-        && !crm_application
-    {
+    if mode == IntakeTriggerMode::OnConfirmed && trigger.admission_status != "CONFIRMED" {
         return IntakeDecision {
             create: false,
             reason: format!("Admission is {}, not CONFIRMED", trigger.admission_status),
             duplicate_of: None,
         };
     }
-    if mode == IntakeTriggerMode::OnFeePaid && !trigger.fee_paid {
+    let offer_accepted = trigger
+        .attributes
+        .get("handoffReason")
+        .and_then(serde_json::Value::as_str)
+        == Some("offer_accepted");
+    if mode == IntakeTriggerMode::OnFeePaid && !trigger.fee_paid && !offer_accepted {
         return IntakeDecision {
             create: false,
             reason: "Admission fee has not been paid".into(),

@@ -171,7 +171,7 @@ async fn provision_tenant(tenant_slug: &str, database_name: &str) -> anyhow::Res
     tenant.migrate().await?;
 
     let row = sqlx::query(
-        r#"SELECT id, slug, code, name, city, status, settings, created_at, updated_at
+        r#"SELECT id, slug, code, name, city, status, created_at, updated_at
            FROM platform.tenants
            WHERE slug = $1 AND status = 'active'"#,
     )
@@ -187,8 +187,8 @@ async fn provision_tenant(tenant_slug: &str, database_name: &str) -> anyhow::Res
         .await?;
     sqlx::query(
         r#"INSERT INTO platform.tenants
-               (id, slug, code, name, city, status, settings, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+               (id, slug, code, name, city, status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
     )
     .bind(row.try_get::<uuid::Uuid, _>("id")?)
     .bind(row.try_get::<String, _>("slug")?)
@@ -196,7 +196,6 @@ async fn provision_tenant(tenant_slug: &str, database_name: &str) -> anyhow::Res
     .bind(row.try_get::<String, _>("name")?)
     .bind(row.try_get::<String, _>("city")?)
     .bind(row.try_get::<String, _>("status")?)
-    .bind(row.try_get::<serde_json::Value, _>("settings")?)
     .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?)
     .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?)
     .execute(&mut *transaction)

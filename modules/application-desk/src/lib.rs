@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! SuperCampus Application Desk.
+//! SuperCampus Admission Desk.
 //!
 //! The bridge between Admissions and the operational system: it converts a
 //! confirmed admitted applicant into a student, a user account and module

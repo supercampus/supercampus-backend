@@ -2405,7 +2405,7 @@ fn default_navigation_sections() -> Vec<NavigationSection> {
         (
             "application-desk",
             "workspace",
-            "Application Desk",
+            "Admission Desk",
             "IdCard",
             &[],
             Some("application-desk"),

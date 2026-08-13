@@ -5,31 +5,35 @@ Scope: all backend services, web/mobile clients, workers, and future ERP modules
 
 ## 1. Entrance into ERP
 
-The only automatic CRM handoff is:
+The application review and ERP handoff boundaries are:
 
 ```text
-CRM Lead -> Application -> Offer -> Offer Accepted
-                                  |
-                                  v
-                        Admission Onboarding
+CRM Lead -> Application Submitted -> Application Status -> Offer Accepted
+                                                                  |
+                                                                  v
+                                                        Admission Desk Review
                                   |
                          Confirm Onboarding
                                   |
                   Student Master + Enrollment
 ```
 
-Application creation and application submission remain CRM concerns. They must
-not create an onboarding case or ERP student.
+Application submission advances CRM review but does not create an Admission Desk
+case or an ERP student. Offer acceptance creates the one authoritative Admission
+Desk case used for verification, approval, finance confirmation, and onboarding.
 
 The Offer Accepted transition:
 
 - is validated by the CRM pipeline;
-- creates one tenant-scoped onboarding case through the Application Desk service;
+- creates one tenant-scoped review/onboarding case through the Admission Desk service;
 - uses the existing transaction, audit, and outbox infrastructure;
-- carries lead, application, offer, applicant, guardian, source, owner, custom
-  fields, and academic references already known;
+- carries lead, submitted form, applicant, guardian, source, owner, custom fields,
+  and academic references already known;
 - is idempotent across lead, application, offer, and live onboarding references;
 - requires the existing Dynamic RBAC permissions.
+
+Repeated offer-acceptance delivery reuses the same case and adds conversion
+traceability; it never opens a second case or creates a shadow application inside CRM.
 
 ## 2. Canonical ownership
 
@@ -38,7 +42,7 @@ The Offer Accepted transition:
 | Core Administration | Institution, campus, academic year, term, department, programme, batch, section |
 | Student | Student Master, guardian relationship, academic enrollment, student status |
 | Employee | Employee Master and institutional relationship |
-| Application Desk | Admission onboarding case and its authoritative workflow history |
+| Admission Desk | Admission onboarding case and its authoritative workflow history |
 | CRM | Lead, application/offer progression, communications and conversion trace |
 | Library | Books, copies, loans, returns, library fines and visits |
 | Hostel | Hostels, rooms, beds and allocations |

@@ -1,4 +1,4 @@
-//! PostgreSQL adapters for the Application Desk.
+//! PostgreSQL adapters for the Admission Desk.
 //!
 //! Every query is tenant-scoped: `begin_tenant` resolves the institution slug to
 //! its uuid and sets `app.tenant_id` for the transaction, which the row level
@@ -300,7 +300,7 @@ impl PostgresDeskRepository {
         .transpose()
     }
 
-    /// The newest tenant-published form that configures Application Desk
+    /// The newest tenant-published form that configures Admission Desk
     /// controls (academic mapping, section allocation, finance, and notes).
     pub async fn published_desk_form(
         transaction: &mut Transaction<'static, Postgres>,

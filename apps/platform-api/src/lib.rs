@@ -1,5 +1,6 @@
 pub mod dashboard;
 pub mod error;
+pub mod media;
 pub mod models;
 pub mod routes;
 pub mod state;

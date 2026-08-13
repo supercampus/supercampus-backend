@@ -990,15 +990,9 @@ impl PostgresCrmRepository {
             .await?;
         }
         if to_stage == "offer_status" && to_substate == "accepted" {
-            let fee_paid: bool = row.try_get("fee_payment_confirmed")?;
-            let documents_verified: bool = row.try_get("documents_verified")?;
-            let scholarship_status: String = row.try_get("scholarship_status")?;
-            if !(documents_verified && (fee_paid || scholarship_status == "approved")) {
-                return Err(CrmError::Validation(
-                    "offer acceptance requires verified documents and paid fees or an approved scholarship"
-                        .into(),
-                ));
-            }
+            // Offer acceptance transfers the lead into Admission Desk review.
+            // Document and finance verification are authoritative workflow
+            // stages there, so CRM readiness flags must not block the handoff.
             self.insert_event(
                 &mut transaction,
                 tenant_id,
@@ -1781,14 +1775,16 @@ impl PostgresCrmRepository {
         actor_id: &str,
     ) -> Result<Value, CrmError> {
         let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
-        let form_version: i32 = sqlx::query_scalar(
-            "SELECT version FROM crm.forms WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+        let form = sqlx::query(
+            "SELECT version, schema FROM crm.forms WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
         )
         .bind(tenant_id)
         .bind(form_id)
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(CrmError::NotFound)?;
+        let form_version: i32 = form.try_get("version")?;
+        let form_schema: Value = form.try_get("schema")?;
         if let Some(campaign_id) = campaign_id {
             let linked: bool = sqlx::query_scalar(
                 r#"SELECT EXISTS(
@@ -1810,11 +1806,11 @@ impl PostgresCrmRepository {
         let row = sqlx::query(
             r#"INSERT INTO crm.form_submissions
                (tenant_id, form_id, form_version, lead_id, campaign_id, idempotency_key,
-                data, submitted_by, processing_status, processed_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'processed', now())
+                data, form_schema, submitted_by, processing_status, processed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'processed', now())
                ON CONFLICT (tenant_id, form_id, idempotency_key)
                    WHERE idempotency_key IS NOT NULL DO NOTHING
-               RETURNING id, lead_id, campaign_id, created_at"#,
+               RETURNING id, lead_id, campaign_id, form_version, form_schema, data, created_at"#,
         )
         .bind(tenant_id)
         .bind(form_id)
@@ -1823,6 +1819,7 @@ impl PostgresCrmRepository {
         .bind(campaign_id)
         .bind(idempotency_key)
         .bind(&data)
+        .bind(&form_schema)
         .bind(actor_id)
         .fetch_optional(&mut *transaction)
         .await?;
@@ -1830,7 +1827,7 @@ impl PostgresCrmRepository {
             (row, false)
         } else {
             let row = sqlx::query(
-                r#"SELECT id, lead_id, campaign_id, created_at
+                r#"SELECT id, lead_id, campaign_id, form_version, form_schema, data, created_at
                    FROM crm.form_submissions
                    WHERE tenant_id = $1 AND form_id = $2 AND idempotency_key = $3"#,
             )
@@ -1843,6 +1840,9 @@ impl PostgresCrmRepository {
         };
         let submission_id: Uuid = row.try_get("id")?;
         let persisted_lead_id: Option<Uuid> = row.try_get("lead_id")?;
+        let persisted_form_version: i32 = row.try_get("form_version")?;
+        let persisted_form_schema: Value = row.try_get("form_schema")?;
+        let persisted_data: Value = row.try_get("data")?;
         if !replayed && let Some(lead_id) = persisted_lead_id {
             self.insert_event(
                 &mut transaction,
@@ -1857,13 +1857,14 @@ impl PostgresCrmRepository {
         Ok(json!({
             "id": submission_id,
             "formId": form_id,
-            "formVersion": form_version,
+            "formVersion": persisted_form_version,
+            "formSchema": persisted_form_schema,
             "leadId": persisted_lead_id,
             "campaignId": row.try_get::<Option<Uuid>, _>("campaign_id")?,
             "idempotencyKey": idempotency_key,
             "processingStatus": "processed",
             "replayed": replayed,
-            "data": data,
+            "data": persisted_data,
             "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?
         }))
     }
@@ -1876,7 +1877,8 @@ impl PostgresCrmRepository {
         let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
         let rows = sqlx::query(
             "SELECT id, form_id, form_version, lead_id, campaign_id, idempotency_key,
-                    processing_status, processing_error, processed_at, data, submitted_by, created_at
+                    processing_status, processing_error, processed_at, data, form_schema,
+                    submitted_by, created_at
              FROM crm.form_submissions WHERE tenant_id = $1 AND form_id = $2 ORDER BY created_at DESC",
         )
         .bind(tenant_id)
@@ -1897,11 +1899,61 @@ impl PostgresCrmRepository {
                     "processingError": row.try_get::<Option<String>, _>("processing_error")?,
                     "processedAt": row.try_get::<Option<DateTime<Utc>>, _>("processed_at")?,
                     "data": row.try_get::<Value, _>("data")?,
+                    "formSchema": row.try_get::<Value, _>("form_schema")?,
                     "submittedBy": row.try_get::<String, _>("submitted_by")?,
                     "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?
                 }))
             })
             .collect()
+    }
+
+    /// The newest submitted Application form linked to this CRM lead.
+    ///
+    /// This read is deliberately tenant-scoped and returns the immutable form
+    /// version and answer snapshot that were persisted with the submission.
+    /// Admission Desk copies that snapshot into its authoritative case
+    /// history; it does not create a second CRM application record.
+    pub async fn latest_application_submission(
+        &self,
+        tenant_slug: &str,
+        lead_id: Uuid,
+    ) -> Result<Option<Value>, CrmError> {
+        let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
+        let row = sqlx::query(
+            r#"SELECT submission.id, submission.form_id, submission.form_version, form.form_type,
+                      submission.form_schema, submission.data, submission.submitted_by,
+                      submission.created_at
+               FROM crm.form_submissions AS submission
+               JOIN crm.forms AS form
+                 ON form.tenant_id = submission.tenant_id
+                AND form.id = submission.form_id
+               WHERE submission.tenant_id = $1
+                 AND submission.lead_id = $2
+                 AND replace(lower(form.form_type), '-', '_') = 'application'
+               ORDER BY submission.created_at DESC, submission.id DESC
+               LIMIT 1"#,
+        )
+        .bind(tenant_id)
+        .bind(lead_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+
+        row.map(|row| {
+            Ok(json!({
+                "submissionId": row.try_get::<Uuid, _>("id")?,
+                "formId": row.try_get::<Uuid, _>("form_id")?,
+                "formType": row.try_get::<String, _>("form_type")?,
+                "formVersion": row.try_get::<i32, _>("form_version")?,
+                "schema": row.try_get::<Value, _>("form_schema")?,
+                "status": "submitted",
+                "data": row.try_get::<Value, _>("data")?,
+                "revision": 1,
+                "updatedAt": row.try_get::<DateTime<Utc>, _>("created_at")?,
+                "updatedBy": row.try_get::<String, _>("submitted_by")?,
+            }))
+        })
+        .transpose()
     }
 
     pub async fn send_communication(

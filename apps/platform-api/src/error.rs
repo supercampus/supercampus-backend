@@ -8,6 +8,8 @@ pub enum ApiError {
     Unauthorized,
     Forbidden,
     NotFound(String),
+    ServiceUnavailable(String),
+    BadGateway(String),
     Internal,
 }
 
@@ -33,6 +35,12 @@ impl IntoResponse for ApiError {
                 "This session cannot access the requested tenant or resource".into(),
             ),
             Self::NotFound(error) => (StatusCode::NOT_FOUND, "not_found", error),
+            Self::ServiceUnavailable(error) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                error,
+            ),
+            Self::BadGateway(error) => (StatusCode::BAD_GATEWAY, "upstream_error", error),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",

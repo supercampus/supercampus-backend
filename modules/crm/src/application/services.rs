@@ -985,12 +985,14 @@ impl CrmService {
             None,
         )
         .await?;
-        // Enquiry is the shared intake queue. Once a first movement claims a card,
-        // the pipeline only returns it to its current owner, regardless of broad
-        // reporting/read scope.
+        // Enquiry is the shared intake queue for users whose read permission is
+        // owner-scoped. Tenant-wide readers (for example Tenant Admin) must see
+        // the complete tenant pipeline so their operational overview is accurate.
+        let owner_scope =
+            (!actor.has_all_scope("crm.leads.read")).then_some(actor.user_id.as_str());
         let leads = self
             .repo()?
-            .list_leads(tenant, &filters, Some(actor.user_id.as_str()), true)
+            .list_leads(tenant, &filters, owner_scope, owner_scope.is_some())
             .await?;
         let stages: Vec<Value> = PrimaryStage::ALL
             .into_iter()
@@ -1011,7 +1013,7 @@ impl CrmService {
             .collect();
         Ok(json!({
             "pipeline": { "key": "pre-admission", "name": "Pre-Admission Pipeline" },
-            "scope": "shared_enquiry_and_owned",
+            "scope": if owner_scope.is_some() { "shared_enquiry_and_owned" } else { "tenant" },
             "stages": stages,
             "total": leads.len()
         }))
@@ -1578,7 +1580,22 @@ impl CrmService {
         {
             return Err(CrmError::Validation("form type cannot be empty".into()));
         }
-        self.repo()?
+        let repository = self.repo()?;
+        let existing = repository.find_form(tenant, form_id).await?;
+        if request.form_type.as_deref().is_some_and(|requested| {
+            requested.trim().to_ascii_lowercase().replace('-', "_")
+                != existing
+                    .form_type
+                    .trim()
+                    .to_ascii_lowercase()
+                    .replace('-', "_")
+        }) {
+            return Err(CrmError::Validation(
+                "form purpose cannot be changed after creation; create a separate form instead"
+                    .into(),
+            ));
+        }
+        repository
             .update_form(
                 tenant,
                 form_id,
@@ -1608,7 +1625,7 @@ impl CrmService {
         let repository = self.repo()?;
         if status == "published" {
             let form = repository.find_form(tenant, form_id).await?;
-            validate_form_for_publish(&form.schema)?;
+            validate_form_for_publish(&form.form_type, &form.schema)?;
         }
         repository
             .set_form_status(tenant, form_id, status, &actor.user_id)
@@ -1646,7 +1663,7 @@ impl CrmService {
                 "only published forms accept submissions".into(),
             ));
         }
-        validate_form_submission(&form.schema, &request.data)?;
+        validate_form_submission(tenant, &form.schema, &request.data)?;
         let normalized_form_type = form.form_type.to_ascii_lowercase().replace('-', "_");
         let creates_lead =
             normalized_form_type.contains("enquiry") || normalized_form_type == "lead_capture";
@@ -1796,6 +1813,18 @@ impl CrmService {
         self.require(tenant, actor, "crm.forms.submissions.read", allowed, None)
             .await?;
         self.repo()?.list_submissions(tenant, form_id).await
+    }
+
+    /// Returns the newest application snapshot for the Admission Desk handoff
+    /// that runs after an offer is accepted.
+    pub async fn latest_application_submission(
+        &self,
+        tenant: &str,
+        lead_id: Uuid,
+    ) -> Result<Option<Value>, CrmError> {
+        self.repo()?
+            .latest_application_submission(tenant, lead_id)
+            .await
     }
 
     pub async fn send_communication(
@@ -2358,7 +2387,7 @@ fn json_text(value: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn validate_form_submission(schema: &Value, data: &Value) -> Result<(), CrmError> {
+fn validate_form_submission(tenant: &str, schema: &Value, data: &Value) -> Result<(), CrmError> {
     let sections = schema
         .get("sections")
         .and_then(Value::as_array)
@@ -2394,6 +2423,17 @@ fn validate_form_submission(schema: &Value, data: &Value) -> Result<(), CrmError
             continue;
         }
 
+        let field_type = field
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if field_type.eq_ignore_ascii_case("upload")
+            || field_type.eq_ignore_ascii_case("image upload")
+        {
+            validate_uploaded_media(tenant, candidate.expect("present value"), label)?;
+            continue;
+        }
+
         let allowed = field
             .get("options")
             .and_then(Value::as_array)
@@ -2417,10 +2457,6 @@ fn validate_form_submission(schema: &Value, data: &Value) -> Result<(), CrmError
             continue;
         }
 
-        let field_type = field
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
         let selected = match candidate {
             Some(Value::Array(values)) => values
                 .iter()
@@ -2445,7 +2481,28 @@ fn validate_form_submission(schema: &Value, data: &Value) -> Result<(), CrmError
     Ok(())
 }
 
-fn validate_form_for_publish(schema: &Value) -> Result<(), CrmError> {
+fn validate_uploaded_media(tenant: &str, value: &Value, label: &str) -> Result<(), CrmError> {
+    let object = value.as_object().ok_or_else(|| {
+        CrmError::Validation(format!("{label} must be uploaded before submission"))
+    })?;
+    let storage = object.get("storage").and_then(Value::as_str);
+    let secure_url = object.get("secureUrl").and_then(Value::as_str);
+    let public_id = object.get("publicId").and_then(Value::as_str);
+    let file_name = object.get("fileName").and_then(Value::as_str);
+    let expected_prefix = format!("supercampus/{tenant}/media/");
+    if storage != Some("cloudinary")
+        || !secure_url.is_some_and(|url| url.starts_with("https://"))
+        || !public_id.is_some_and(|id| id.starts_with(&expected_prefix))
+        || !file_name.is_some_and(|name| !name.trim().is_empty())
+    {
+        return Err(CrmError::Validation(format!(
+            "{label} does not contain a valid tenant Cloudinary upload"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_form_for_publish(form_type: &str, schema: &Value) -> Result<(), CrmError> {
     let Some(sections) = schema
         .get("sections")
         .and_then(Value::as_array)
@@ -2453,11 +2510,12 @@ fn validate_form_for_publish(schema: &Value) -> Result<(), CrmError> {
     else {
         return Ok(());
     };
-    for field in sections
+    let fields = sections
         .iter()
         .filter_map(|section| section.get("fields").and_then(Value::as_array))
         .flatten()
-    {
+        .collect::<Vec<_>>();
+    for field in &fields {
         let field_type = field
             .get("type")
             .and_then(Value::as_str)
@@ -2487,6 +2545,45 @@ fn validate_form_for_publish(schema: &Value) -> Result<(), CrmError> {
             return Err(CrmError::Validation(format!(
                 "at least one option is required before publishing: {label}"
             )));
+        }
+    }
+    if form_type.to_ascii_lowercase().replace('-', "_") == "application" {
+        let mut document_types = std::collections::HashSet::new();
+        for field in fields {
+            let field_type = field
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !field_type.eq_ignore_ascii_case("upload")
+                && !field_type.eq_ignore_ascii_case("image upload")
+            {
+                continue;
+            }
+            let Some(config) = field.get("documentConfig").and_then(Value::as_object) else {
+                continue;
+            };
+            if config.get("enabled").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            let label = field
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("Upload");
+            let document_type = config
+                .get("documentType")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    CrmError::Validation(format!(
+                        "Admission Desk document type is required for {label}"
+                    ))
+                })?;
+            if !document_types.insert(document_type.to_owned()) {
+                return Err(CrmError::Validation(format!(
+                    "Admission Desk document type is mapped more than once: {document_type}"
+                )));
+            }
         }
     }
     Ok(())
@@ -2522,17 +2619,49 @@ mod form_submission_tests {
     #[test]
     fn accepts_configured_single_and_multi_select_options() {
         let data = json!({ "values": { "course": "MBA", "campuses": "Main, City" } });
-        assert!(validate_form_submission(&choice_schema(), &data).is_ok());
+        assert!(validate_form_submission("tenant-local", &choice_schema(), &data).is_ok());
     }
 
     #[test]
     fn rejects_values_outside_the_published_choice_catalog() {
         let data = json!({ "values": { "course": "Unpublished course" } });
-        let error = validate_form_submission(&choice_schema(), &data).unwrap_err();
+        let error = validate_form_submission("tenant-local", &choice_schema(), &data).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("invalid option selected for Course")
+        );
+    }
+
+    #[test]
+    fn upload_fields_require_a_tenant_scoped_cloudinary_reference() {
+        let schema = json!({
+            "sections": [{
+                "fields": [{ "key": "marksheet", "label": "Marksheet", "type": "Upload", "required": true }]
+            }]
+        });
+        let valid = json!({ "values": { "marksheet": {
+            "storage": "cloudinary",
+            "fileName": "marksheet.pdf",
+            "secureUrl": "https://res.cloudinary.com/example/raw/upload/marksheet.pdf",
+            "publicId": "supercampus/tenant-local/media/marksheet"
+        } } });
+        assert!(validate_form_submission("tenant-local", &schema, &valid).is_ok());
+
+        let wrong_tenant = json!({ "values": { "marksheet": {
+            "storage": "cloudinary",
+            "fileName": "marksheet.pdf",
+            "secureUrl": "https://res.cloudinary.com/example/raw/upload/marksheet.pdf",
+            "publicId": "supercampus/another-tenant/media/marksheet"
+        } } });
+        assert!(validate_form_submission("tenant-local", &schema, &wrong_tenant).is_err());
+        assert!(
+            validate_form_submission(
+                "tenant-local",
+                &schema,
+                &json!({ "values": { "marksheet": "marksheet.pdf" } })
+            )
+            .is_err()
         );
     }
 
@@ -2543,12 +2672,27 @@ mod form_submission_tests {
                 "fields": [{ "key": "course", "label": "Course", "type": "Dropdown" }]
             }]
         });
-        let error = validate_form_for_publish(&schema).unwrap_err();
+        let error = validate_form_for_publish("lead_capture", &schema).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("at least one option is required")
         );
+    }
+
+    #[test]
+    fn application_document_mappings_must_be_unique() {
+        let schema = json!({
+            "sections": [{
+                "fields": [
+                    { "key": "certificate_10", "label": "10th Certificate", "type": "Upload", "documentConfig": { "enabled": true, "documentType": "certificate-10" } },
+                    { "key": "duplicate", "label": "Another Certificate", "type": "Upload", "documentConfig": { "enabled": true, "documentType": "certificate-10" } }
+                ]
+            }]
+        });
+        let error = validate_form_for_publish("application", &schema).unwrap_err();
+        assert!(error.to_string().contains("mapped more than once"));
+        assert!(validate_form_for_publish("enquiry", &schema).is_ok());
     }
 
     #[test]

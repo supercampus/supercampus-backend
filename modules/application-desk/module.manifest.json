@@ -1,7 +1,7 @@
 {
   "$schema": "../../contracts/module-manifest/module-manifest.schema.json",
   "key": "application-desk",
-  "name": "Application Desk",
+  "name": "Admission Desk",
   "version": "0.1.0",
   "backendCrate": "supercampus-application-desk",
   "permissions": [

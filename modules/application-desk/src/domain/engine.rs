@@ -113,6 +113,22 @@ pub struct DocumentUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_form_field_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_submission_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_form_version: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejection_reason: Option<String>,
 }
 
@@ -283,14 +299,51 @@ fn apply_payload(onboarding: &OnboardingCase, context: &EngineContext<'_>) -> On
         {
             existing.state = update.state;
             existing.file_id = update.file_id.clone().or_else(|| existing.file_id.clone());
+            existing.file_name = update
+                .file_name
+                .clone()
+                .or_else(|| existing.file_name.clone());
+            existing.content_type = update
+                .content_type
+                .clone()
+                .or_else(|| existing.content_type.clone());
+            existing.secure_url = update
+                .secure_url
+                .clone()
+                .or_else(|| existing.secure_url.clone());
+            existing.bytes = update.bytes.or(existing.bytes);
+            existing.uploaded_at = update
+                .uploaded_at
+                .clone()
+                .or_else(|| existing.uploaded_at.clone());
+            existing.source_form_field_key = update
+                .source_form_field_key
+                .clone()
+                .or_else(|| existing.source_form_field_key.clone());
+            existing.source_submission_id = update
+                .source_submission_id
+                .clone()
+                .or_else(|| existing.source_submission_id.clone());
+            existing.source_form_version =
+                update.source_form_version.or(existing.source_form_version);
             existing.rejection_reason = update.rejection_reason.clone();
             existing.verified_by = Some(context.actor.clone());
             existing.verified_at = Some(context.now.to_rfc3339());
         } else {
             draft.documents.push(DocumentRecord {
                 document_type: update.document_type.clone(),
+                label: None,
+                required: false,
                 state: update.state,
                 file_id: update.file_id.clone(),
+                file_name: update.file_name.clone(),
+                content_type: update.content_type.clone(),
+                secure_url: update.secure_url.clone(),
+                bytes: update.bytes,
+                uploaded_at: update.uploaded_at.clone(),
+                source_form_field_key: update.source_form_field_key.clone(),
+                source_submission_id: update.source_submission_id.clone(),
+                source_form_version: update.source_form_version,
                 verified_by: Some(context.actor.clone()),
                 verified_at: Some(context.now.to_rfc3339()),
                 rejection_reason: update.rejection_reason.clone(),
@@ -614,7 +667,7 @@ pub async fn apply_action(
     // Record what the operator supplied, then judge the case as it now stands.
     let staged = apply_payload(onboarding, context);
 
-    // Collecting the full application is an Application Desk invariant, not a
+    // Collecting the full application is an Admission Desk invariant, not a
     // CRM stage field. Tenants without a published Application form remain
     // compatible; once a case is marked as requiring one, Data Review cannot
     // be left until a submitted revision exists.

@@ -1,4 +1,4 @@
-//! Application Desk domain layer.
+//! Admission Desk domain layer.
 //!
 //! Pure: no Axum, no SQLx, no messaging clients, no clock reads. The engine
 //! receives `now` and its integration services from the caller, which is what
@@ -20,7 +20,8 @@ pub use engine::{
 pub use guards::{GuardResult, run_guards};
 pub use intake::{
     AdmissionTrigger, CreateCaseOptions, IntakeDecision, IntakeTriggerMode, QueueKey,
-    average_onboarding_hours, create_case, evaluate_intake, queue_of, summarise_queues,
+    apply_application_document_mapping, average_onboarding_hours, create_case, evaluate_intake,
+    queue_of, summarise_queues,
 };
 pub use numbering::{
     NumberToken, StudentNumberFormat, StudentNumberInput, department_code, format_student_number,

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use axum::{
     Extension, Json, Router,
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -95,6 +95,10 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/me", get(me))
         .route("/auth/logout", post(logout))
         .route("/state", get(get_app_state).put(save_app_state))
+        .route(
+            "/media/upload",
+            post(upload_media).layer(DefaultBodyLimit::max(crate::media::MULTIPART_BODY_LIMIT)),
+        )
         .nest("/v1", v1);
 
     Router::new()
@@ -118,6 +122,14 @@ async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         "status": "ready",
         "checks": { "runtime": "ok", "storage": state.storage_kind() }
     })))
+}
+
+async fn upload_media(
+    Extension(principal): Extension<AuthPrincipal>,
+    multipart: Multipart,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    let media = crate::media::upload(&principal.student.tenant_id, multipart).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(media))))
 }
 
 async fn api_index(State(state): State<AppState>) -> Json<ApiResponse<Value>> {
@@ -1041,6 +1053,7 @@ fn requires_authorization(method: &Method, path: &str) -> bool {
 
     !is_public_crm_route
         && (path == "/api/state"
+            || path == "/api/media/upload"
             || path == "/api/v1"
             || path.starts_with("/api/v1/")
             || path == "/api/auth/me"
@@ -1189,5 +1202,10 @@ mod tests {
         assert!(can_access_module(&admin, "crm"));
         assert_eq!(module_read_permission(&admin, "fees").as_deref(), Some("*"));
         assert!(require_module_record_permission(&admin, "fees", "delete").is_ok());
+    }
+
+    #[test]
+    fn media_upload_is_always_authenticated() {
+        assert!(requires_authorization(&Method::POST, "/api/media/upload"));
     }
 }

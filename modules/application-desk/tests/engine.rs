@@ -259,13 +259,28 @@ fn intake_blocks_a_duplicate_applicant_but_allows_readmission_after_a_closed_cas
 }
 
 #[test]
-fn crm_application_submission_remains_in_crm_until_offer_is_accepted() {
+fn unsubmitted_crm_application_does_not_open_the_desk() {
     let mut application = trigger();
     application.admission_status = "APPLICATION".into();
     application.crm_lead_id = Some(uuid::Uuid::new_v4());
     application
         .attributes
         .insert("source".into(), serde_json::json!("Google Search"));
+
+    let decision = evaluate_intake(&application, &[], IntakeTriggerMode::OnConfirmed);
+    assert!(!decision.create);
+    assert!(decision.reason.contains("not CONFIRMED"));
+}
+
+#[test]
+fn submitted_crm_application_waits_for_offer_acceptance() {
+    let mut application = trigger();
+    application.admission_status = "SUBMITTED".into();
+    application.crm_lead_id = Some(uuid::Uuid::new_v4());
+    application.attributes.insert(
+        "handoffReason".into(),
+        serde_json::json!("application_submitted"),
+    );
 
     let decision = evaluate_intake(&application, &[], IntakeTriggerMode::OnConfirmed);
     assert!(!decision.create);

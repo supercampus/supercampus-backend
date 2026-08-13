@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use axum::{
     Extension, Json, Router,
-    extract::{Path, Query, Request, State},
+    extract::{Multipart, Path, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -95,6 +95,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/me", get(me))
         .route("/auth/logout", post(logout))
         .route("/state", get(get_app_state).put(save_app_state))
+        .route("/media/upload", post(upload_media))
         .nest("/v1", v1);
 
     Router::new()
@@ -102,6 +103,14 @@ pub fn router(state: AppState) -> Router {
         .route("/ready", get(ready))
         .nest("/api", api)
         .with_state(state)
+}
+
+async fn upload_media(
+    Extension(principal): Extension<AuthPrincipal>,
+    multipart: Multipart,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let uploaded = crate::media::upload_to_cloudinary(multipart, &principal.student.tenant_id).await?;
+    Ok(Json(ApiResponse::new(uploaded)))
 }
 
 async fn health() -> Json<HealthDocument> {
@@ -1041,6 +1050,7 @@ fn requires_authorization(method: &Method, path: &str) -> bool {
 
     !is_public_crm_route
         && (path == "/api/state"
+            || path == "/api/media/upload"
             || path == "/api/v1"
             || path.starts_with("/api/v1/")
             || path == "/api/auth/me"

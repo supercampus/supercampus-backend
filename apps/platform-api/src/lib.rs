@@ -3,6 +3,7 @@ pub mod error;
 pub mod models;
 pub mod routes;
 pub mod state;
+mod media;
 
 use std::net::SocketAddr;
 
@@ -94,8 +95,10 @@ pub async fn run() -> anyhow::Result<()> {
         std::env::var("CONTROL_DATABASE_URL").context("CONTROL_DATABASE_URL is required")?;
     let control_database = Database::connect(&control_database_url).await?;
     control_database.migrate().await?;
+    tracing::info!("control database migration check completed");
     let tenant_databases =
         TenantDatabaseManager::clustered(control_database.clone(), &control_database_url)?;
+    tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;
     tracing::info!(
         transport = mailer.transport(),
@@ -108,7 +111,11 @@ pub async fn run() -> anyhow::Result<()> {
     if seeded > 0 {
         tracing::info!(count = seeded, "testing identities seeded from environment");
     }
-    tenant_databases.ping_registered().await?;
+    if std::env::var("SKIP_TENANT_DB_PING").as_deref() == Ok("true") {
+        tracing::warn!("registered tenant database startup ping skipped");
+    } else {
+        tenant_databases.ping_registered().await?;
+    }
     tracing::info!(storage = "postgresql", "SuperCampus storage connected");
     let host = std::env::var("HTTP_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port = std::env::var("HTTP_PORT").unwrap_or_else(|_| "4000".into());

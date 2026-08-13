@@ -6,6 +6,10 @@ use std::{
 use chrono::Utc;
 use serde_json::{Value, json};
 use supercampus_database::Database;
+use supercampus_application_desk::{
+    application::{ActorContext as DeskActorContext, ApplicationDeskService},
+    domain::{AdmissionTrigger, ApplicantSnapshot},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -84,6 +88,7 @@ impl ActorContext {
 #[derive(Clone)]
 pub struct CrmService {
     repository: Option<PostgresCrmRepository>,
+    database: Option<Database>,
 }
 
 #[derive(Default)]
@@ -98,7 +103,8 @@ struct SourcePerformance {
 impl CrmService {
     pub fn new(database: Option<Database>) -> Self {
         Self {
-            repository: database.map(PostgresCrmRepository::new),
+            repository: database.clone().map(PostgresCrmRepository::new),
+            database,
         }
     }
 
@@ -1637,6 +1643,7 @@ impl CrmService {
         }
 
         let campaign_id = request.campaign_id;
+        let application_submission = normalized_form_type.contains("application");
         let idempotency_key = request
             .idempotency_key
             .as_deref()
@@ -1651,6 +1658,12 @@ impl CrmService {
                 "idempotencyKey must not exceed 200 characters".into(),
             ));
         }
+        if application_submission && idempotency_key.is_none() {
+            return Err(CrmError::Validation(
+                "application submissions require an idempotencyKey".into(),
+            ));
+        }
+        let submitted_data = request.data.clone();
         let mut lead_id = request.lead_id;
         let mut created_lead_id = None;
         if creates_lead && lead_id.is_none() {
@@ -1755,6 +1768,27 @@ impl CrmService {
                 {
                     object.insert("createdLeadId".into(), json!(id));
                 }
+                if application_submission {
+                    let desk_case = self
+                        .open_application_desk_case(
+                            tenant,
+                            &submission,
+                            form_id,
+                            form.version,
+                            form.name.as_str(),
+                            persisted_uuid(&submission, "leadId").or(lead_id),
+                            submitted_data,
+                        )
+                        .await
+                        .map_err(|error| {
+                            CrmError::Storage(format!(
+                                "application was saved but Application Desk handoff failed: {error}"
+                            ))
+                        })?;
+                    if let Some(object) = submission.as_object_mut() {
+                        object.insert("applicationDesk".into(), desk_case);
+                    }
+                }
                 Ok(submission)
             }
             Err(error) => {
@@ -1764,6 +1798,91 @@ impl CrmService {
                 Err(error)
             }
         }
+    }
+
+    async fn open_application_desk_case(
+        &self,
+        tenant: &str,
+        submission: &Value,
+        form_id: Uuid,
+        form_version: i32,
+        form_name: &str,
+        lead_id: Option<Uuid>,
+        submitted_data: Value,
+    ) -> Result<Value, supercampus_application_desk::infrastructure::postgres::DeskError> {
+        let database = self.database.clone().ok_or(
+            supercampus_application_desk::infrastructure::postgres::DeskError::Unavailable,
+        )?;
+        let submission_id = submission
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                supercampus_application_desk::infrastructure::postgres::DeskError::Conflict(
+                    "form submission did not return an id".into(),
+                )
+            })?;
+        let values = submitted_data
+            .get("values")
+            .unwrap_or(&submitted_data);
+        let applicant = ApplicantSnapshot {
+            full_name: first_text(values, &["fullName", "name"]),
+            email: first_text(values, &["email"]),
+            phone: first_text(values, &["phone", "mobile", "whatsapp"]),
+            guardian_name: first_text(values, &["parentName", "guardianName"]),
+            guardian_email: first_text(values, &["parentEmail", "guardianEmail"]),
+        };
+        let academic = values.get("academic").unwrap_or(values);
+        let mut attributes = serde_json::Map::new();
+        attributes.insert(
+            "applicationForm".into(),
+            json!({
+                "status": "submitted",
+                "formId": form_id,
+                "formVersion": form_version,
+                "formName": form_name,
+                "submissionId": submission_id,
+                "values": submitted_data,
+            }),
+        );
+        attributes.insert("source".into(), json!("published_application_form"));
+
+        let trigger = AdmissionTrigger {
+            applicant_id: lead_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| submission_id.to_owned()),
+            application_id: format!("FORM-{submission_id}"),
+            admission_id: format!("FORM-{submission_id}"),
+            crm_lead_id: lead_id,
+            admission_status: "APPLICATION".into(),
+            academic_year: first_text(academic, &["academicYear", "intakeYear"]),
+            admission_category: first_text(values, &["admissionCategory", "category"]),
+            program_id: first_text(academic, &["programId", "programmeId", "program"]),
+            department_id: first_text(academic, &["departmentId", "department"]),
+            campus_id: first_text(values, &["campusId", "campus"]),
+            batch_id: first_text(academic, &["batchId", "batch"]),
+            fee_paid: values
+                .get("feePaid")
+                .and_then(Value::as_bool)
+                .or_else(|| values.get("depositPaid").and_then(Value::as_bool))
+                .unwrap_or(false),
+            applicant,
+            attributes,
+            ..AdmissionTrigger::default()
+        };
+        let actor = DeskActorContext {
+            user_id: "application-form-submission".into(),
+            roles: vec!["system".into()],
+            permissions: vec!["application-desk.create".into()],
+        };
+        let (created, reason, _) = ApplicationDeskService::new(database)
+            .open_case(tenant, &actor, trigger)
+            .await?;
+        Ok(json!({
+            "created": created,
+            "duplicate": !created,
+            "reason": reason,
+            "submissionId": submission_id,
+        }))
     }
 
     pub async fn list_submissions(
@@ -2336,6 +2455,24 @@ fn json_text(value: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn first_text(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn persisted_uuid(value: &Value, key: &str) -> Option<Uuid> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|text| Uuid::parse_str(text).ok())
 }
 
 fn validate_form_submission(schema: &Value, data: &Value) -> Result<(), CrmError> {

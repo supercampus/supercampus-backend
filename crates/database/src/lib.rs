@@ -66,7 +66,10 @@ impl Database {
     pub async fn migrate(&self) -> anyhow::Result<()> {
         if let Err(error) = MIGRATOR.run(&self.pool).await {
             let error_str = format!("{error:?}");
-            if error_str.contains("VersionMismatch") {
+            if error_str.contains("VersionMissing") {
+                tracing::warn!(error = %error, "database has migrations newer than this checkout; ignoring missing applied migrations");
+                return Ok(());
+            } else if error_str.contains("VersionMismatch") {
                 tracing::warn!(error = %error, "sqlx migration version mismatch detected; reconciling applied migration checksums");
                 for migration in MIGRATOR.iter() {
                     sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2")
@@ -193,10 +196,14 @@ impl TenantDatabaseManager {
         let database = Database::connect_options(options, 5)
             .await
             .with_context(|| format!("failed to connect tenant {tenant_slug} database"))?;
-        database
-            .migrate()
-            .await
-            .with_context(|| format!("failed to migrate tenant {tenant_slug} database"))?;
+        if std::env::var("SKIP_TENANT_DB_PING").as_deref() == Ok("true") {
+            tracing::warn!(tenant_slug, "tenant database request-time migration check skipped");
+        } else {
+            database
+                .migrate()
+                .await
+                .with_context(|| format!("failed to migrate tenant {tenant_slug} database"))?;
+        }
         database.ping().await?;
         self.pools
             .write()

@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 use futures_util::TryStreamExt;
 use sqlx::{
     Row,
-    postgres::{PgConnectOptions, PgPoolCopyExt},
+    postgres::{PgConnectOptions, PgPoolCopyExt, PgRow},
 };
 use supercampus_database::{Database, TenantDatabaseManager, validate_database_name};
 
@@ -19,7 +19,17 @@ async fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str).unwrap_or("migrate") {
         "migrate" => migrate_registered_databases().await,
         "split-control-plane" => split_control_plane().await,
+        "sync-control-plane" => sync_control_plane().await,
         "inspect-source" => inspect_source().await,
+        "route-existing" => {
+            let tenant_slug = args
+                .get(1)
+                .context("usage: migration-runner route-existing <tenant-slug> <database-name>")?;
+            let database_name = args
+                .get(2)
+                .context("usage: migration-runner route-existing <tenant-slug> <database-name>")?;
+            route_existing_tenant(tenant_slug, database_name).await
+        }
         "provision" => {
             let tenant_slug = args
                 .get(1)
@@ -30,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
             provision_tenant(tenant_slug, database_name).await
         }
         command => bail!(
-            "unknown command {command}; expected migrate, inspect-source, split-control-plane, or provision"
+            "unknown command {command}; expected migrate, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
 }
@@ -158,6 +168,186 @@ async fn split_control_plane() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn sync_control_plane() -> anyhow::Result<()> {
+    let source_url = required_environment("DATABASE_URL")?;
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let primary_tenant_slug =
+        env::var("PRIMARY_TENANT_SLUG").unwrap_or_else(|_| "tenant-local".to_owned());
+
+    let source_options = PgConnectOptions::from_str(&source_url).context("invalid DATABASE_URL")?;
+    let source_database_name = source_options
+        .get_database()
+        .context("DATABASE_URL must name the existing institution database")?
+        .to_owned();
+    validate_database_name(&source_database_name)?;
+    ensure_database_exists(&control_url).await?;
+
+    let source = Database::connect(&source_url).await?;
+    let control = Database::connect(&control_url).await?;
+    control.migrate().await?;
+
+    let tenant = sqlx::query(
+        r#"SELECT id, slug, code, name, city, status, created_at, updated_at
+           FROM platform.tenants
+           WHERE slug = $1 AND status = 'active'"#,
+    )
+    .bind(&primary_tenant_slug)
+    .fetch_optional(source.pool())
+    .await
+    .context("failed to read source institution")?
+    .with_context(|| format!("unknown active institution {primary_tenant_slug}"))?;
+
+    let tenant_id = tenant.try_get::<uuid::Uuid, _>("id")?;
+    let mut transaction = control.pool().begin().await?;
+    sqlx::query("DELETE FROM platform.tenant_databases WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM authz.user_roles WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM authz.role_permissions WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM authz.roles WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM authz.permission_definitions WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM identity.tenant_memberships WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(
+        r#"DELETE FROM identity.users
+           WHERE id IN (SELECT user_id FROM identity.tenant_memberships WHERE tenant_id = $1)"#,
+    )
+    .bind(tenant_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("DELETE FROM platform.tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+
+    sqlx::query(
+        r#"INSERT INTO platform.tenants
+               (id, slug, code, name, city, status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (slug) DO UPDATE SET
+               id = EXCLUDED.id,
+               code = EXCLUDED.code,
+               name = EXCLUDED.name,
+               city = EXCLUDED.city,
+               status = EXCLUDED.status,
+               updated_at = EXCLUDED.updated_at"#,
+    )
+    .bind(tenant_id)
+    .bind(tenant.try_get::<String, _>("slug")?)
+    .bind(tenant.try_get::<String, _>("code")?)
+    .bind(tenant.try_get::<String, _>("name")?)
+    .bind(tenant.try_get::<String, _>("city")?)
+    .bind(tenant.try_get::<String, _>("status")?)
+    .bind(tenant.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?)
+    .bind(tenant.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?)
+    .execute(&mut *transaction)
+    .await?;
+
+    let users = fetch_source_rows(
+        &source,
+        r#"SELECT id, email, password_hash, display_name, initials, account_type, active,
+                  profile, created_at, updated_at, last_login_at
+           FROM identity.users
+           WHERE id IN (SELECT user_id FROM identity.tenant_memberships WHERE tenant_id = $1)"#,
+        tenant_id,
+    )
+    .await?;
+    for row in users {
+        sqlx::query(
+            r#"INSERT INTO identity.users
+                   (id, email, password_hash, display_name, initials, account_type, active,
+                    profile, created_at, updated_at, last_login_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               ON CONFLICT (email) DO UPDATE SET
+                   id = EXCLUDED.id,
+                   password_hash = EXCLUDED.password_hash,
+                   display_name = EXCLUDED.display_name,
+                   initials = EXCLUDED.initials,
+                   account_type = EXCLUDED.account_type,
+                   active = EXCLUDED.active,
+                   profile = EXCLUDED.profile,
+                   updated_at = EXCLUDED.updated_at,
+                   last_login_at = EXCLUDED.last_login_at"#,
+        )
+        .bind(row.try_get::<uuid::Uuid, _>("id")?)
+        .bind(row.try_get::<String, _>("email")?)
+        .bind(row.try_get::<String, _>("password_hash")?)
+        .bind(row.try_get::<String, _>("display_name")?)
+        .bind(row.try_get::<String, _>("initials")?)
+        .bind(row.try_get::<String, _>("account_type")?)
+        .bind(row.try_get::<bool, _>("active")?)
+        .bind(row.try_get::<serde_json::Value, _>("profile")?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?)
+        .bind(row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_login_at")?)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    let memberships = fetch_source_rows(
+        &source,
+        r#"SELECT tenant_id, user_id, roles, active, is_primary, profile, created_at, updated_at
+           FROM identity.tenant_memberships
+           WHERE tenant_id = $1"#,
+        tenant_id,
+    )
+    .await?;
+    for row in memberships {
+        sqlx::query(
+            r#"INSERT INTO identity.tenant_memberships
+                   (tenant_id, user_id, roles, active, is_primary, profile, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+                   roles = EXCLUDED.roles,
+                   active = EXCLUDED.active,
+                   is_primary = EXCLUDED.is_primary,
+                   profile = EXCLUDED.profile,
+                   updated_at = EXCLUDED.updated_at"#,
+        )
+        .bind(row.try_get::<uuid::Uuid, _>("tenant_id")?)
+        .bind(row.try_get::<uuid::Uuid, _>("user_id")?)
+        .bind(row.try_get::<Vec<String>, _>("roles")?)
+        .bind(row.try_get::<bool, _>("active")?)
+        .bind(row.try_get::<bool, _>("is_primary")?)
+        .bind(row.try_get::<serde_json::Value, _>("profile")?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    sync_permission_definitions(&source, &mut transaction, tenant_id).await?;
+    sync_roles(&source, &mut transaction, tenant_id).await?;
+    sync_role_permissions(&source, &mut transaction, tenant_id).await?;
+    sync_user_roles(&source, &mut transaction, tenant_id).await?;
+
+    transaction.commit().await?;
+
+    let manager = TenantDatabaseManager::clustered(control, &control_url)?;
+    manager
+        .register(&primary_tenant_slug, &source_database_name)
+        .await?;
+    println!(
+        "control plane synced; institution {primary_tenant_slug} is routed to database {source_database_name}"
+    );
+    Ok(())
+}
+
 async fn provision_tenant(tenant_slug: &str, database_name: &str) -> anyhow::Result<()> {
     validate_database_name(database_name)?;
     let control_url = required_environment("CONTROL_DATABASE_URL")?;
@@ -171,7 +361,7 @@ async fn provision_tenant(tenant_slug: &str, database_name: &str) -> anyhow::Res
     tenant.migrate().await?;
 
     let row = sqlx::query(
-        r#"SELECT id, slug, code, name, city, status, settings, created_at, updated_at
+        r#"SELECT id, slug, code, name, city, status, created_at, updated_at
            FROM platform.tenants
            WHERE slug = $1 AND status = 'active'"#,
     )
@@ -187,8 +377,8 @@ async fn provision_tenant(tenant_slug: &str, database_name: &str) -> anyhow::Res
         .await?;
     sqlx::query(
         r#"INSERT INTO platform.tenants
-               (id, slug, code, name, city, status, settings, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+               (id, slug, code, name, city, status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
     )
     .bind(row.try_get::<uuid::Uuid, _>("id")?)
     .bind(row.try_get::<String, _>("slug")?)
@@ -196,7 +386,6 @@ async fn provision_tenant(tenant_slug: &str, database_name: &str) -> anyhow::Res
     .bind(row.try_get::<String, _>("name")?)
     .bind(row.try_get::<String, _>("city")?)
     .bind(row.try_get::<String, _>("status")?)
-    .bind(row.try_get::<serde_json::Value, _>("settings")?)
     .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?)
     .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?)
     .execute(&mut *transaction)
@@ -207,6 +396,194 @@ async fn provision_tenant(tenant_slug: &str, database_name: &str) -> anyhow::Res
     manager.register(tenant_slug, database_name).await?;
     manager.tenant(tenant_slug).await?;
     println!("institution {tenant_slug} provisioned in database {database_name}");
+    Ok(())
+}
+
+async fn route_existing_tenant(tenant_slug: &str, database_name: &str) -> anyhow::Result<()> {
+    validate_database_name(database_name)?;
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    control.migrate().await?;
+    let manager = TenantDatabaseManager::clustered(control, &control_url)?;
+    manager.register(tenant_slug, database_name).await?;
+    println!("institution {tenant_slug} routed to existing database {database_name}");
+    Ok(())
+}
+
+async fn fetch_source_rows(
+    source: &Database,
+    sql: &str,
+    tenant_id: uuid::Uuid,
+) -> anyhow::Result<Vec<PgRow>> {
+    sqlx::query(sql)
+        .bind(tenant_id)
+        .fetch_all(source.pool())
+        .await
+        .context("failed to fetch source control-plane rows")
+}
+
+async fn sync_permission_definitions(
+    source: &Database,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    let rows = fetch_source_rows(
+        source,
+        r#"SELECT tenant_id, permission_key, module_key, feature_key, action, display_name,
+                  description, active, created_at, updated_at, crud_actions
+           FROM authz.permission_definitions
+           WHERE tenant_id = $1"#,
+        tenant_id,
+    )
+    .await?;
+    for row in rows {
+        sqlx::query(
+            r#"INSERT INTO authz.permission_definitions
+                   (tenant_id, permission_key, module_key, feature_key, action, display_name,
+                    description, active, created_at, updated_at, crud_actions)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               ON CONFLICT (tenant_id, permission_key) DO UPDATE SET
+                   module_key = EXCLUDED.module_key,
+                   feature_key = EXCLUDED.feature_key,
+                   action = EXCLUDED.action,
+                   display_name = EXCLUDED.display_name,
+                   description = EXCLUDED.description,
+                   active = EXCLUDED.active,
+                   crud_actions = EXCLUDED.crud_actions,
+                   updated_at = EXCLUDED.updated_at"#,
+        )
+        .bind(row.try_get::<uuid::Uuid, _>("tenant_id")?)
+        .bind(row.try_get::<String, _>("permission_key")?)
+        .bind(row.try_get::<String, _>("module_key")?)
+        .bind(row.try_get::<String, _>("feature_key")?)
+        .bind(row.try_get::<String, _>("action")?)
+        .bind(row.try_get::<String, _>("display_name")?)
+        .bind(row.try_get::<String, _>("description")?)
+        .bind(row.try_get::<bool, _>("active")?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?)
+        .bind(row.try_get::<Vec<String>, _>("crud_actions")?)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn sync_roles(
+    source: &Database,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    let rows = fetch_source_rows(
+        source,
+        r#"SELECT id, tenant_id, role_key, name, team, scope_description, protected, active,
+                  created_by, updated_by, created_at, updated_at
+           FROM authz.roles
+           WHERE tenant_id = $1"#,
+        tenant_id,
+    )
+    .await?;
+    for row in rows {
+        sqlx::query(
+            r#"INSERT INTO authz.roles
+                   (id, tenant_id, role_key, name, team, scope_description, protected, active,
+                    created_by, updated_by, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+               ON CONFLICT (tenant_id, role_key) DO UPDATE SET
+                   id = EXCLUDED.id,
+                   name = EXCLUDED.name,
+                   team = EXCLUDED.team,
+                   scope_description = EXCLUDED.scope_description,
+                   protected = EXCLUDED.protected,
+                   active = EXCLUDED.active,
+                   updated_by = EXCLUDED.updated_by,
+                   updated_at = EXCLUDED.updated_at"#,
+        )
+        .bind(row.try_get::<uuid::Uuid, _>("id")?)
+        .bind(row.try_get::<uuid::Uuid, _>("tenant_id")?)
+        .bind(row.try_get::<String, _>("role_key")?)
+        .bind(row.try_get::<String, _>("name")?)
+        .bind(row.try_get::<String, _>("team")?)
+        .bind(row.try_get::<String, _>("scope_description")?)
+        .bind(row.try_get::<bool, _>("protected")?)
+        .bind(row.try_get::<bool, _>("active")?)
+        .bind(row.try_get::<String, _>("created_by")?)
+        .bind(row.try_get::<String, _>("updated_by")?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn sync_role_permissions(
+    source: &Database,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    let rows = fetch_source_rows(
+        source,
+        r#"SELECT tenant_id, role_id, permission_key, scope, constraints, granted_by, granted_at
+           FROM authz.role_permissions
+           WHERE tenant_id = $1"#,
+        tenant_id,
+    )
+    .await?;
+    for row in rows {
+        sqlx::query(
+            r#"INSERT INTO authz.role_permissions
+                   (tenant_id, role_id, permission_key, scope, constraints, granted_by, granted_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (tenant_id, role_id, permission_key) DO UPDATE SET
+                   scope = EXCLUDED.scope,
+                   constraints = EXCLUDED.constraints,
+                   granted_by = EXCLUDED.granted_by,
+                   granted_at = EXCLUDED.granted_at"#,
+        )
+        .bind(row.try_get::<uuid::Uuid, _>("tenant_id")?)
+        .bind(row.try_get::<uuid::Uuid, _>("role_id")?)
+        .bind(row.try_get::<String, _>("permission_key")?)
+        .bind(row.try_get::<String, _>("scope")?)
+        .bind(row.try_get::<serde_json::Value, _>("constraints")?)
+        .bind(row.try_get::<String, _>("granted_by")?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("granted_at")?)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn sync_user_roles(
+    source: &Database,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    let rows = fetch_source_rows(
+        source,
+        r#"SELECT tenant_id, user_id, role_id, assigned_by, assigned_at
+           FROM authz.user_roles
+           WHERE tenant_id = $1"#,
+        tenant_id,
+    )
+    .await?;
+    for row in rows {
+        sqlx::query(
+            r#"INSERT INTO authz.user_roles
+                   (tenant_id, user_id, role_id, assigned_by, assigned_at)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (tenant_id, user_id, role_id) DO UPDATE SET
+                   assigned_by = EXCLUDED.assigned_by,
+                   assigned_at = EXCLUDED.assigned_at"#,
+        )
+        .bind(row.try_get::<uuid::Uuid, _>("tenant_id")?)
+        .bind(row.try_get::<uuid::Uuid, _>("user_id")?)
+        .bind(row.try_get::<uuid::Uuid, _>("role_id")?)
+        .bind(row.try_get::<String, _>("assigned_by")?)
+        .bind(row.try_get::<chrono::DateTime<chrono::Utc>, _>("assigned_at")?)
+        .execute(&mut **transaction)
+        .await?;
+    }
     Ok(())
 }
 
@@ -295,10 +672,6 @@ async fn copy_control_plane_tenant(
         (
             "authz.user_roles",
             format!("SELECT * FROM authz.user_roles WHERE tenant_id = {tenant_id}"),
-        ),
-        (
-            "identity.auth_sessions",
-            format!("SELECT * FROM identity.auth_sessions WHERE tenant_id = {tenant_id}"),
         ),
     ];
 

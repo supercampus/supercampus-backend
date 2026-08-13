@@ -283,6 +283,12 @@ impl AppState {
     }
 
     pub async fn ready(&self) -> anyhow::Result<()> {
+        if std::env::var("SKIP_TENANT_DB_PING").as_deref() == Ok("true") {
+            if let Some(database) = &self.database {
+                database.ping().await?;
+            }
+            return Ok(());
+        }
         if let Some(databases) = &self.tenant_databases {
             databases.ping_registered().await?;
         } else if let Some(database) = &self.database {

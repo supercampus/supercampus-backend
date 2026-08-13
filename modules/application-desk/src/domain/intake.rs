@@ -96,11 +96,11 @@ pub fn evaluate_intake(
     existing: &[OnboardingCase],
     mode: IntakeTriggerMode,
 ) -> IntakeDecision {
-    let crm_application =
-        trigger.crm_lead_id.is_some() && trigger.admission_status == "APPLICATION";
+    let application_submission =
+        trigger.admission_status == "APPLICATION" && !trigger.application_id.is_empty();
     if mode == IntakeTriggerMode::OnConfirmed
         && trigger.admission_status != "CONFIRMED"
-        && !crm_application
+        && !application_submission
     {
         return IntakeDecision {
             create: false,

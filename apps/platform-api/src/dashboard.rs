@@ -100,6 +100,7 @@ mod tests {
     fn access(permissions: &[&str]) -> EffectiveAccess {
         EffectiveAccess {
             roles: Vec::new(),
+            portal_families: Vec::new(),
             permissions: permissions
                 .iter()
                 .map(|permission| permission.to_string())

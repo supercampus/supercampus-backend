@@ -259,7 +259,7 @@ fn intake_blocks_a_duplicate_applicant_but_allows_readmission_after_a_closed_cas
 }
 
 #[test]
-fn crm_application_stage_can_open_a_desk_case_before_admission_confirmation() {
+fn unsubmitted_crm_application_does_not_open_the_desk() {
     let mut application = trigger();
     application.admission_status = "APPLICATION".into();
     application.crm_lead_id = Some(uuid::Uuid::new_v4());
@@ -268,22 +268,35 @@ fn crm_application_stage_can_open_a_desk_case_before_admission_confirmation() {
         .insert("source".into(), serde_json::json!("Google Search"));
 
     let decision = evaluate_intake(&application, &[], IntakeTriggerMode::OnConfirmed);
-    assert!(decision.create);
+    assert!(!decision.create);
+    assert!(decision.reason.contains("not CONFIRMED"));
+}
 
-    let case = create_case(
-        &application,
-        &default_workflow(TENANT),
-        CreateCaseOptions {
-            id: "ONB-CRM-APPLICATION".into(),
-            now: now(),
-            assigned_to: None,
-        },
+#[test]
+fn submitted_crm_application_waits_for_offer_acceptance() {
+    let mut application = trigger();
+    application.admission_status = "SUBMITTED".into();
+    application.crm_lead_id = Some(uuid::Uuid::new_v4());
+    application.attributes.insert(
+        "handoffReason".into(),
+        serde_json::json!("application_submitted"),
     );
-    assert_eq!(case.crm_lead_id, application.crm_lead_id);
-    assert_eq!(
-        case.attributes.get("source"),
-        Some(&serde_json::json!("Google Search"))
-    );
+
+    let decision = evaluate_intake(&application, &[], IntakeTriggerMode::OnConfirmed);
+    assert!(!decision.create);
+    assert!(decision.reason.contains("not CONFIRMED"));
+}
+
+#[test]
+fn accepted_offer_opens_onboarding_even_when_finance_is_still_pending() {
+    let mut accepted = trigger();
+    accepted.fee_paid = false;
+    accepted
+        .attributes
+        .insert("handoffReason".into(), serde_json::json!("offer_accepted"));
+
+    let decision = evaluate_intake(&accepted, &[], IntakeTriggerMode::OnFeePaid);
+    assert!(decision.create);
 }
 
 #[test]

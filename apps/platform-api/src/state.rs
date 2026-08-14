@@ -80,6 +80,7 @@ pub struct AuthPrincipal {
 #[derive(Debug, Clone)]
 pub struct EffectiveAccess {
     pub roles: Vec<String>,
+    pub portal_families: Vec<String>,
     pub permissions: Vec<String>,
     pub scopes: HashMap<String, String>,
 }
@@ -578,6 +579,7 @@ impl AppState {
         &self,
         email: &str,
         password: &str,
+        tenant_slug: Option<&str>,
     ) -> anyhow::Result<Option<AuthenticatedIdentity>> {
         let email = email.trim().to_ascii_lowercase();
         if let Some(database) = &self.database {
@@ -589,12 +591,14 @@ impl AppState {
                    JOIN platform.tenants t ON t.id = m.tenant_id
                    WHERE u.email = $1
                      AND u.password_hash = crypt($2, u.password_hash)
+                     AND ($3::text IS NULL OR t.slug = $3)
                      AND u.active AND m.active AND t.status = 'active'
                    ORDER BY m.is_primary DESC, t.name
                    LIMIT 1"#,
             )
             .bind(&email)
             .bind(password)
+            .bind(tenant_slug)
             .fetch_optional(database.pool())
             .await
             .context("failed to authenticate identity")?;
@@ -636,14 +640,16 @@ impl AppState {
                 access.roles
             };
             student.role = roles.first().cloned().unwrap_or_default();
+            student.portal_families = access.portal_families;
             student.access = access.permissions;
             return Ok(Some(AuthenticatedIdentity { student, roles }));
         }
 
         let identities = self.identities.read().await;
-        let identity = identities
-            .values()
-            .find(|identity| identity.student.email == email);
+        let identity = identities.values().find(|identity| {
+            identity.student.email == email
+                && tenant_slug.is_none_or(|tenant| identity.student.tenant_id == tenant)
+        });
         Ok(identity
             .filter(|identity| identity.password == password)
             .map(|identity| AuthenticatedIdentity {
@@ -669,7 +675,7 @@ impl AppState {
     ) -> anyhow::Result<EffectiveAccess> {
         if let Some(database) = &self.database {
             let rows = sqlx::query(
-                r#"SELECT role.role_key, role_grant.permission_key, role_grant.scope,
+                r#"SELECT role.role_key, role.portal_family, role_grant.permission_key, role_grant.scope,
                           'allow'::text AS mode
                    FROM platform.tenants tenant
                    JOIN identity.tenant_memberships membership
@@ -687,7 +693,8 @@ impl AppState {
                        AND permission.active
                    WHERE tenant.slug = $1
                    UNION ALL
-                   SELECT NULL::text AS role_key, assignment.permission AS permission_key,
+                   SELECT NULL::text AS role_key, NULL::text AS portal_family,
+                          assignment.permission AS permission_key,
                           assignment.scope, assignment.mode
                    FROM platform.tenants tenant
                    JOIN authz.assignments assignment ON assignment.tenant_id = tenant.id
@@ -709,6 +716,7 @@ impl AppState {
             .context("failed to load effective tenant access")?;
 
             let mut roles = Vec::new();
+            let mut portal_families = Vec::new();
             let mut permissions = Vec::new();
             let mut scopes: HashMap<String, String> = HashMap::new();
             let mut denied_permissions = Vec::new();
@@ -718,6 +726,12 @@ impl AppState {
                     && !roles.contains(&role_key)
                 {
                     roles.push(role_key);
+                }
+                let portal_family: Option<String> = row.try_get("portal_family")?;
+                if let Some(portal_family) = portal_family
+                    && !portal_families.contains(&portal_family)
+                {
+                    portal_families.push(portal_family);
                 }
                 let permission_key: Option<String> = row.try_get("permission_key")?;
                 let scope: Option<String> = row.try_get("scope")?;
@@ -765,6 +779,7 @@ impl AppState {
 
             return Ok(EffectiveAccess {
                 roles,
+                portal_families,
                 permissions,
                 scopes,
             });
@@ -777,11 +792,13 @@ impl AppState {
         Ok(identity.map_or(
             EffectiveAccess {
                 roles: Vec::new(),
+                portal_families: Vec::new(),
                 permissions: Vec::new(),
                 scopes: HashMap::new(),
             },
             |identity| EffectiveAccess {
                 roles: identity.roles.clone(),
+                portal_families: vec![legacy_portal_family(&identity.student.role).into()],
                 permissions: vec!["*".into()],
                 scopes: HashMap::from([("*".into(), "all".into())]),
             },
@@ -945,7 +962,7 @@ impl AppState {
         let database = self.database.as_ref().context("PostgreSQL is required")?;
         let rows = sqlx::query(
             r#"SELECT role.id, role.role_key, role.name, role.team, role.scope_description,
-                      role.protected, role.active,
+                      role.portal_family, role.protected, role.active,
                       COALESCE((
                           SELECT jsonb_agg(jsonb_build_object(
                               'key', role_grant.permission_key,
@@ -973,6 +990,7 @@ impl AppState {
                     "name": row.try_get::<String, _>("name")?,
                     "team": row.try_get::<String, _>("team")?,
                     "scope": row.try_get::<String, _>("scope_description")?,
+                    "portalFamily": row.try_get::<String, _>("portal_family")?,
                     "protected": row.try_get::<bool, _>("protected")?,
                     "active": row.try_get::<bool, _>("active")?,
                     "permissions": row.try_get::<Value, _>("permissions")?,
@@ -992,9 +1010,9 @@ impl AppState {
         let tenant_id = ensure_tenant(database, tenant_slug).await?;
         let row = sqlx::query(
             r#"INSERT INTO authz.roles
-               (tenant_id, role_key, name, team, scope_description, created_by, updated_by)
-               VALUES ($1, $2, $3, $4, $5, $6, $6)
-               RETURNING id, role_key, name, team, scope_description, protected, active"#,
+               (tenant_id, role_key, name, team, scope_description, portal_family, created_by, updated_by)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+               RETURNING id, role_key, name, team, scope_description, portal_family, protected, active"#,
         )
         .bind(tenant_id)
         .bind(request.key.trim())
@@ -1005,6 +1023,7 @@ impl AppState {
             request.team.trim()
         })
         .bind(request.scope.trim())
+        .bind(validate_portal_family(&request.portal_family)?)
         .bind(actor_id)
         .fetch_one(database.pool())
         .await
@@ -1024,12 +1043,14 @@ impl AppState {
             r#"UPDATE authz.roles role
                SET name = COALESCE($3, role.name), team = COALESCE($4, role.team),
                    scope_description = COALESCE($5, role.scope_description),
-                   active = COALESCE($6, role.active), updated_by = $7, updated_at = now()
+                   active = COALESCE($6, role.active),
+                   portal_family = COALESCE($7, role.portal_family),
+                   updated_by = $8, updated_at = now()
                FROM platform.tenants tenant
                WHERE role.tenant_id = tenant.id AND tenant.slug = $1 AND role.id = $2
                  AND NOT role.protected
                RETURNING role.id, role.role_key, role.name, role.team,
-                         role.scope_description, role.protected, role.active"#,
+                         role.scope_description, role.portal_family, role.protected, role.active"#,
         )
         .bind(tenant_slug)
         .bind(role_id)
@@ -1037,6 +1058,13 @@ impl AppState {
         .bind(request.team.as_deref())
         .bind(request.scope.as_deref())
         .bind(request.active)
+        .bind(
+            request
+                .portal_family
+                .as_deref()
+                .map(validate_portal_family)
+                .transpose()?,
+        )
         .bind(actor_id)
         .fetch_optional(database.pool())
         .await
@@ -2031,10 +2059,31 @@ fn authorization_role_row(row: &PgRow, permissions: Value) -> anyhow::Result<Val
         "name": row.try_get::<String, _>("name")?,
         "team": row.try_get::<String, _>("team")?,
         "scope": row.try_get::<String, _>("scope_description")?,
+        "portalFamily": row.try_get::<String, _>("portal_family")?,
         "protected": row.try_get::<bool, _>("protected")?,
         "active": row.try_get::<bool, _>("active")?,
         "permissions": permissions,
     }))
+}
+
+fn validate_portal_family(value: &str) -> anyhow::Result<&str> {
+    match value.trim() {
+        "student" | "parent" | "staff" | "admin" => Ok(value.trim()),
+        _ => bail!("portal family must be student, parent, staff, or admin"),
+    }
+}
+
+fn legacy_portal_family(role_key: &str) -> &'static str {
+    let normalized = role_key.trim().to_ascii_lowercase();
+    if normalized == "student" {
+        "student"
+    } else if matches!(normalized.as_str(), "parent" | "guardian") {
+        "parent"
+    } else if normalized.contains("admin") {
+        "admin"
+    } else {
+        "staff"
+    }
 }
 
 async fn replace_user_roles(
@@ -2411,7 +2460,7 @@ fn default_navigation_sections() -> Vec<NavigationSection> {
         (
             "application-desk",
             "workspace",
-            "Application Desk",
+            "Admission Desk",
             "IdCard",
             &[],
             Some("application-desk"),
@@ -2634,6 +2683,7 @@ fn identity_student(input: IdentityStudentInput) -> AuthStudent {
         initials: initials(&name),
         name,
         role,
+        portal_families: Vec::new(),
         team: profile_string("team", ""),
         access,
         roll: profile_string("roll", ""),
@@ -2716,10 +2766,11 @@ async fn seed_identity(
     let protected = identity.role == "tenant_admin";
     let role_id: Uuid = sqlx::query_scalar(
         r#"INSERT INTO authz.roles
-           (tenant_id, role_key, name, team, scope_description, protected, created_by, updated_by)
-           VALUES ($1, $2, $3, $4, $5, $6, 'test-seeder', 'test-seeder')
+           (tenant_id, role_key, name, team, scope_description, portal_family, protected, created_by, updated_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'test-seeder', 'test-seeder')
            ON CONFLICT (tenant_id, role_key) DO UPDATE SET name = EXCLUDED.name,
-               team = EXCLUDED.team, active = true, updated_by = 'test-seeder', updated_at = now()
+               team = EXCLUDED.team, portal_family = EXCLUDED.portal_family,
+               active = true, updated_by = 'test-seeder', updated_at = now()
            RETURNING id"#,
     )
     .bind(tenant_id)
@@ -2727,6 +2778,7 @@ async fn seed_identity(
     .bind(humanize_identifier(identity.role))
     .bind(identity.team)
     .bind("Testing role configured from environment")
+    .bind(legacy_portal_family(identity.role))
     .bind(protected)
     .fetch_one(database.pool())
     .await
@@ -2765,7 +2817,9 @@ async fn seed_identity(
 
 fn access_scope_rank(scope: &str) -> u8 {
     match scope {
-        "all" => 3,
+        "all" => 5,
+        "institution" => 4,
+        "department" => 3,
         "assigned" => 2,
         "own" => 1,
         _ => 0,

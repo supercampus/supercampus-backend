@@ -1,4 +1,4 @@
-//! HTTP surface for the Application Desk.
+//! HTTP surface for the Admission Desk.
 
 pub mod handlers;
 pub mod routes;

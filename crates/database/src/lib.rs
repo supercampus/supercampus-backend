@@ -197,7 +197,10 @@ impl TenantDatabaseManager {
             .await
             .with_context(|| format!("failed to connect tenant {tenant_slug} database"))?;
         if std::env::var("SKIP_TENANT_DB_PING").as_deref() == Ok("true") {
-            tracing::warn!(tenant_slug, "tenant database request-time migration check skipped");
+            tracing::warn!(
+                tenant_slug,
+                "tenant database request-time migration check skipped"
+            );
         } else {
             database
                 .migrate()

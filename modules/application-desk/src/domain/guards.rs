@@ -32,18 +32,13 @@ impl GuardResult {
 /// Every mandatory document from the checklist is VERIFIED or WAIVED.
 fn mandatory_documents_satisfied(
     onboarding: &OnboardingCase,
-    definition: &WorkflowDefinition,
+    _: &WorkflowDefinition,
 ) -> GuardResult {
-    let outstanding: Vec<&str> = definition
-        .document_checklist
+    let outstanding: Vec<&str> = onboarding
+        .documents
         .iter()
-        .filter(|requirement| requirement.required)
-        .filter(|requirement| {
-            !onboarding.documents.iter().any(|record| {
-                record.document_type == requirement.document_type && record.state.is_satisfied()
-            })
-        })
-        .map(|requirement| requirement.label.as_str())
+        .filter(|record| record.required && !record.state.is_satisfied())
+        .map(|record| record.label.as_deref().unwrap_or(&record.document_type))
         .collect();
 
     if outstanding.is_empty() {

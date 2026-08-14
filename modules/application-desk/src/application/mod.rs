@@ -11,9 +11,10 @@ use supercampus_database::Database;
 
 use crate::{
     domain::{
-        ActionKind, ActionPayload, AdmissionTrigger, CreateCaseOptions, EngineContext,
-        OnboardingCase, OnboardingEventName, OnboardingStatus, apply_action, create_case,
-        engine::ApplicationFormUpdate, evaluate_intake, summarise_queues,
+        ActionKind, ActionPayload, AdmissionTrigger, AuditEntry, CreateCaseOptions, EngineContext,
+        OnboardingCase, OnboardingEventName, OnboardingStage, OnboardingStatus, apply_action,
+        apply_application_document_mapping, create_case, engine::ApplicationFormUpdate,
+        evaluate_intake, summarise_queues,
     },
     infrastructure::postgres::{
         DeskError, DeskSettings, PostgresDeskRepository, PostgresOnboardingServices,
@@ -52,6 +53,7 @@ impl ActorContext {
 pub struct DeskSnapshot {
     pub definition: Value,
     pub application_form: Option<Value>,
+    pub desk_form: Option<Value>,
     pub cases: Vec<OnboardingCase>,
     pub audit: Vec<Value>,
     pub events: Vec<Value>,
@@ -63,6 +65,7 @@ impl DeskSnapshot {
         json!({
             "definition": self.definition,
             "applicationForm": self.application_form,
+            "deskForm": self.desk_form,
             "cases": self.cases,
             "audit": self.audit,
             "events": self.events,
@@ -110,7 +113,16 @@ impl ApplicationDeskService {
                 .await?;
         let application_form =
             PostgresDeskRepository::published_application_form(&mut transaction, tenant_id).await?;
+        let desk_form =
+            PostgresDeskRepository::published_desk_form(&mut transaction, tenant_id).await?;
         let mut cases = PostgresDeskRepository::list_cases(&mut transaction, tenant_id).await?;
+        for onboarding in &mut cases {
+            hydrate_matching_application_schema(
+                &mut onboarding.attributes,
+                application_form.as_ref(),
+            );
+            apply_application_document_mapping(&mut onboarding.documents, &onboarding.attributes);
+        }
         if application_form.is_some() {
             for onboarding in &mut cases {
                 if onboarding.stage == crate::domain::OnboardingStage::DataReview {
@@ -129,13 +141,14 @@ impl ApplicationDeskService {
         Ok(build_snapshot(
             &definition,
             application_form,
+            desk_form,
             cases,
             audit,
             events,
         ))
     }
 
-    /// Open a case for a confirmed admission.
+    /// Open a review case for a confirmed admission.
     pub async fn open_case(
         &self,
         tenant_slug: &str,
@@ -161,10 +174,62 @@ impl ApplicationDeskService {
                     .insert("applicationFormId".into(), id.clone());
             }
         }
+        hydrate_matching_application_schema(&mut trigger.attributes, application_form.as_ref());
         let existing = PostgresDeskRepository::list_cases(&mut transaction, tenant_id).await?;
 
         let decision = evaluate_intake(&trigger, &existing, settings.intake_mode);
         if !decision.create {
+            // Offer acceptance is a later fact for the same application, not a
+            // reason to create a second case. Record it once on the existing
+            // authoritative case so the conversion remains traceable.
+            let offer_accepted = trigger
+                .attributes
+                .get("handoffReason")
+                .and_then(Value::as_str)
+                == Some("offer_accepted");
+            if offer_accepted && let Some(case_id) = decision.duplicate_of.as_deref() {
+                let mut onboarding =
+                    PostgresDeskRepository::lock_case(&mut transaction, tenant_id, case_id).await?;
+                let already_recorded = onboarding.attributes.contains_key("offerAcceptedAt");
+                let now = Utc::now();
+                for (key, value) in &trigger.attributes {
+                    onboarding.attributes.insert(key.clone(), value.clone());
+                }
+                apply_application_document_mapping(
+                    &mut onboarding.documents,
+                    &onboarding.attributes,
+                );
+                if !already_recorded {
+                    onboarding
+                        .attributes
+                        .insert("offerAcceptedAt".into(), json!(now));
+                    onboarding
+                        .attributes
+                        .insert("offerAcceptedBy".into(), json!(actor.user_id));
+                    PostgresDeskRepository::insert_audit(
+                        &mut transaction,
+                        tenant_id,
+                        &[AuditEntry {
+                            case_id: onboarding.id.clone(),
+                            actor: actor.user_id.clone(),
+                            action: "offer_accepted_handoff".into(),
+                            from_stage: onboarding.stage,
+                            to_stage: onboarding.stage,
+                            from_status: onboarding.status,
+                            to_status: onboarding.status,
+                            timestamp: now,
+                            reason: Some(
+                                "CRM offer acceptance linked to the existing application case"
+                                    .into(),
+                            ),
+                        }],
+                    )
+                    .await?;
+                }
+                onboarding.updated_at = now;
+                PostgresDeskRepository::upsert_case(&mut transaction, tenant_id, &onboarding)
+                    .await?;
+            }
             transaction.commit().await?;
             let snapshot = self.snapshot(tenant_slug).await?;
             return Ok((false, Some(decision.reason), snapshot));
@@ -188,12 +253,38 @@ impl ApplicationDeskService {
         );
 
         PostgresDeskRepository::upsert_case(&mut transaction, tenant_id, &onboarding).await?;
+        PostgresDeskRepository::insert_audit(
+            &mut transaction,
+            tenant_id,
+            &[AuditEntry {
+                case_id: onboarding.id.clone(),
+                actor: actor.user_id.clone(),
+                action: "offer_accepted_handoff".into(),
+                from_stage: OnboardingStage::New,
+                to_stage: OnboardingStage::DataReview,
+                from_status: OnboardingStatus::Active,
+                to_status: OnboardingStatus::Active,
+                timestamp: now,
+                reason: Some(
+                    "CRM offer accepted; Admission Desk review case created or reused".into(),
+                ),
+            }],
+        )
+        .await?;
         let event = crate::domain::OnboardingEvent {
             name: OnboardingEventName::OnboardingCreated,
             case_id: onboarding.id.clone(),
             tenant_id: onboarding.tenant_id.clone(),
             timestamp: now,
-            payload: serde_json::Map::new(),
+            payload: json!({
+                "trigger": "offer_accepted",
+                "crmLeadId": onboarding.crm_lead_id,
+                "applicationId": onboarding.application_id,
+                "offerId": onboarding.admission_id,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
         };
         PostgresDeskRepository::enqueue_events(&mut transaction, tenant_id, &[event]).await?;
         transaction.commit().await?;
@@ -221,8 +312,13 @@ impl ApplicationDeskService {
             PostgresDeskRepository::lock_case(&mut transaction, tenant_id, case_id).await?;
         let published_application =
             PostgresDeskRepository::published_application_form(&mut transaction, tenant_id).await?;
+        hydrate_matching_application_schema(
+            &mut onboarding.attributes,
+            published_application.as_ref(),
+        );
+        apply_application_document_mapping(&mut onboarding.documents, &onboarding.attributes);
         if let Some(update) = payload.application_form.as_ref() {
-            validate_application_update(update, published_application.as_ref())?;
+            validate_application_update(tenant_slug, update, published_application.as_ref())?;
         }
         if published_application.is_some()
             && onboarding.stage == crate::domain::OnboardingStage::DataReview
@@ -245,12 +341,25 @@ impl ApplicationDeskService {
 
         let services =
             PostgresOnboardingServices::new(transaction, tenant_id, settings, &actor.user_id);
-        let result = {
+        let mut result = {
             let context = EngineContext::new(actor.user_id.clone(), Utc::now(), &services)
                 .with_reason(reason)
                 .with_payload(payload);
             apply_action(&definition, &onboarding, action, &context).await
         };
+        if let Some(form) = published_application.as_ref()
+            && let Some(application) = result
+                .case
+                .attributes
+                .get_mut("applicationForm")
+                .and_then(Value::as_object_mut)
+        {
+            application.insert("formType".into(), json!("application"));
+            if let Some(schema) = form.get("schema") {
+                application.insert("schema".into(), schema.clone());
+            }
+            apply_application_document_mapping(&mut result.case.documents, &result.case.attributes);
+        }
         let mut transaction = services.into_transaction();
 
         // Facts the operator recorded survive a refusal. Approving step 1 of a
@@ -280,7 +389,44 @@ impl ApplicationDeskService {
     }
 }
 
+/// Backfill an immutable schema only when an older case references the exact
+/// form revision that is still published. This never applies a newer Form
+/// Builder revision to an older submission.
+fn hydrate_matching_application_schema(
+    attributes: &mut serde_json::Map<String, Value>,
+    published: Option<&Value>,
+) {
+    let Some(published) = published else {
+        return;
+    };
+    let Some(application) = attributes
+        .get_mut("applicationForm")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if application
+        .get("schema")
+        .is_some_and(|schema| !schema.is_null())
+    {
+        return;
+    }
+    let matches_form = application.get("formId").and_then(Value::as_str)
+        == published.get("id").and_then(Value::as_str);
+    let matches_version = application.get("formVersion").and_then(Value::as_i64)
+        == published.get("version").and_then(Value::as_i64);
+    if !matches_form || !matches_version {
+        return;
+    }
+    let Some(schema) = published.get("schema") else {
+        return;
+    };
+    application.insert("formType".into(), json!("application"));
+    application.insert("schema".into(), schema.clone());
+}
+
 fn validate_application_update(
+    tenant_slug: &str,
     update: &ApplicationFormUpdate,
     published: Option<&Value>,
 ) -> Result<(), DeskError> {
@@ -314,10 +460,13 @@ fn validate_application_update(
     let Some(sections) = sections else {
         return Ok(());
     };
-    let missing = sections
+    let fields = sections
         .iter()
         .filter_map(|section| section.get("fields").and_then(Value::as_array))
         .flatten()
+        .collect::<Vec<_>>();
+    let missing = fields
+        .iter()
         .filter(|field| {
             field
                 .get("required")
@@ -338,12 +487,63 @@ fn validate_application_update(
             (!present).then(|| label.to_owned())
         })
         .collect::<Vec<_>>();
-    if missing.is_empty() {
-        Ok(())
-    } else {
+    if !missing.is_empty() {
         Err(DeskError::Conflict(format!(
             "Complete required application field(s): {}",
             missing.join(", ")
+        )))
+    } else {
+        for field in fields {
+            let field_type = field
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !field_type.eq_ignore_ascii_case("upload")
+                && !field_type.eq_ignore_ascii_case("image upload")
+            {
+                continue;
+            }
+            let label = field.get("label").and_then(Value::as_str).unwrap_or("File");
+            let key = field
+                .get("key")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| application_field_key(label));
+            if let Some(value) = update.data.get(&key) {
+                validate_application_media(tenant_slug, value, label)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_application_media(
+    tenant_slug: &str,
+    value: &Value,
+    label: &str,
+) -> Result<(), DeskError> {
+    let object = value.as_object().ok_or_else(|| {
+        DeskError::Conflict(format!("{label} must be uploaded before submission"))
+    })?;
+    let expected_prefix = format!("supercampus/{tenant_slug}/media/");
+    let valid = object.get("storage").and_then(Value::as_str) == Some("cloudinary")
+        && object
+            .get("secureUrl")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.starts_with("https://"))
+        && object
+            .get("publicId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with(&expected_prefix))
+        && object
+            .get("fileName")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty());
+    if valid {
+        Ok(())
+    } else {
+        Err(DeskError::Conflict(format!(
+            "{label} does not contain a valid tenant Cloudinary upload"
         )))
     }
 }
@@ -382,6 +582,7 @@ fn application_value_present(value: &Value) -> bool {
 fn build_snapshot(
     definition: &crate::domain::WorkflowDefinition,
     application_form: Option<Value>,
+    desk_form: Option<Value>,
     cases: Vec<OnboardingCase>,
     audit: Vec<Value>,
     events: Vec<Value>,
@@ -390,6 +591,7 @@ fn build_snapshot(
     DeskSnapshot {
         definition: serde_json::to_value(definition).unwrap_or(Value::Null),
         application_form,
+        desk_form,
         queues: json!(queues),
         cases,
         audit,
@@ -423,8 +625,36 @@ mod application_form_validation_tests {
             status: "submitted".into(),
             data: json!({ "full_name": "Asha" }).as_object().cloned().unwrap(),
         };
-        let error = validate_application_update(&update, Some(&published_form())).unwrap_err();
+        let error = validate_application_update("tenant-local", &update, Some(&published_form()))
+            .unwrap_err();
         assert!(error.to_string().contains("Programme"));
+    }
+
+    #[test]
+    fn submitted_application_upload_must_belong_to_the_case_tenant() {
+        let form = json!({
+            "id": "form-1",
+            "version": 2,
+            "schema": { "sections": [{ "fields": [
+                { "key": "marksheet", "label": "Marksheet", "type": "Upload", "required": true }
+            ]}]}
+        });
+        let update = ApplicationFormUpdate {
+            form_id: "form-1".into(),
+            form_version: 2,
+            status: "submitted".into(),
+            data: json!({ "marksheet": {
+                "storage": "cloudinary",
+                "fileName": "marksheet.pdf",
+                "secureUrl": "https://res.cloudinary.com/example/image/upload/marksheet.pdf",
+                "publicId": "supercampus/another-tenant/media/marksheet"
+            }})
+            .as_object()
+            .cloned()
+            .unwrap(),
+        };
+        let error = validate_application_update("tenant-local", &update, Some(&form)).unwrap_err();
+        assert!(error.to_string().contains("tenant Cloudinary upload"));
     }
 
     #[test]
@@ -435,7 +665,48 @@ mod application_form_validation_tests {
             status: "draft".into(),
             data: serde_json::Map::new(),
         };
-        let error = validate_application_update(&update, Some(&published_form())).unwrap_err();
+        let error = validate_application_update("tenant-local", &update, Some(&published_form()))
+            .unwrap_err();
         assert!(error.to_string().contains("changed"));
+    }
+
+    #[test]
+    fn matching_legacy_submission_receives_its_published_schema() {
+        let mut attributes = json!({
+            "applicationForm": {
+                "formId": "form-1",
+                "formVersion": 2,
+                "status": "submitted",
+                "data": { "full_name": "Asha" }
+            }
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+
+        hydrate_matching_application_schema(&mut attributes, Some(&published_form()));
+
+        let application = attributes["applicationForm"].as_object().unwrap();
+        assert_eq!(application.get("formType"), Some(&json!("application")));
+        assert!(application.get("schema").is_some());
+    }
+
+    #[test]
+    fn newer_schema_is_not_attached_to_an_older_submission() {
+        let mut attributes = json!({
+            "applicationForm": {
+                "formId": "form-1",
+                "formVersion": 1,
+                "status": "submitted",
+                "data": { "full_name": "Asha" }
+            }
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+
+        hydrate_matching_application_schema(&mut attributes, Some(&published_form()));
+
+        assert!(attributes["applicationForm"].get("schema").is_none());
     }
 }

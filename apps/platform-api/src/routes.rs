@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use axum::{
     Extension, Json, Router,
-    extract::{Multipart, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -95,7 +95,10 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/me", get(me))
         .route("/auth/logout", post(logout))
         .route("/state", get(get_app_state).put(save_app_state))
-        .route("/media/upload", post(upload_media))
+        .route(
+            "/media/upload",
+            post(upload_media).layer(DefaultBodyLimit::max(crate::media::MULTIPART_BODY_LIMIT)),
+        )
         .nest("/v1", v1);
 
     Router::new()
@@ -103,14 +106,6 @@ pub fn router(state: AppState) -> Router {
         .route("/ready", get(ready))
         .nest("/api", api)
         .with_state(state)
-}
-
-async fn upload_media(
-    Extension(principal): Extension<AuthPrincipal>,
-    multipart: Multipart,
-) -> ApiResult<Json<ApiResponse<Value>>> {
-    let uploaded = crate::media::upload_to_cloudinary(multipart, &principal.student.tenant_id).await?;
-    Ok(Json(ApiResponse::new(uploaded)))
 }
 
 async fn health() -> Json<HealthDocument> {
@@ -127,6 +122,14 @@ async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         "status": "ready",
         "checks": { "runtime": "ok", "storage": state.storage_kind() }
     })))
+}
+
+async fn upload_media(
+    Extension(principal): Extension<AuthPrincipal>,
+    multipart: Multipart,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    let media = crate::media::upload(&principal.student.tenant_id, multipart).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(media))))
 }
 
 async fn api_index(State(state): State<AppState>) -> Json<ApiResponse<Value>> {
@@ -194,6 +197,7 @@ async fn bootstrap(
         user_id: principal.student.id,
         tenant_brand,
         roles: access.roles,
+        portal_families: access.portal_families,
         permissions: access.permissions,
         permission_scopes: access.scopes,
         workflows,
@@ -729,7 +733,7 @@ async fn login(
     Json(request): Json<LoginRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let identity = state
-        .authenticate_credentials(&request.email, &request.password)
+        .authenticate_credentials(&request.email, &request.password, None)
         .await?;
     let Some(identity) = identity else {
         return Err(ApiError::Unauthorized);
@@ -1167,6 +1171,7 @@ mod tests {
     fn access(permissions: &[&str]) -> EffectiveAccess {
         EffectiveAccess {
             roles: vec!["test_role".into()],
+            portal_families: vec!["staff".into()],
             permissions: permissions.iter().map(|value| (*value).into()).collect(),
             scopes: HashMap::new(),
         }
@@ -1199,5 +1204,10 @@ mod tests {
         assert!(can_access_module(&admin, "crm"));
         assert_eq!(module_read_permission(&admin, "fees").as_deref(), Some("*"));
         assert!(require_module_record_permission(&admin, "fees", "delete").is_ok());
+    }
+
+    #[test]
+    fn media_upload_is_always_authenticated() {
+        assert!(requires_authorization(&Method::POST, "/api/media/upload"));
     }
 }

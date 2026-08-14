@@ -47,11 +47,8 @@ impl CrmApiState {
         &self,
         context: &RequestContext,
         lead: &crate::domain::Lead,
-        application_submitted: bool,
+        handoff: ApplicationDeskHandoff,
     ) -> Result<(), CrmHttpError> {
-        if !application_submitted {
-            return Ok(());
-        }
         let databases = self
             .databases
             .as_ref()
@@ -60,6 +57,10 @@ impl CrmApiState {
             .tenant(&context.tenant)
             .await
             .map_err(|error| CrmHttpError(CrmError::Storage(error.to_string())))?;
+        let crm = CrmService::new(Some(database.clone()));
+        let submitted_application = crm
+            .latest_application_submission(&context.tenant, lead.id)
+            .await?;
         let desk = ApplicationDeskService::new(database);
         let actor = DeskActorContext {
             user_id: context.actor.user_id.clone(),
@@ -72,12 +73,45 @@ impl CrmApiState {
             .or_else(|| lead.academic.get("program"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let application_id = format!("CRM-APP-{}", lead.id);
+        let admission_id = format!("CRM-ADMISSION-{}", lead.id);
+        let (admission_status, handoff_reason) = match handoff {
+            ApplicationDeskHandoff::OfferAccepted => ("CONFIRMED", "offer_accepted"),
+        };
+        let mut attributes = json!({
+            "source": lead.source,
+            "sourceDetail": lead.source_detail,
+            "whatsapp": lead.whatsapp,
+            "parentPhone": lead.parent_phone,
+            "interest": lead.interest,
+            "priority": lead.priority,
+            "leadOwner": lead.assigned_to,
+            "preferredChannel": lead.preferred_channel,
+            "customFields": lead.custom_fields,
+            "crmStage": lead.stage_key,
+            "crmSubstate": lead.substate_key,
+            "leadCreatedAt": lead.created_at,
+            "handoffReason": handoff_reason,
+            "sourceReferences": {
+                "leadId": lead.id,
+                "applicationId": application_id,
+                "admissionId": admission_id,
+            },
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+        if let Some(application) = submitted_application {
+            attributes.insert("applicationForm".into(), application.clone());
+            attributes.insert("applicationFormHistory".into(), json!([application]));
+            attributes.insert("applicationFormRequired".into(), json!(true));
+        }
         let trigger = AdmissionTrigger {
             applicant_id: lead.id.to_string(),
-            application_id: format!("CRM-APP-{}", lead.id),
-            admission_id: format!("CRM-OFFER-{}", lead.id),
+            application_id: application_id.clone(),
+            admission_id: admission_id.clone(),
             crm_lead_id: Some(lead.id),
-            admission_status: "APPLICATION".into(),
+            admission_status: admission_status.into(),
             program_id,
             fee_paid: lead.fee_payment_confirmed,
             applicant: ApplicantSnapshot {
@@ -87,23 +121,7 @@ impl CrmApiState {
                 guardian_name: lead.parent_name.clone(),
                 guardian_email: None,
             },
-            attributes: json!({
-                "source": lead.source,
-                "sourceDetail": lead.source_detail,
-                "whatsapp": lead.whatsapp,
-                "parentPhone": lead.parent_phone,
-                "interest": lead.interest,
-                "priority": lead.priority,
-                "leadOwner": lead.assigned_to,
-                "preferredChannel": lead.preferred_channel,
-                "customFields": lead.custom_fields,
-                "crmStage": lead.stage_key,
-                "crmSubstate": lead.substate_key,
-                "leadCreatedAt": lead.created_at,
-            })
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
+            attributes,
             ..AdmissionTrigger::default()
         };
         desk.open_case(&context.tenant, &actor, trigger)
@@ -113,8 +131,19 @@ impl CrmApiState {
     }
 }
 
-fn opens_application_desk(to_stage: &str, to_substate: Option<&str>) -> bool {
-    to_stage == "application" && to_substate == Some("application_submitted")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplicationDeskHandoff {
+    OfferAccepted,
+}
+
+fn application_desk_handoff(
+    to_stage: &str,
+    to_substate: Option<&str>,
+) -> Option<ApplicationDeskHandoff> {
+    match (to_stage, to_substate) {
+        ("offer_status", Some("accepted")) => Some(ApplicationDeskHandoff::OfferAccepted),
+        _ => None,
+    }
 }
 
 pub struct RequestContext {
@@ -425,15 +454,16 @@ pub async fn move_stage(
     Json(request): Json<MoveStageRequest>,
 ) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
     let context = RequestContext::from_headers(&headers)?;
-    let application_submitted =
-        opens_application_desk(&request.to_stage, request.to_substate.as_deref());
+    let handoff = application_desk_handoff(&request.to_stage, request.to_substate.as_deref());
     let service = state.service(&context.tenant).await?;
     let moved = service
         .move_stage(&context.tenant, &context.actor, id, request)
         .await?;
-    state
-        .reflect_application_in_desk(&context, &moved, application_submitted)
-        .await?;
+    if let Some(handoff) = handoff {
+        state
+            .reflect_application_in_desk(&context, &moved, handoff)
+            .await?;
+    }
     let _ = state.realtime_wake.send(());
     Ok(ok(moved))
 }
@@ -602,13 +632,14 @@ pub async fn approve_move_request(
         .decide_stage_move(&context.tenant, &context.actor, id, true, request)
         .await?;
     if decision.status == "approved"
-        && opens_application_desk(&decision.to_stage, Some(&decision.to_substate))
+        && let Some(handoff) =
+            application_desk_handoff(&decision.to_stage, Some(&decision.to_substate))
     {
         let moved = service
             .get_lead(&context.tenant, &context.actor, decision.lead_id)
             .await?;
         state
-            .reflect_application_in_desk(&context, &moved, true)
+            .reflect_application_in_desk(&context, &moved, handoff)
             .await?;
     }
     let _ = state.realtime_wake.send(());
@@ -617,24 +648,36 @@ pub async fn approve_move_request(
 
 #[cfg(test)]
 mod application_desk_trigger_tests {
-    use super::opens_application_desk;
+    use super::{ApplicationDeskHandoff, application_desk_handoff};
 
     #[test]
-    fn application_desk_opens_only_after_application_submission() {
-        assert!(!opens_application_desk("application", None));
-        assert!(!opens_application_desk("application", Some("to_do")));
-        assert!(!opens_application_desk(
-            "application",
-            Some("application_in_progress")
-        ));
-        assert!(opens_application_desk(
-            "application",
-            Some("application_submitted")
-        ));
-        assert!(!opens_application_desk(
-            "application_status",
-            Some("awaiting_decision")
-        ));
+    fn admission_desk_opens_only_after_offer_acceptance() {
+        assert_eq!(application_desk_handoff("application", None), None);
+        assert_eq!(application_desk_handoff("application", Some("to_do")), None);
+        assert_eq!(
+            application_desk_handoff("application", Some("application_in_progress")),
+            None
+        );
+        assert_eq!(
+            application_desk_handoff("application", Some("application_submitted")),
+            None
+        );
+        assert_eq!(
+            application_desk_handoff("application_status", Some("awaiting_decision")),
+            None
+        );
+        assert_eq!(
+            application_desk_handoff("offer_status", Some("to_do")),
+            None
+        );
+        assert_eq!(
+            application_desk_handoff("offer_status", Some("accepted")),
+            Some(ApplicationDeskHandoff::OfferAccepted)
+        );
+        assert_eq!(
+            application_desk_handoff("offer_status", Some("rejected")),
+            None
+        );
     }
 }
 

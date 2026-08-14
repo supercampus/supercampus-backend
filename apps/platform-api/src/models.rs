@@ -53,6 +53,7 @@ pub struct BootstrapDocument {
     pub user_id: String,
     pub tenant_brand: Value,
     pub roles: Vec<String>,
+    pub portal_families: Vec<String>,
     pub permissions: Vec<String>,
     pub permission_scopes: HashMap<String, String>,
     pub workflows: Vec<WorkflowDefinition>,
@@ -166,6 +167,8 @@ pub struct CreateAuthorizationRoleRequest {
     pub team: String,
     #[serde(default)]
     pub scope: String,
+    #[serde(default = "default_portal_family")]
+    pub portal_family: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,6 +178,7 @@ pub struct UpdateAuthorizationRoleRequest {
     pub team: Option<String>,
     pub scope: Option<String>,
     pub active: Option<bool>,
+    pub portal_family: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +246,10 @@ fn default_permission_scope() -> String {
     "all".into()
 }
 
+fn default_portal_family() -> String {
+    "staff".into()
+}
+
 fn default_permission_mode() -> String {
     "allow".into()
 }
@@ -284,6 +292,8 @@ pub struct AuthStudent {
     pub initials: String,
     #[serde(default)]
     pub role: String,
+    #[serde(default)]
+    pub portal_families: Vec<String>,
     #[serde(default)]
     pub team: String,
     #[serde(default)]

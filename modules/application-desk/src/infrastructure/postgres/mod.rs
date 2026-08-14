@@ -1,4 +1,4 @@
-//! PostgreSQL adapters for the Application Desk.
+//! PostgreSQL adapters for the Admission Desk.
 //!
 //! Every query is tenant-scoped: `begin_tenant` resolves the institution slug to
 //! its uuid and sets `app.tenant_id` for the transaction, which the row level
@@ -280,6 +280,37 @@ impl PostgresDeskRepository {
                FROM crm.forms
                WHERE tenant_id = $1 AND status = 'published' AND deleted_at IS NULL
                  AND replace(lower(form_type), '-', '_') = 'application'
+               ORDER BY updated_at DESC LIMIT 1"#,
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+
+        row.map(|row| {
+            Ok(json!({
+                "id": row.try_get::<Uuid, _>("id")?.to_string(),
+                "name": row.try_get::<String, _>("name")?,
+                "formType": row.try_get::<String, _>("form_type")?,
+                "status": row.try_get::<String, _>("status")?,
+                "version": row.try_get::<i32, _>("version")?,
+                "schema": row.try_get::<Value, _>("schema")?,
+                "updatedAt": row.try_get::<chrono::DateTime<Utc>, _>("updated_at")?,
+            }))
+        })
+        .transpose()
+    }
+
+    /// The newest tenant-published form that configures Admission Desk
+    /// controls (academic mapping, section allocation, finance, and notes).
+    pub async fn published_desk_form(
+        transaction: &mut Transaction<'static, Postgres>,
+        tenant_id: Uuid,
+    ) -> Result<Option<Value>, DeskError> {
+        let row: Option<PgRow> = sqlx::query(
+            r#"SELECT id, name, form_type, status, version, schema, updated_at
+               FROM crm.forms
+               WHERE tenant_id = $1 AND status = 'published' AND deleted_at IS NULL
+                 AND replace(lower(form_type), '-', '_') = 'application_desk_controls'
                ORDER BY updated_at DESC LIMIT 1"#,
         )
         .bind(tenant_id)
@@ -922,6 +953,85 @@ impl OnboardingServices for PostgresOnboardingServices {
             .bind(onboarding.academic.academic_year.as_deref())
             .bind(onboarding.admission_category.as_deref())
             .fetch_one(&mut **guard)
+            .await
+            .map_err(service_error)?;
+
+            // Academic context is a separate canonical record. Desk mappings
+            // must carry Core Administration IDs, never names or local copies.
+            let required_id = |value: Option<&str>, field: &str| {
+                value
+                    .and_then(|raw| Uuid::parse_str(raw).ok())
+                    .ok_or_else(|| {
+                        ServiceError::new(format!(
+                            "{field} must reference a canonical Core Administration UUID"
+                        ))
+                    })
+            };
+            let academic_year_id = required_id(
+                onboarding.academic.academic_year.as_deref(),
+                "academicYearId",
+            )?;
+            let department_id =
+                required_id(onboarding.academic.department_id.as_deref(), "departmentId")?;
+            let programme_id =
+                required_id(onboarding.academic.program_id.as_deref(), "programmeId")?;
+            let batch_id = required_id(onboarding.academic.batch_id.as_deref(), "batchId")?;
+            let campus_id = onboarding
+                .academic
+                .campus_id
+                .as_deref()
+                .and_then(|value| Uuid::parse_str(value).ok());
+            let section_id = onboarding
+                .academic
+                .section_id
+                .as_deref()
+                .and_then(|value| Uuid::parse_str(value).ok());
+
+            let enrollment_id: Uuid = sqlx::query_scalar(
+                r#"INSERT INTO core.academic_enrollments
+                   (tenant_id, student_id, academic_year_id, campus_id,
+                    department_id, programme_id, batch_id, section_id, status,
+                    metadata)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9)
+                   ON CONFLICT (tenant_id, student_id, academic_year_id, programme_id)
+                   DO UPDATE SET
+                       campus_id = EXCLUDED.campus_id,
+                       department_id = EXCLUDED.department_id,
+                       batch_id = EXCLUDED.batch_id,
+                       section_id = EXCLUDED.section_id,
+                       status = 'active',
+                       updated_at = now()
+                   RETURNING id"#,
+            )
+            .bind(self.tenant_id)
+            .bind(student_id)
+            .bind(academic_year_id)
+            .bind(campus_id)
+            .bind(department_id)
+            .bind(programme_id)
+            .bind(batch_id)
+            .bind(section_id)
+            .bind(json!({ "onboardingCaseId": onboarding.id }))
+            .fetch_one(&mut **guard)
+            .await
+            .map_err(service_error)?;
+
+            sqlx::query(
+                r#"INSERT INTO application_desk.outbox_events
+                   (tenant_id, aggregate_id, event_type, payload)
+                   VALUES ($1, $2, 'AcademicEnrollmentCreated', $3)"#,
+            )
+            .bind(self.tenant_id)
+            .bind(&onboarding.id)
+            .bind(json!({
+                "studentId": student_id,
+                "enrollmentId": enrollment_id,
+                "academicYearId": academic_year_id,
+                "programmeId": programme_id,
+                "batchId": batch_id,
+                "sectionId": section_id,
+            }))
+            .execute(&mut **guard)
             .await
             .map_err(service_error)?;
 

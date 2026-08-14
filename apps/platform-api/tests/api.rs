@@ -113,6 +113,24 @@ async fn login_rejects_client_selected_tenant() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn login_ignores_pre_auth_tenant_header() {
+    let response = test_app()
+        .oneshot(
+            Request::post("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", "tenant-b")
+                .body(Body::from(format!(
+                    r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}"}}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn health_and_module_catalog_are_available() {
     let app = test_app();

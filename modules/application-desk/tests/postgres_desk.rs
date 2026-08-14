@@ -115,6 +115,74 @@ fn satisfying_payload() -> ActionPayload {
     .expect("payload")
 }
 
+async fn canonical_academic_payload(database: &Database, tenant: &str) -> ActionPayload {
+    let repository = PostgresDeskRepository::new(database.clone());
+    let (tenant_id, mut transaction) = repository.begin_tenant(tenant).await.expect("tenant");
+    let suffix = Uuid::new_v4().simple().to_string();
+    let campus_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO core.campuses (tenant_id, code, name) VALUES ($1, $2, 'Test Campus') RETURNING id",
+    )
+    .bind(tenant_id)
+    .bind(format!("C{}", &suffix[..8]))
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("campus");
+    let year_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO core.academic_years (tenant_id, code, name, starts_on, ends_on, status) VALUES ($1, $2, 'Test Year', DATE '2026-01-01', DATE '2026-12-31', 'draft') RETURNING id",
+    )
+    .bind(tenant_id)
+    .bind(format!("Y{}", &suffix[..8]))
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("year");
+    let department_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO core.departments (tenant_id, campus_id, code, name) VALUES ($1, $2, $3, 'Test Department') RETURNING id",
+    )
+    .bind(tenant_id)
+    .bind(campus_id)
+    .bind(format!("D{}", &suffix[..8]))
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("department");
+    let programme_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO core.programmes (tenant_id, department_id, code, name) VALUES ($1, $2, $3, 'Test Programme') RETURNING id",
+    )
+    .bind(tenant_id)
+    .bind(department_id)
+    .bind(format!("P{}", &suffix[..8]))
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("programme");
+    let batch_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO core.batches (tenant_id, programme_id, academic_year_id, code, name) VALUES ($1, $2, $3, $4, 'Test Batch') RETURNING id",
+    )
+    .bind(tenant_id)
+    .bind(programme_id)
+    .bind(year_id)
+    .bind(format!("B{}", &suffix[..8]))
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("batch");
+    let section_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO core.sections (tenant_id, batch_id, code, name) VALUES ($1, $2, $3, 'Test Section') RETURNING id",
+    )
+    .bind(tenant_id)
+    .bind(batch_id)
+    .bind(format!("S{}", &suffix[..8]))
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("section");
+    transaction.commit().await.expect("academic fixtures");
+
+    let mut payload = satisfying_payload();
+    payload.program_id = Some(programme_id.to_string());
+    payload.department_id = Some(department_id.to_string());
+    payload.batch_id = Some(batch_id.to_string());
+    payload.academic_year = Some(year_id.to_string());
+    payload.section_id = Some(section_id.to_string());
+    payload
+}
+
 #[tokio::test]
 #[ignore = "requires DATABASE_URL and writes temporary rows"]
 async fn concurrent_number_allocation_never_collides() {
@@ -168,6 +236,7 @@ async fn a_replayed_transition_never_creates_a_second_student() {
     let service = ApplicationDeskService::new(database.clone());
     let tenant = tenant_slug();
     let suffix = Uuid::new_v4().to_string();
+    let academic_payload = canonical_academic_payload(&database, &tenant).await;
 
     let (created, refusal, _) = service
         .open_case(&tenant, &actor(), trigger(&suffix))
@@ -193,7 +262,7 @@ async fn a_replayed_transition_never_creates_a_second_student() {
         assert!(guard_rail < 12, "did not reach STUDENT_CREATION");
         guard_rail += 1;
 
-        let mut payload = satisfying_payload();
+        let mut payload = academic_payload.clone();
         if current.stage == OnboardingStage::Approval {
             // Approve each configured step in turn.
             payload =
@@ -617,7 +686,7 @@ async fn lead_application_relationship_is_tenant_safe_stable_and_authoritative()
     .expect("relationship history");
     assert_eq!(
         relationships_after_readmission, 2,
-        "each Application Desk case keeps its own immutable conversion link"
+        "each Admission Desk case keeps its own immutable conversion link"
     );
     transaction.commit().await.expect("commit assertions");
 }

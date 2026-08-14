@@ -476,7 +476,7 @@ async fn sync_roles(
 ) -> anyhow::Result<()> {
     let rows = fetch_source_rows(
         source,
-        r#"SELECT id, tenant_id, role_key, name, team, scope_description, protected, active,
+        r#"SELECT id, tenant_id, role_key, name, team, scope_description, portal_family, protected, active,
                   created_by, updated_by, created_at, updated_at
            FROM authz.roles
            WHERE tenant_id = $1"#,
@@ -486,14 +486,15 @@ async fn sync_roles(
     for row in rows {
         sqlx::query(
             r#"INSERT INTO authz.roles
-                   (id, tenant_id, role_key, name, team, scope_description, protected, active,
+                   (id, tenant_id, role_key, name, team, scope_description, portal_family, protected, active,
                     created_by, updated_by, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                ON CONFLICT (tenant_id, role_key) DO UPDATE SET
                    id = EXCLUDED.id,
                    name = EXCLUDED.name,
                    team = EXCLUDED.team,
                    scope_description = EXCLUDED.scope_description,
+                   portal_family = EXCLUDED.portal_family,
                    protected = EXCLUDED.protected,
                    active = EXCLUDED.active,
                    updated_by = EXCLUDED.updated_by,
@@ -505,6 +506,7 @@ async fn sync_roles(
         .bind(row.try_get::<String, _>("name")?)
         .bind(row.try_get::<String, _>("team")?)
         .bind(row.try_get::<String, _>("scope_description")?)
+        .bind(row.try_get::<String, _>("portal_family")?)
         .bind(row.try_get::<bool, _>("protected")?)
         .bind(row.try_get::<bool, _>("active")?)
         .bind(row.try_get::<String, _>("created_by")?)

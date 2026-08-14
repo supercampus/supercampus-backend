@@ -1,6 +1,6 @@
-//! Application Desk — core domain types.
+//! Admission Desk — core domain types.
 //!
-//! The Application Desk is an onboarding *orchestration* layer: it owns the
+//! The Admission Desk is an onboarding *orchestration* layer: it owns the
 //! [`OnboardingCase`] and nothing else. Every other entity referenced here
 //! (applicant, student, fee structure, user account) is owned by another module
 //! and is referred to by id only.
@@ -204,9 +204,30 @@ pub struct DocumentRequirement {
 pub struct DocumentRecord {
     #[serde(rename = "type")]
     pub document_type: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub required: bool,
     pub state: DocumentState,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub file_id: Option<String>,
+    /// Immutable Cloudinary metadata copied from the submitted Application form.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub secure_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub uploaded_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_form_field_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_submission_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_form_version: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub verified_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]

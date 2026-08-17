@@ -1197,12 +1197,13 @@ impl AppState {
             _ => error.into(),
         })?;
         let role_id: Uuid = row.try_get("id")?;
-        for surface in request
+        let surfaces = request
             .surfaces
             .iter()
             .map(|surface| surface.trim())
-            .collect::<HashSet<_>>()
-        {
+            .chain(["website", "app"])
+            .collect::<HashSet<_>>();
+        for surface in surfaces {
             sqlx::query(
                 r#"INSERT INTO authz.role_surfaces
                    (tenant_id, role_id, surface, enabled_by)

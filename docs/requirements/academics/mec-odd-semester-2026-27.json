@@ -1,0 +1,90 @@
+{
+  "institutionCode": "MEC",
+  "academicYear": "2026-2027",
+  "term": "III",
+  "source": "Odd Sem Time Table-26-27.docx",
+  "workingDays": [1, 2, 3, 4, 5],
+  "requiredSectionPeriodsPerWeek": 35,
+  "slots": [
+    { "sequence": 1, "instructionalSequence": 1, "label": "I", "type": "instructional", "startsAt": "08:30", "endsAt": "09:20" },
+    { "sequence": 2, "instructionalSequence": 2, "label": "II", "type": "instructional", "startsAt": "09:20", "endsAt": "10:10" },
+    { "sequence": 3, "label": "Break", "type": "break", "startsAt": "10:10", "endsAt": "10:30" },
+    { "sequence": 4, "instructionalSequence": 3, "label": "III", "type": "instructional", "startsAt": "10:30", "endsAt": "11:20" },
+    { "sequence": 5, "instructionalSequence": 4, "label": "IV", "type": "instructional", "startsAt": "11:20", "endsAt": "12:10" },
+    { "sequence": 6, "label": "Lunch", "type": "lunch", "startsAt": "12:10", "endsAt": "13:00" },
+    { "sequence": 7, "instructionalSequence": 5, "label": "V", "type": "instructional", "startsAt": "13:00", "endsAt": "13:50" },
+    { "sequence": 8, "instructionalSequence": 6, "label": "VI", "type": "instructional", "startsAt": "13:50", "endsAt": "14:40" },
+    { "sequence": 9, "instructionalSequence": 7, "label": "VII", "type": "instructional", "startsAt": "14:40", "endsAt": "15:30" }
+  ],
+  "roomInventory": {
+    "totalSpaces": 18,
+    "requiresCapacityBeforeImport": false,
+    "readyForImport": true,
+    "rooms": [
+      { "code": "AIDS-CLASS", "name": "AI & DS Department Room", "departmentCode": "AIDS", "roomType": "classroom", "capacity": 60 },
+      { "code": "CSBS-CLASS", "name": "CSBS Department Room", "departmentCode": "CSBS", "roomType": "classroom", "capacity": 60 },
+      { "code": "CSE-CLASS", "name": "CSE Department Room", "departmentCode": "CSE", "roomType": "classroom", "capacity": 60 },
+      { "code": "AIML-CLASS", "name": "AI & ML Department Room", "departmentCode": "AIML", "roomType": "classroom", "capacity": 60 },
+      { "code": "CYBER-CLASS", "name": "Cyber Security Department Room", "departmentCode": "CYBER", "roomType": "classroom", "capacity": 60 },
+      { "code": "IT-CLASS", "name": "IT Department Room", "departmentCode": "IT", "roomType": "classroom", "capacity": 60 },
+      { "code": "TUT-01", "name": "Tutorial Room 1", "departmentCode": null, "roomType": "tutorial_room", "capacity": 50 },
+      { "code": "TUT-02", "name": "Tutorial Room 2", "departmentCode": null, "roomType": "tutorial_room", "capacity": 50 },
+      { "code": "COMP-LAB-01", "name": "Computer Lab 1", "departmentCode": null, "roomType": "computer_lab", "capacity": 50 },
+      { "code": "COMP-LAB-02", "name": "Computer Lab 2", "departmentCode": null, "roomType": "computer_lab", "capacity": 50 },
+      { "code": "CHEM-LAB", "name": "Chemistry Lab", "departmentCode": null, "roomType": "chemistry_lab", "capacity": 25 },
+      { "code": "PHY-LAB", "name": "Physics Lab", "departmentCode": null, "roomType": "physics_lab", "capacity": 25 },
+      { "code": "MECH-WORKSHOP", "name": "Mechanical Workshop Lab", "departmentCode": "MECH", "roomType": "workshop", "capacity": 100 },
+      { "code": "LIBRARY", "name": "Library", "departmentCode": null, "roomType": "library", "capacity": 48 },
+      { "code": "STAFF-01", "name": "Staff Room 1", "departmentCode": null, "roomType": "staff_room", "capacity": 20 },
+      { "code": "STAFF-02", "name": "Staff Room 2", "departmentCode": null, "roomType": "staff_room", "capacity": 20 },
+      { "code": "SEMINAR-01", "name": "Seminar Hall 1", "departmentCode": null, "roomType": "seminar_hall", "capacity": 200 },
+      { "code": "SEMINAR-02", "name": "Seminar Hall 2", "departmentCode": null, "roomType": "seminar_hall", "capacity": 200 }
+    ]
+  },
+  "offeringWeeklyTotals": {
+    "CSE": { "MA25C08": 5, "CS25C11": 6, "CS25C10": 4, "CS25C08": 7, "CS25C09": 7, "EN25C03": 3, "SKILL_DEVELOPMENT": 2, "LIBRARY": 1 },
+    "CYBER": { "MA25C08": 5, "CS25C11": 6, "CS25C10": 4, "CS25C08": 7, "CS25C09": 7, "EN25C03": 3, "SKILL_DEVELOPMENT": 2, "LIBRARY": 1 },
+    "AIML": { "MA25C08": 5, "CS25C10": 4, "CS25C08": 7, "CS25C09": 7, "CS25C11": 6, "EN25C03": 3, "SKILL_DEVELOPMENT": 2, "LIBRARY": 1 },
+    "AIDS": { "MA25C08": 5, "CS25C08": 7, "CS25C09": 7, "AD25C01": 5, "CS25C11": 5, "EN25C03": 3, "SKILL_DEVELOPMENT": 2, "LIBRARY": 1 },
+    "IT": { "MA25C08": 5, "CW25201": 4, "CS25C08": 7, "CS25C07": 7, "IT25301": 6, "EN25C03": 3, "SKILL_DEVELOPMENT": 2, "LIBRARY": 1 },
+    "CSBS": { "MA25C08": 6, "MG25301": 6, "CS25C08": 8, "CS25C09": 8, "EN25C03": 3, "SKILL_DEVELOPMENT": 2, "LIBRARY": 2 }
+  },
+  "offeringWorkloadSplits": {
+    "CSE": {
+      "CS25C11": { "class": 4, "laboratory": 2 },
+      "CS25C08": { "class": 4, "laboratory": 3 },
+      "CS25C09": { "class": 4, "laboratory": 3 },
+      "EN25C03": { "laboratory": 3 }
+    },
+    "CYBER": {
+      "CS25C11": { "class": 4, "laboratory": 2 },
+      "CS25C08": { "class": 4, "laboratory": 3 },
+      "CS25C09": { "class": 4, "laboratory": 3 },
+      "EN25C03": { "laboratory": 3 }
+    },
+    "AIML": {
+      "CS25C11": { "class": 4, "laboratory": 2 },
+      "CS25C08": { "class": 4, "laboratory": 3 },
+      "CS25C09": { "class": 4, "laboratory": 3 },
+      "EN25C03": { "laboratory": 3 }
+    },
+    "AIDS": {
+      "CS25C08": { "class": 4, "laboratory": 3 },
+      "CS25C09": { "class": 4, "laboratory": 3 },
+      "AD25C01": { "class": 3, "laboratory": 2 },
+      "CS25C11": { "class": 3, "laboratory": 2 },
+      "EN25C03": { "laboratory": 3 }
+    },
+    "IT": {
+      "CS25C08": { "class": 4, "laboratory": 3 },
+      "CS25C07": { "class": 4, "laboratory": 3 },
+      "IT25301": { "class": 4, "laboratory": 2 },
+      "EN25C03": { "laboratory": 3 }
+    },
+    "CSBS": {
+      "CS25C08": { "class": 5, "laboratory": 3 },
+      "CS25C09": { "class": 5, "laboratory": 3 },
+      "EN25C03": { "laboratory": 3 }
+    }
+  }
+}

@@ -27,12 +27,27 @@ struct CloudinaryConfig {
 
 impl CloudinaryConfig {
     fn from_environment() -> anyhow::Result<Self> {
-        Ok(Self {
-            cloud_name: required_environment("CLOUDINARY_CLOUD_NAME")?,
-            api_key: required_environment("CLOUDINARY_API_KEY")?,
-            api_secret: required_environment("CLOUDINARY_API_SECRET")?,
-        })
+        let individual = (
+            optional_environment("CLOUDINARY_CLOUD_NAME"),
+            optional_environment("CLOUDINARY_API_KEY"),
+            optional_environment("CLOUDINARY_API_SECRET"),
+        );
+        match individual {
+            (Some(cloud_name), Some(api_key), Some(api_secret)) => Ok(Self {
+                cloud_name,
+                api_key,
+                api_secret,
+            }),
+            (None, None, None) => parse_cloudinary_url(&required_environment("CLOUDINARY_URL")?),
+            _ => bail!(
+                "set all of CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET, or set CLOUDINARY_URL"
+            ),
+        }
     }
+}
+
+pub fn validate_configuration() -> anyhow::Result<()> {
+    CloudinaryConfig::from_environment().map(|_| ())
 }
 
 #[derive(Debug)]
@@ -159,6 +174,9 @@ async fn upload_to_cloudinary(
         config.cloud_name
     );
     let client = reqwest::Client::builder()
+        // Cloudinary must follow the host OS trust store. This keeps TLS
+        // verification enabled while supporting managed Windows certificates.
+        .use_native_tls()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .context("Cloudinary HTTP client could not be created")?;
@@ -180,11 +198,55 @@ async fn upload_to_cloudinary(
 }
 
 fn required_environment(name: &str) -> anyhow::Result<String> {
+    optional_environment(name).ok_or_else(|| anyhow!("{name} is required for media uploads"))
+}
+
+fn optional_environment(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("{name} is required for media uploads"))
+}
+
+fn parse_cloudinary_url(value: &str) -> anyhow::Result<CloudinaryConfig> {
+    let authority = value
+        .strip_prefix("cloudinary://")
+        .ok_or_else(|| anyhow!("CLOUDINARY_URL must start with cloudinary://"))?;
+    let (credentials, cloud_name) = authority
+        .rsplit_once('@')
+        .ok_or_else(|| anyhow!("CLOUDINARY_URL must contain credentials and a cloud name"))?;
+    let (api_key, api_secret) = credentials
+        .split_once(':')
+        .ok_or_else(|| anyhow!("CLOUDINARY_URL must contain an API key and secret"))?;
+    let cloud_name = cloud_name.split(['/', '?', '#']).next().unwrap_or_default();
+    if api_key.is_empty() || api_secret.is_empty() || cloud_name.is_empty() {
+        bail!("CLOUDINARY_URL contains an empty API key, secret, or cloud name");
+    }
+    Ok(CloudinaryConfig {
+        cloud_name: percent_decode(cloud_name)?,
+        api_key: percent_decode(api_key)?,
+        api_secret: percent_decode(api_secret)?,
+    })
+}
+
+fn percent_decode(value: &str) -> anyhow::Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                bail!("CLOUDINARY_URL contains invalid percent encoding");
+            }
+            let pair = std::str::from_utf8(&bytes[index + 1..index + 3])?;
+            decoded.push(u8::from_str_radix(pair, 16).context("invalid percent encoding")?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).context("CLOUDINARY_URL contains invalid UTF-8")
 }
 
 fn tenant_folder(tenant_id: &str) -> ApiResult<String> {
@@ -263,5 +325,14 @@ mod tests {
             ),
             "cbe75e617563de8575aa0dbc9ca3be2d7e7cafb1"
         );
+    }
+
+    #[test]
+    fn parses_the_standard_cloudinary_url() {
+        let config = parse_cloudinary_url("cloudinary://123456:secret%2Fvalue@campus-cloud")
+            .expect("cloudinary url");
+        assert_eq!(config.cloud_name, "campus-cloud");
+        assert_eq!(config.api_key, "123456");
+        assert_eq!(config.api_secret, "secret/value");
     }
 }

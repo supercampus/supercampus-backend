@@ -60,6 +60,7 @@ impl Default for DeskSettings {
 /// archived CRM record; terminal application outcomes do synchronize.
 fn crm_projection<'a>(
     status: OnboardingStatus,
+    desk_stage: crate::domain::OnboardingStage,
     current_stage: &'a str,
     current_substate: &'a str,
     new_relationship: bool,
@@ -70,7 +71,9 @@ fn crm_projection<'a>(
         | OnboardingStatus::Cancelled
         | OnboardingStatus::Withdrawn
         | OnboardingStatus::Expired => ("offer_status", "rejected"),
-        _ if current_stage == "application" => (current_stage, current_substate),
+        _ if desk_stage <= crate::domain::OnboardingStage::DataReview => {
+            ("application", "application_submitted")
+        }
         _ if new_relationship
             && current_stage == "offer_status"
             && matches!(current_substate, "accepted" | "rejected") =>
@@ -96,15 +99,33 @@ mod application_projection_tests {
     #[test]
     fn active_application_advances_only_an_earlier_crm_stage() {
         assert_eq!(
-            crm_projection(OnboardingStatus::Active, "application", "to_do", true),
-            ("application", "to_do")
+            crm_projection(
+                OnboardingStatus::Active,
+                crate::domain::OnboardingStage::DataReview,
+                "qualified",
+                "converted",
+                true
+            ),
+            ("application", "application_submitted")
         );
         assert_eq!(
-            crm_projection(OnboardingStatus::Active, "qualified", "eligible", true),
+            crm_projection(
+                OnboardingStatus::Active,
+                crate::domain::OnboardingStage::IdentityVerification,
+                "application",
+                "application_submitted",
+                false
+            ),
             ("application_status", "awaiting_decision")
         );
         assert_eq!(
-            crm_projection(OnboardingStatus::Active, "offer_status", "to_do", false),
+            crm_projection(
+                OnboardingStatus::Active,
+                crate::domain::OnboardingStage::IdentityVerification,
+                "offer_status",
+                "to_do",
+                false
+            ),
             ("offer_status", "to_do")
         );
     }
@@ -114,6 +135,7 @@ mod application_projection_tests {
         assert_eq!(
             crm_projection(
                 OnboardingStatus::Completed,
+                crate::domain::OnboardingStage::Completed,
                 "application_status",
                 "awaiting_decision",
                 false,
@@ -123,6 +145,7 @@ mod application_projection_tests {
         assert_eq!(
             crm_projection(
                 OnboardingStatus::Withdrawn,
+                crate::domain::OnboardingStage::DataReview,
                 "application_status",
                 "awaiting_decision",
                 false,
@@ -134,7 +157,13 @@ mod application_projection_tests {
     #[test]
     fn a_new_readmission_resets_a_closed_offer_without_rewriting_history() {
         assert_eq!(
-            crm_projection(OnboardingStatus::Active, "offer_status", "rejected", true),
+            crm_projection(
+                OnboardingStatus::Active,
+                crate::domain::OnboardingStage::IdentityVerification,
+                "offer_status",
+                "rejected",
+                true
+            ),
             ("application_status", "awaiting_decision")
         );
     }
@@ -484,6 +513,7 @@ impl PostgresDeskRepository {
                     let global_status_data: Value = current.try_get("global_status_data")?;
                     let (stage, substate) = crm_projection(
                         onboarding.status,
+                        onboarding.stage,
                         &from_stage,
                         &from_substate,
                         linked.rows_affected() == 1,

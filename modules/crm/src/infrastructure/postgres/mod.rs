@@ -357,6 +357,66 @@ impl PostgresCrmRepository {
         Ok(())
     }
 
+    pub async fn delete_lead_with_audit(
+        &self,
+        tenant_slug: &str,
+        lead_id: Uuid,
+        reason: &str,
+        actor_id: &str,
+        actor_role: &str,
+    ) -> Result<(), CrmError> {
+        let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
+        let lead = sqlx::query(
+            "SELECT to_jsonb(l) AS snapshot, full_name FROM crm.leads l WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(lead_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(CrmError::NotFound)?;
+        let snapshot: Value = lead.try_get("snapshot")?;
+        let lead_name: String = lead.try_get("full_name")?;
+
+        sqlx::query(
+            r#"INSERT INTO crm.lead_deletion_audit
+               (tenant_id, lead_id, lead_snapshot, reason, deleted_by, deleted_by_role)
+               VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind(tenant_id)
+        .bind(lead_id)
+        .bind(snapshot)
+        .bind(reason)
+        .bind(actor_id)
+        .bind(actor_role)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            "UPDATE crm.leads SET deleted_at = now(), updated_at = now() WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(lead_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        self.insert_event(
+            &mut transaction,
+            tenant_id,
+            lead_id,
+            "lead.deleted",
+            json!({
+                "leadId": lead_id,
+                "leadName": lead_name,
+                "reason": reason,
+                "byUser": actor_id,
+                "byRole": actor_role,
+            }),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn assign(
         &self,
         tenant_slug: &str,
@@ -1679,6 +1739,263 @@ impl PostgresCrmRepository {
         rows.iter().map(row_to_form).collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_application_invitation(
+        &self,
+        tenant_slug: &str,
+        lead_id: Uuid,
+        form_id: Uuid,
+        token: Uuid,
+        otp_hash: &str,
+        channel: &str,
+        contact: &str,
+        expires_at: DateTime<Utc>,
+        actor_id: &str,
+        otp: &str,
+    ) -> Result<Value, CrmError> {
+        let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
+        sqlx::query(
+            r#"UPDATE crm.application_invitations
+               SET status = 'revoked', updated_at = now()
+               WHERE tenant_id = $1 AND lead_id = $2 AND status IN ('issued', 'verified')"#,
+        )
+        .bind(tenant_id)
+        .bind(lead_id)
+        .execute(&mut *transaction)
+        .await?;
+        let row = sqlx::query(
+            r#"INSERT INTO crm.application_invitations
+               (tenant_id, lead_id, form_id, token, otp_hash, channel, contact,
+                expires_at, created_by)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               RETURNING id, token, expires_at, status"#,
+        )
+        .bind(tenant_id)
+        .bind(lead_id)
+        .bind(form_id)
+        .bind(token)
+        .bind(otp_hash)
+        .bind(channel)
+        .bind(contact)
+        .bind(expires_at)
+        .bind(actor_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let tenant_code: String =
+            sqlx::query_scalar("SELECT code FROM platform.tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        let domain_key = tenant_code
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_owned();
+        let application_url =
+            format!("https://application.{domain_key}.supercampus.ai/apply/{token}");
+        self.queue_communication(
+            &mut transaction,
+            tenant_id,
+            lead_id,
+            channel,
+            Some("application_invitation"),
+            Some("Complete your college application"),
+            json!({
+                "applicationUrl": application_url,
+                "otp": otp,
+                "expiresAt": expires_at,
+                "message": format!("Complete your application: {application_url}. OTP: {otp}")
+            }),
+            None,
+            actor_id,
+        )
+        .await?;
+        self.insert_event(
+            &mut transaction,
+            tenant_id,
+            lead_id,
+            "application.invitation_issued",
+            json!({
+                "invitationId": row.try_get::<Uuid, _>("id")?,
+                "formId": form_id,
+                "channel": channel,
+                "expiresAt": expires_at
+            }),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(json!({
+            "id": row.try_get::<Uuid, _>("id")?,
+            "token": row.try_get::<Uuid, _>("token")?,
+            "applicationUrl": application_url,
+            "channel": channel,
+            "contact": contact,
+            "status": row.try_get::<String, _>("status")?,
+            "expiresAt": row.try_get::<DateTime<Utc>, _>("expires_at")?
+        }))
+    }
+
+    pub async fn application_invitation(
+        &self,
+        tenant_slug: &str,
+        token: Uuid,
+    ) -> Result<Value, CrmError> {
+        let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
+        let row = sqlx::query(
+            r#"SELECT invitation.id, invitation.status, invitation.expires_at,
+                      invitation.channel, invitation.contact, invitation.verified_at,
+                      lead.full_name, form.id AS form_id, form.name AS form_name,
+                      form.version AS form_version, form.schema, tenant.name AS tenant_name
+               FROM crm.application_invitations invitation
+               JOIN crm.leads lead ON lead.tenant_id = invitation.tenant_id
+                                  AND lead.id = invitation.lead_id
+               JOIN crm.forms form ON form.tenant_id = invitation.tenant_id
+                                  AND form.id = invitation.form_id
+               JOIN platform.tenants tenant ON tenant.id = invitation.tenant_id
+               WHERE invitation.tenant_id = $1 AND invitation.token = $2
+                 AND invitation.status IN ('issued', 'verified')
+                 AND invitation.expires_at > now()
+                 AND form.status = 'published'"#,
+        )
+        .bind(tenant_id)
+        .bind(token)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(CrmError::NotFound)?;
+        transaction.commit().await?;
+        let contact: String = row.try_get("contact")?;
+        let visible = contact
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        Ok(json!({
+            "id": row.try_get::<Uuid, _>("id")?,
+            "status": row.try_get::<String, _>("status")?,
+            "expiresAt": row.try_get::<DateTime<Utc>, _>("expires_at")?,
+            "channel": row.try_get::<String, _>("channel")?,
+            "maskedContact": format!("••••{visible}"),
+            "verified": row.try_get::<Option<DateTime<Utc>>, _>("verified_at")?.is_some(),
+            "applicantName": row.try_get::<String, _>("full_name")?,
+            "tenantName": row.try_get::<String, _>("tenant_name")?,
+            "form": {
+                "id": row.try_get::<Uuid, _>("form_id")?,
+                "name": row.try_get::<String, _>("form_name")?,
+                "version": row.try_get::<i32, _>("form_version")?,
+                "schema": row.try_get::<Value, _>("schema")?
+            }
+        }))
+    }
+
+    pub async fn verify_application_otp(
+        &self,
+        tenant_slug: &str,
+        token: Uuid,
+        otp_hash: &str,
+        verification_token_hash: &str,
+    ) -> Result<(), CrmError> {
+        let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
+        let current = sqlx::query(
+            r#"SELECT otp_hash, attempts FROM crm.application_invitations
+               WHERE tenant_id = $1 AND token = $2 AND status = 'issued'
+                 AND expires_at > now() FOR UPDATE"#,
+        )
+        .bind(tenant_id)
+        .bind(token)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| {
+            CrmError::Validation("application invitation is invalid or expired".into())
+        })?;
+        let attempts: i32 = current.try_get("attempts")?;
+        if attempts >= 5 {
+            return Err(CrmError::Validation(
+                "too many OTP attempts; request a new link".into(),
+            ));
+        }
+        if current.try_get::<String, _>("otp_hash")? != otp_hash {
+            sqlx::query(
+                "UPDATE crm.application_invitations SET attempts = attempts + 1, updated_at = now() WHERE tenant_id = $1 AND token = $2",
+            )
+            .bind(tenant_id)
+            .bind(token)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Err(CrmError::Validation("the OTP is incorrect".into()));
+        }
+        sqlx::query(
+            r#"UPDATE crm.application_invitations
+               SET status = 'verified', verification_token_hash = $3,
+                   verified_at = now(), updated_at = now()
+               WHERE tenant_id = $1 AND token = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(token)
+        .bind(verification_token_hash)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn authorize_application_submission(
+        &self,
+        tenant_slug: &str,
+        token: Uuid,
+        verification_token_hash: &str,
+    ) -> Result<Value, CrmError> {
+        let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
+        let row = sqlx::query(
+            r#"SELECT id, lead_id, form_id FROM crm.application_invitations
+               WHERE tenant_id = $1 AND token = $2 AND status = 'verified'
+                 AND expires_at > now() AND verification_token_hash = $3"#,
+        )
+        .bind(tenant_id)
+        .bind(token)
+        .bind(verification_token_hash)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| CrmError::Forbidden("verify the OTP before submitting".into()))?;
+        transaction.commit().await?;
+        Ok(json!({
+            "id": row.try_get::<Uuid, _>("id")?,
+            "leadId": row.try_get::<Uuid, _>("lead_id")?,
+            "formId": row.try_get::<Uuid, _>("form_id")?
+        }))
+    }
+
+    pub async fn complete_application_invitation(
+        &self,
+        tenant_slug: &str,
+        token: Uuid,
+    ) -> Result<(), CrmError> {
+        let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
+        sqlx::query(
+            r#"UPDATE crm.application_invitations
+               SET status = 'submitted', submitted_at = now(), updated_at = now()
+               WHERE tenant_id = $1 AND token = $2 AND status = 'verified'"#,
+        )
+        .bind(tenant_id)
+        .bind(token)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn find_form(
         &self,
         tenant_slug: &str,
@@ -1773,6 +2090,8 @@ impl PostgresCrmRepository {
         idempotency_key: Option<&str>,
         data: Value,
         actor_id: &str,
+        actor_role: &str,
+        advance_to_application: bool,
     ) -> Result<Value, CrmError> {
         let (tenant_id, mut transaction) = self.begin_tenant(tenant_slug).await?;
         let form = sqlx::query(
@@ -1853,6 +2172,82 @@ impl PostgresCrmRepository {
             )
             .await?;
         }
+        let mut pipeline_lead = None;
+        if !replayed && advance_to_application {
+            let lead_id = persisted_lead_id.ok_or_else(|| {
+                CrmError::Validation(
+                    "application submissions must be linked to a Qualified lead".into(),
+                )
+            })?;
+            let current = sqlx::query(
+                r#"SELECT stage_key, substate_key, global_status
+                   FROM crm.leads
+                   WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL
+                   FOR UPDATE"#,
+            )
+            .bind(tenant_id)
+            .bind(lead_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(CrmError::NotFound)?;
+            let from_stage: String = current.try_get("stage_key")?;
+            let from_substate: String = current.try_get("substate_key")?;
+            let global_status: Option<String> = current.try_get("global_status")?;
+            if global_status.as_deref() == Some("on_hold") {
+                return Err(CrmError::Conflict(
+                    "the application cannot be submitted while the lead is on hold".into(),
+                ));
+            }
+            if from_stage != "qualified" {
+                return Err(CrmError::Conflict(format!(
+                    "a new application can only be submitted for a Qualified lead; current stage is {from_stage}"
+                )));
+            }
+            let moved_row = sqlx::query(
+                r#"UPDATE crm.leads
+                   SET stage_key = 'application', substate_key = 'application_submitted',
+                       stage_entered_at = now(), updated_at = now()
+                   WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL
+                   RETURNING *"#,
+            )
+            .bind(tenant_id)
+            .bind(lead_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            self.insert_stage_history(
+                &mut transaction,
+                tenant_id,
+                lead_id,
+                Some(&from_stage),
+                Some(&from_substate),
+                "application",
+                "application_submitted",
+                actor_id,
+                actor_role,
+                Some("automatic_after_application_submission"),
+                None,
+            )
+            .await?;
+            let moved = row_to_lead(&moved_row, tenant_slug)?;
+            self.insert_event(
+                &mut transaction,
+                tenant_id,
+                lead_id,
+                "lead.moved",
+                json!({
+                    "leadId": lead_id,
+                    "fromStage": from_stage,
+                    "fromSubstate": from_substate,
+                    "toStage": "application",
+                    "toSubstate": "application_submitted",
+                    "byUser": actor_id,
+                    "trigger": "form.submitted",
+                    "lead": moved
+                }),
+            )
+            .await?;
+            pipeline_lead = Some(moved);
+        }
         transaction.commit().await?;
         Ok(json!({
             "id": submission_id,
@@ -1864,6 +2259,7 @@ impl PostgresCrmRepository {
             "idempotencyKey": idempotency_key,
             "processingStatus": "processed",
             "replayed": replayed,
+            "pipelineLead": pipeline_lead,
             "data": persisted_data,
             "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?
         }))
@@ -2410,7 +2806,27 @@ impl PostgresCrmRepository {
         {
             return Ok(tenant_id);
         }
-        // Still an upsert: callers rely on an unknown slug being provisioned on first use.
+        // Public application hosts use the tenant code (for example `mec`) while
+        // authenticated requests normally carry the tenant slug. Resolve both to
+        // the same tenant before falling back to development-time provisioning.
+        if let Some(tenant_id) = sqlx::query_scalar::<_, Uuid>(
+            r#"SELECT id FROM platform.tenants
+               WHERE slug = $1 OR lower(code) = lower($1)
+               ORDER BY CASE WHEN slug = $1 THEN 0 ELSE 1 END
+               LIMIT 1"#,
+        )
+        .bind(tenant_slug)
+        .fetch_optional(self.database.pool())
+        .await?
+        {
+            TENANT_ID_CACHE
+                .get_or_init(Default::default)
+                .write()
+                .expect("tenant id cache lock poisoned")
+                .insert(tenant_slug.to_owned(), tenant_id);
+            return Ok(tenant_id);
+        }
+        // Unknown slugs are provisioned on first use for local development.
         let tenant_id: Uuid = sqlx::query_scalar(
             r#"INSERT INTO platform.tenants (slug, code, name)
                VALUES ($1, upper(replace($1, '-', '_')), $1)

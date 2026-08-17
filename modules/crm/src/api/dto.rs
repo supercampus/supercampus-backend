@@ -169,6 +169,11 @@ pub struct ReasonRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct DeleteLeadRequest {
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveRequest {
     pub archive_reason: String,
@@ -207,6 +212,25 @@ pub struct SubmitFormRequest {
     pub lead_id: Option<Uuid>,
     pub campaign_id: Option<Uuid>,
     pub idempotency_key: Option<String>,
+    pub data: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateApplicationInvitationRequest {
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyApplicationOtpRequest {
+    pub otp: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitInvitedApplicationRequest {
+    pub verification_token: String,
     pub data: Value,
 }
 

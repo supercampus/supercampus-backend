@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::models::{
     AssignUserRolesRequest, AuthStudent, ConfigurationDocument, CreateAuthorizationRoleRequest,
     CreateTenantUserRequest, DynamicRecord, ModuleDescriptor, PermissionGrantRequest,
-    ServiceDescriptor, SetUserAccessRequest, StoredAppState, TenantSummary,
+    ServiceDescriptor, SetUserAccessRequest, StoredAppState, StudentImportRow, TenantSummary,
     UpdateAuthorizationRoleRequest, WorkflowDefinition, WorkflowState, WorkflowStateStatus,
     WorkflowTransition,
 };
@@ -100,6 +100,22 @@ impl EffectiveAccess {
                         .is_some_and(|rest| rest.starts_with('.'))
                 })
         })
+    }
+
+    pub fn scope_for(&self, permission: &str) -> Option<&str> {
+        self.scopes
+            .iter()
+            .filter(|(key, _)| {
+                key.as_str() == "*"
+                    || key.as_str() == permission
+                    || key.strip_suffix(".*").is_some_and(|namespace| {
+                        permission
+                            .strip_prefix(namespace)
+                            .is_some_and(|rest| rest.starts_with('.'))
+                    })
+            })
+            .max_by_key(|(_, scope)| access_scope_rank(scope))
+            .map(|(_, scope)| scope.as_str())
     }
 }
 
@@ -329,6 +345,107 @@ impl AppState {
             .filter(|record| record.tenant_id == tenant_id && record.module_key == module_key)
             .cloned()
             .collect())
+    }
+
+    pub async fn list_student_master(&self, tenant_slug: &str) -> anyhow::Result<Value> {
+        let database = self.tenant_database(tenant_slug).await?;
+        let rows = sqlx::query(
+            r#"SELECT student.id, student.student_number, student.full_name,
+                      COALESCE(
+                          department.name,
+                          NULLIF(student.profile ->> 'department', ''),
+                          student.department_id::text,
+                          ''
+                      ) AS department,
+                      student.phone, student.email, student.status,
+                      student.created_at, student.updated_at
+               FROM core.students student
+               JOIN platform.tenants tenant ON tenant.id = student.tenant_id
+               LEFT JOIN core.departments department
+                 ON department.tenant_id = student.tenant_id
+                AND department.id::text = student.department_id::text
+               WHERE tenant.slug = $1
+               ORDER BY student.full_name, student.student_number"#,
+        )
+        .bind(tenant_slug)
+        .fetch_all(database.pool())
+        .await
+        .context("failed to list Student Master")?;
+
+        let students = rows
+            .iter()
+            .map(|row| {
+                Ok(json!({
+                    "id": row.try_get::<Uuid, _>("id")?,
+                    "rollNo": row.try_get::<String, _>("student_number")?,
+                    "name": row.try_get::<String, _>("full_name")?,
+                    "department": row.try_get::<String, _>("department")?,
+                    "mobileNumber": row.try_get::<Option<String>, _>("phone")?.unwrap_or_default(),
+                    "email": row.try_get::<Option<String>, _>("email")?.unwrap_or_default(),
+                    "status": row.try_get::<String, _>("status")?,
+                    "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?,
+                    "updatedAt": row.try_get::<DateTime<Utc>, _>("updated_at")?,
+                }))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(json!(students))
+    }
+
+    pub async fn import_student_master(
+        &self,
+        tenant_slug: &str,
+        actor_id: &str,
+        rows: &[StudentImportRow],
+    ) -> anyhow::Result<Value> {
+        let database = self.tenant_database(tenant_slug).await?;
+        let tenant_id = ensure_tenant(&database, tenant_slug).await?;
+        let mut transaction = database.pool().begin().await?;
+        let mut inserted = 0_u64;
+        let mut updated = 0_u64;
+
+        for row in rows {
+            let existed = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM core.students WHERE tenant_id = $1 AND student_number = $2)",
+            )
+            .bind(tenant_id)
+            .bind(&row.roll_no)
+            .fetch_one(&mut *transaction)
+            .await?;
+
+            let source_id = format!("bulk:{}", row.roll_no);
+            sqlx::query(
+                r#"INSERT INTO core.students
+                   (tenant_id, student_number, full_name, email, phone, applicant_id,
+                    application_id, admission_id, department_id, status, profile)
+                   VALUES ($1, $2, $3, $4, $5, $6, $6, $6, $7, 'active', $8)
+                   ON CONFLICT (tenant_id, student_number) DO UPDATE SET
+                       full_name = EXCLUDED.full_name,
+                       email = EXCLUDED.email,
+                       phone = EXCLUDED.phone,
+                       department_id = EXCLUDED.department_id,
+                       profile = core.students.profile || EXCLUDED.profile,
+                       updated_at = now()"#,
+            )
+            .bind(tenant_id)
+            .bind(&row.roll_no)
+            .bind(&row.name)
+            .bind(&row.email)
+            .bind(&row.mobile_number)
+            .bind(source_id)
+            .bind(&row.department)
+            .bind(json!({ "source": "bulk_import", "importedBy": actor_id }))
+            .execute(&mut *transaction)
+            .await?;
+
+            if existed {
+                updated += 1;
+            } else {
+                inserted += 1;
+            }
+        }
+
+        transaction.commit().await?;
+        Ok(json!({ "imported": rows.len(), "inserted": inserted, "updated": updated }))
     }
 
     pub async fn create_record(

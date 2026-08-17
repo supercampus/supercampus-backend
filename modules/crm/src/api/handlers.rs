@@ -373,12 +373,14 @@ pub async fn delete_lead(
     State(state): State<CrmApiState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
+    Json(request): Json<DeleteLeadRequest>,
 ) -> Result<StatusCode, CrmHttpError> {
     let context = RequestContext::from_headers(&headers)?;
     let service = state.service(&context.tenant).await?;
     service
-        .delete_lead(&context.tenant, &context.actor, id)
+        .delete_lead(&context.tenant, &context.actor, id, request)
         .await?;
+    let _ = state.realtime_wake.send(());
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -459,6 +461,23 @@ pub async fn move_stage(
     let moved = service
         .move_stage(&context.tenant, &context.actor, id, request)
         .await?;
+    if moved.stage_key == "qualified"
+        && let Err(error) = service
+            .create_application_invitation(
+                &context.tenant,
+                &context.actor,
+                id,
+                CreateApplicationInvitationRequest { channel: None },
+            )
+            .await
+    {
+        tracing::warn!(
+            tenant = %context.tenant,
+            lead_id = %id,
+            error = %error,
+            "qualified lead moved, but application invitation could not be issued"
+        );
+    }
     if let Some(handoff) = handoff {
         state
             .reflect_application_in_desk(&context, &moved, handoff)
@@ -1006,6 +1025,62 @@ pub async fn submit_public_form(
             .await?),
     ))
 }
+
+pub async fn create_application_invitation(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<CreateApplicationInvitationRequest>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    let invitation = service
+        .create_application_invitation(&context.tenant, &context.actor, id, request)
+        .await?;
+    let _ = state.realtime_wake.send(());
+    Ok(ok(invitation))
+}
+
+pub async fn public_application_invitation(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(token): Path<Uuid>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::public_from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .public_application_invitation(&context.tenant, token)
+        .await?))
+}
+
+pub async fn verify_application_otp(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(token): Path<Uuid>,
+    Json(request): Json<VerifyApplicationOtpRequest>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::public_from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    Ok(ok(service
+        .verify_application_otp(&context.tenant, token, request)
+        .await?))
+}
+
+pub async fn submit_invited_application(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Path(token): Path<Uuid>,
+    Json(request): Json<SubmitInvitedApplicationRequest>,
+) -> Result<Json<ApiResponse<impl Serialize>>, CrmHttpError> {
+    let context = RequestContext::public_from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    let submission = service
+        .submit_invited_application(&context.tenant, token, request)
+        .await?;
+    let _ = state.realtime_wake.send(());
+    Ok(ok(submission))
+}
+
 pub async fn form_submissions(
     State(state): State<CrmApiState>,
     headers: HeaderMap,

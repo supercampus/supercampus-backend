@@ -1,9 +1,12 @@
+pub mod academic_assignments;
 pub mod dashboard;
 pub mod error;
+pub mod governance;
 pub mod media;
 pub mod models;
 pub mod routes;
 pub mod state;
+pub mod timetable;
 
 use std::net::SocketAddr;
 
@@ -71,6 +74,7 @@ fn cors_layer() -> CorsLayer {
             HeaderName::from_static("pragma"),
             HeaderName::from_static("x-tenant-id"),
             HeaderName::from_static("x-client-surface"),
+            HeaderName::from_static("x-application-verification"),
         ])
         .allow_credentials(true)
 }
@@ -88,8 +92,14 @@ fn is_allowed_cors_origin(origin: &str, configured: &[HeaderValue]) -> bool {
 }
 
 pub async fn run() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
+    if dotenvy::dotenv().is_err() {
+        eprintln!("warning: could not load .env; check dotenv syntax");
+    }
     supercampus_observability::init("platform-api");
+    match media::validate_configuration() {
+        Ok(()) => tracing::info!("Cloudinary media storage configured"),
+        Err(error) => tracing::warn!(?error, "Cloudinary media storage is unavailable"),
+    }
     let auth = auth_service_from_environment()?;
     let control_database_url =
         std::env::var("CONTROL_DATABASE_URL").context("CONTROL_DATABASE_URL is required")?;

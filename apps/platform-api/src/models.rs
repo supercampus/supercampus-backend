@@ -87,6 +87,22 @@ pub struct UpdateRecordRequest {
     pub data: Value,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StudentImportRow {
+    pub name: String,
+    pub roll_no: String,
+    pub department: String,
+    pub mobile_number: String,
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BulkStudentImportRequest {
+    pub rows: Vec<StudentImportRow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigurationDocument {

@@ -76,6 +76,10 @@ pub fn router(databases: Option<TenantDatabaseManager>) -> Router {
         .route("/leads/{id}/notes", post(handlers::add_lead_note))
         .route("/leads/{id}/tasks", post(handlers::add_lead_task))
         .route("/leads/{id}/application", get(handlers::application_link))
+        .route(
+            "/leads/{id}/application-invitations",
+            post(handlers::create_application_invitation),
+        )
         .route("/kanban/board", get(handlers::board))
         .route("/kanban/my-board", get(handlers::my_board))
         .route("/kanban/stages", get(handlers::stages))
@@ -112,6 +116,18 @@ pub fn router(databases: Option<TenantDatabaseManager>) -> Router {
         .route(
             "/public/forms/{id}/submit",
             post(handlers::submit_public_form),
+        )
+        .route(
+            "/public/applications/{token}",
+            get(handlers::public_application_invitation),
+        )
+        .route(
+            "/public/applications/{token}/verify",
+            post(handlers::verify_application_otp),
+        )
+        .route(
+            "/public/applications/{token}/submit",
+            post(handlers::submit_invited_application),
         )
         .route("/forms/{id}/submissions", get(handlers::form_submissions))
         .route("/communications/whatsapp", post(handlers::send_whatsapp))

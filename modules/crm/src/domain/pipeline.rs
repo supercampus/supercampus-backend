@@ -190,11 +190,15 @@ pub fn validate_transition(
         (PrimaryStage::ContactAttempted, PrimaryStage::Contacted | PrimaryStage::Nurture) => true,
         (PrimaryStage::Contacted, PrimaryStage::Nurture | PrimaryStage::Qualified) => true,
         (PrimaryStage::Nurture, PrimaryStage::Qualified) => true,
-        (PrimaryStage::Qualified, PrimaryStage::Application) => to_substate == "to_do",
+        (PrimaryStage::Qualified, PrimaryStage::Application) => {
+            matches!(to_substate, "to_do" | "application_submitted")
+        }
         (PrimaryStage::Application, PrimaryStage::ApplicationStatus) => {
             to_substate == "awaiting_decision"
         }
-        (PrimaryStage::ApplicationStatus, PrimaryStage::OfferStatus) => to_substate == "to_do",
+        (PrimaryStage::ApplicationStatus, PrimaryStage::OfferStatus) => {
+            matches!(to_substate, "to_do" | "accepted" | "rejected")
+        }
         (_, PrimaryStage::Archived) => true,
         _ => false,
     };
@@ -276,10 +280,41 @@ mod tests {
     fn application_submission_can_advance_to_review() {
         assert!(
             validate_transition(
+                PrimaryStage::Qualified,
+                "qualified",
+                PrimaryStage::Application,
+                "application_submitted"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_transition(
                 PrimaryStage::Application,
                 "application_submitted",
                 PrimaryStage::ApplicationStatus,
                 "awaiting_decision"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn management_can_record_a_final_application_decision() {
+        assert!(
+            validate_transition(
+                PrimaryStage::ApplicationStatus,
+                "awaiting_decision",
+                PrimaryStage::OfferStatus,
+                "accepted"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_transition(
+                PrimaryStage::ApplicationStatus,
+                "awaiting_decision",
+                PrimaryStage::OfferStatus,
+                "rejected"
             )
             .is_ok()
         );

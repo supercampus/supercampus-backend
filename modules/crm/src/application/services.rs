@@ -3,12 +3,9 @@ use std::{
     str::FromStr,
 };
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde_json::{Value, json};
-use supercampus_application_desk::{
-    application::{ActorContext as DeskActorContext, ApplicationDeskService},
-    domain::{AdmissionTrigger, ApplicantSnapshot},
-};
+use sha2::{Digest, Sha256};
 use supercampus_database::Database;
 use uuid::Uuid;
 
@@ -16,11 +13,12 @@ use crate::{
     api::dto::{
         ArchiveRequest, AssignLeadRequest, AutomationToggleRequest, BulkImportLeadResult,
         BulkImportLeadsRequest, BulkImportLeadsResponse, ClaimLeadRequest,
-        CounselorCapacityRequest, CreateCampaignRequest, CreateFormRequest, CreateLeadNoteRequest,
-        CreateLeadRequest, CreateLeadTaskRequest, CreateTemplateRequest, HoldRequest,
-        IntakeStatusRequest, LeadFilters, MoveRequestDecision, MoveStageRequest, ReasonRequest,
-        SendCommunicationRequest, SubmitFormRequest, TransferLeadRequest, UnarchiveRequest,
-        UpdateFormRequest, UpdateLeadRequest, WorkflowToggleRequest,
+        CounselorCapacityRequest, CreateApplicationInvitationRequest, CreateCampaignRequest,
+        CreateFormRequest, CreateLeadNoteRequest, CreateLeadRequest, CreateLeadTaskRequest,
+        CreateTemplateRequest, DeleteLeadRequest, HoldRequest, IntakeStatusRequest, LeadFilters,
+        MoveRequestDecision, MoveStageRequest, ReasonRequest, SendCommunicationRequest,
+        SubmitFormRequest, SubmitInvitedApplicationRequest, TransferLeadRequest, UnarchiveRequest,
+        UpdateFormRequest, UpdateLeadRequest, VerifyApplicationOtpRequest, WorkflowToggleRequest,
     },
     domain::{
         Campaign, CrmError, FormDefinition, Lead, LeadMoveRequest, PipelineTransferCandidate,
@@ -88,7 +86,6 @@ impl ActorContext {
 #[derive(Clone)]
 pub struct CrmService {
     repository: Option<PostgresCrmRepository>,
-    database: Option<Database>,
 }
 
 #[derive(Default)]
@@ -103,8 +100,7 @@ struct SourcePerformance {
 impl CrmService {
     pub fn new(database: Option<Database>) -> Self {
         Self {
-            repository: database.clone().map(PostgresCrmRepository::new),
-            database,
+            repository: database.map(PostgresCrmRepository::new),
         }
     }
 
@@ -458,17 +454,31 @@ impl CrmService {
         tenant: &str,
         actor: &ActorContext,
         lead_id: Uuid,
+        request: DeleteLeadRequest,
     ) -> Result<(), CrmError> {
-        let lead = self.repo()?.find_lead(tenant, lead_id).await?;
+        let reason = request.reason.trim();
+        if reason.len() < 3 || reason.len() > 500 {
+            return Err(CrmError::Validation(
+                "deletion reason must be between 3 and 500 characters".into(),
+            ));
+        }
         self.require(
             tenant,
             actor,
             "crm.leads.delete",
-            actor.can_access_assigned("crm.leads.delete", lead.assigned_to.as_deref()),
+            actor.is_administrator() && actor.has_all_scope("crm.leads.delete"),
             Some(lead_id),
         )
         .await?;
-        self.repo()?.soft_delete(tenant, lead_id).await
+        self.repo()?
+            .delete_lead_with_audit(
+                tenant,
+                lead_id,
+                reason,
+                &actor.user_id,
+                actor.primary_role(),
+            )
+            .await
     }
 
     pub async fn assign(
@@ -602,6 +612,12 @@ impl CrmService {
             .await?;
         }
         let current = PrimaryStage::from_str(&lead.stage_key)?;
+        if current == PrimaryStage::Qualified && target == PrimaryStage::Application {
+            return Err(CrmError::Validation(
+                "Application is created automatically when the published application form is submitted"
+                    .into(),
+            ));
+        }
         if target.order() < current.order()
             && !(actor.is_administrator()
                 && (actor.has("crm.leads.stage.backward") || can_override))
@@ -650,26 +666,7 @@ impl CrmService {
             )
             .await?;
 
-        if target == PrimaryStage::Application && target_substate == "application_submitted" {
-            moved = repository
-                .transition(
-                    tenant,
-                    lead_id,
-                    "application_status",
-                    "awaiting_decision",
-                    "system",
-                    "system",
-                    Some("automatic_after_application_submission"),
-                    None,
-                    None,
-                    Some("application_submitted"),
-                    false,
-                    true,
-                )
-                .await?;
-        } else if target == PrimaryStage::ApplicationStatus
-            && target_substate == "unconditional_offer"
-        {
+        if target == PrimaryStage::ApplicationStatus && target_substate == "unconditional_offer" {
             moved = repository
                 .transition(
                     tenant,
@@ -1700,7 +1697,6 @@ impl CrmService {
                 "application submissions require an idempotencyKey".into(),
             ));
         }
-        let submitted_data = request.data.clone();
         let mut lead_id = request.lead_id;
         let mut created_lead_id = None;
         if creates_lead && lead_id.is_none() {
@@ -1788,6 +1784,8 @@ impl CrmService {
                 idempotency_key.as_deref(),
                 request.data,
                 &actor.user_id,
+                actor.primary_role(),
+                application_submission,
             )
             .await
         {
@@ -1805,27 +1803,6 @@ impl CrmService {
                 {
                     object.insert("createdLeadId".into(), json!(id));
                 }
-                if application_submission {
-                    let desk_case = self
-                        .open_application_desk_case(
-                            tenant,
-                            &submission,
-                            form_id,
-                            form.version,
-                            form.name.as_str(),
-                            persisted_uuid(&submission, "leadId").or(lead_id),
-                            submitted_data,
-                        )
-                        .await
-                        .map_err(|error| {
-                            CrmError::Storage(format!(
-                                "application was saved but Application Desk handoff failed: {error}"
-                            ))
-                        })?;
-                    if let Some(object) = submission.as_object_mut() {
-                        object.insert("applicationDesk".into(), desk_case);
-                    }
-                }
                 Ok(submission)
             }
             Err(error) => {
@@ -1837,87 +1814,160 @@ impl CrmService {
         }
     }
 
-    async fn open_application_desk_case(
+    pub async fn create_application_invitation(
         &self,
         tenant: &str,
-        submission: &Value,
-        form_id: Uuid,
-        form_version: i32,
-        form_name: &str,
-        lead_id: Option<Uuid>,
-        submitted_data: Value,
-    ) -> Result<Value, supercampus_application_desk::infrastructure::postgres::DeskError> {
-        let database = self.database.clone().ok_or(
-            supercampus_application_desk::infrastructure::postgres::DeskError::Unavailable,
-        )?;
-        let submission_id = submission
+        actor: &ActorContext,
+        lead_id: Uuid,
+        request: CreateApplicationInvitationRequest,
+    ) -> Result<Value, CrmError> {
+        self.require(
+            tenant,
+            actor,
+            "crm.forms.submit",
+            actor.has_any(&["crm.forms.submit", "crm.leads.stage.move"]),
+            Some(lead_id),
+        )
+        .await?;
+        let repository = self.repo()?;
+        let lead = repository.find_lead(tenant, lead_id).await?;
+        if lead.stage_key != "qualified" {
+            return Err(CrmError::Validation(
+                "application invitations can only be issued for Qualified leads".into(),
+            ));
+        }
+        let form = repository
+            .find_published_form_by_type(tenant, "application")
+            .await?;
+        let requested_channel = request
+            .channel
+            .unwrap_or_else(|| "whatsapp".into())
+            .trim()
+            .to_ascii_lowercase();
+        let (channel, contact) = match requested_channel.as_str() {
+            "whatsapp" => (
+                "whatsapp",
+                lead.whatsapp
+                    .as_deref()
+                    .or(lead.phone.as_deref())
+                    .ok_or_else(|| {
+                        CrmError::Validation("lead has no WhatsApp or phone number".into())
+                    })?,
+            ),
+            "sms" => (
+                "sms",
+                lead.phone
+                    .as_deref()
+                    .ok_or_else(|| CrmError::Validation("lead has no phone number".into()))?,
+            ),
+            _ => {
+                return Err(CrmError::Validation(
+                    "application invitation channel must be whatsapp or sms".into(),
+                ));
+            }
+        };
+        let token = Uuid::new_v4();
+        let otp_seed = Uuid::new_v4();
+        let otp = format!(
+            "{:06}",
+            u32::from_be_bytes(otp_seed.as_bytes()[0..4].try_into().expect("uuid bytes"))
+                % 1_000_000
+        );
+        let expires_at = Utc::now() + Duration::hours(72);
+        repository
+            .create_application_invitation(
+                tenant,
+                lead_id,
+                form.id,
+                token,
+                &hash_invitation_secret(tenant, &otp),
+                channel,
+                contact,
+                expires_at,
+                &actor.user_id,
+                &otp,
+            )
+            .await
+    }
+
+    pub async fn public_application_invitation(
+        &self,
+        tenant: &str,
+        token: Uuid,
+    ) -> Result<Value, CrmError> {
+        self.repo()?.application_invitation(tenant, token).await
+    }
+
+    pub async fn verify_application_otp(
+        &self,
+        tenant: &str,
+        token: Uuid,
+        request: VerifyApplicationOtpRequest,
+    ) -> Result<Value, CrmError> {
+        let otp = request.otp.trim();
+        if otp.len() != 6 || !otp.bytes().all(|value| value.is_ascii_digit()) {
+            return Err(CrmError::Validation("enter the 6-digit OTP".into()));
+        }
+        let verification_token = Uuid::new_v4().to_string();
+        self.repo()?
+            .verify_application_otp(
+                tenant,
+                token,
+                &hash_invitation_secret(tenant, otp),
+                &hash_invitation_secret(tenant, &verification_token),
+            )
+            .await?;
+        Ok(json!({ "verificationToken": verification_token }))
+    }
+
+    pub async fn submit_invited_application(
+        &self,
+        tenant: &str,
+        token: Uuid,
+        request: SubmitInvitedApplicationRequest,
+    ) -> Result<Value, CrmError> {
+        let repository = self.repo()?;
+        let invitation = repository
+            .authorize_application_submission(
+                tenant,
+                token,
+                &hash_invitation_secret(tenant, request.verification_token.trim()),
+            )
+            .await?;
+        let form_id = persisted_uuid(&invitation, "formId")
+            .ok_or_else(|| CrmError::Storage("invitation form id is missing".into()))?;
+        let lead_id = persisted_uuid(&invitation, "leadId")
+            .ok_or_else(|| CrmError::Storage("invitation lead id is missing".into()))?;
+        let invitation_id = invitation
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                supercampus_application_desk::infrastructure::postgres::DeskError::Conflict(
-                    "form submission did not return an id".into(),
-                )
-            })?;
-        let values = submitted_data.get("values").unwrap_or(&submitted_data);
-        let applicant = ApplicantSnapshot {
-            full_name: first_text(values, &["fullName", "name"]),
-            email: first_text(values, &["email"]),
-            phone: first_text(values, &["phone", "mobile", "whatsapp"]),
-            guardian_name: first_text(values, &["parentName", "guardianName"]),
-            guardian_email: first_text(values, &["parentEmail", "guardianEmail"]),
+            .ok_or_else(|| CrmError::Storage("invitation id is missing".into()))?
+            .to_owned();
+        let system_actor = ActorContext {
+            user_id: format!("application-invitation-{invitation_id}"),
+            roles: vec!["applicant".into()],
+            permissions: HashSet::from(["crm.forms.submit".into()]),
+            permission_scopes: HashMap::new(),
+            public: true,
+            ip_address: None,
         };
-        let academic = values.get("academic").unwrap_or(values);
-        let mut attributes = serde_json::Map::new();
-        attributes.insert(
-            "applicationForm".into(),
-            json!({
-                "status": "submitted",
-                "formId": form_id,
-                "formVersion": form_version,
-                "formName": form_name,
-                "submissionId": submission_id,
-                "values": submitted_data,
-            }),
-        );
-        attributes.insert("source".into(), json!("published_application_form"));
-
-        let trigger = AdmissionTrigger {
-            applicant_id: lead_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| submission_id.to_owned()),
-            application_id: format!("FORM-{submission_id}"),
-            admission_id: format!("FORM-{submission_id}"),
-            crm_lead_id: lead_id,
-            admission_status: "APPLICATION".into(),
-            academic_year: first_text(academic, &["academicYear", "intakeYear"]),
-            admission_category: first_text(values, &["admissionCategory", "category"]),
-            program_id: first_text(academic, &["programId", "programmeId", "program"]),
-            department_id: first_text(academic, &["departmentId", "department"]),
-            campus_id: first_text(values, &["campusId", "campus"]),
-            batch_id: first_text(academic, &["batchId", "batch"]),
-            fee_paid: values
-                .get("feePaid")
-                .and_then(Value::as_bool)
-                .or_else(|| values.get("depositPaid").and_then(Value::as_bool))
-                .unwrap_or(false),
-            applicant,
-            attributes,
-            ..AdmissionTrigger::default()
-        };
-        let actor = DeskActorContext {
-            user_id: "application-form-submission".into(),
-            roles: vec!["system".into()],
-            permissions: vec!["application-desk.create".into()],
-        };
-        let (created, reason, _) = ApplicationDeskService::new(database)
-            .open_case(tenant, &actor, trigger)
+        let submission = self
+            .submit_form(
+                tenant,
+                &system_actor,
+                form_id,
+                SubmitFormRequest {
+                    lead_id: Some(lead_id),
+                    campaign_id: None,
+                    idempotency_key: Some(format!("application-invitation:{invitation_id}")),
+                    data: request.data,
+                },
+            )
             .await?;
-        Ok(json!({
-            "created": created,
-            "duplicate": !created,
-            "reason": reason,
-            "submissionId": submission_id,
-        }))
+        repository
+            .complete_application_invitation(tenant, token)
+            .await?;
+        Ok(submission)
     }
 
     pub async fn list_submissions(
@@ -2504,22 +2554,19 @@ fn json_text(value: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn first_text(value: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        value
-            .get(*key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_owned)
-    })
-}
-
 fn persisted_uuid(value: &Value, key: &str) -> Option<Uuid> {
     value
         .get(key)
         .and_then(Value::as_str)
         .and_then(|text| Uuid::parse_str(text).ok())
+}
+
+fn hash_invitation_secret(tenant: &str, secret: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(tenant.as_bytes());
+    hasher.update(b":");
+    hasher.update(secret.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn validate_form_submission(tenant: &str, schema: &Value, data: &Value) -> Result<(), CrmError> {

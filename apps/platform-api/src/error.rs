@@ -59,3 +59,10 @@ impl From<anyhow::Error> for ApiError {
         Self::Internal
     }
 }
+
+impl From<sqlx::Error> for ApiError {
+    fn from(error: sqlx::Error) -> Self {
+        tracing::error!(error = ?error, "database request failed");
+        Self::Internal
+    }
+}

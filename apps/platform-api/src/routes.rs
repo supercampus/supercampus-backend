@@ -10,16 +10,18 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
     error::{ApiError, ApiResult},
     models::{
-        ApiResponse, AssignUserRolesRequest, BootstrapDocument, CreateAuthorizationRoleRequest,
-        CreateRecordRequest, CreateTenantUserRequest, ForgotPasswordRequest, HealthDocument,
-        LoginData, LoginRequest, NavigationItem, PutConfigurationRequest, ResetPasswordRequest,
-        SaveAppStateRequest, SessionData, SetRolePermissionsRequest, SetUserAccessRequest,
-        UpdateAuthorizationRoleRequest, UpdateRecordRequest, ValidateWorkflowTransitionRequest,
+        ApiResponse, AssignUserRolesRequest, BootstrapDocument, BulkStudentImportRequest,
+        CreateAuthorizationRoleRequest, CreateRecordRequest, CreateTenantUserRequest,
+        ForgotPasswordRequest, HealthDocument, LoginData, LoginRequest, NavigationItem,
+        PutConfigurationRequest, ResetPasswordRequest, SaveAppStateRequest, SessionData,
+        SetRolePermissionsRequest, SetUserAccessRequest, UpdateAuthorizationRoleRequest,
+        UpdateRecordRequest, ValidateWorkflowTransitionRequest,
     },
     state::{
         AppState, AuthPrincipal, CreatedAuthSession, EffectiveAccess, MINIMUM_PASSWORD_LENGTH,
@@ -77,6 +79,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/navigation", get(get_navigation))
         .route("/dashboard/effective", get(get_effective_dashboard))
+        .route("/student-master", get(list_student_master))
+        .route("/student-master/import", post(import_student_master))
+        .nest(
+            "/academic-assignments",
+            crate::academic_assignments::router(),
+        )
+        .nest("/timetable", crate::timetable::router())
         .route(
             "/{module_key}/records",
             get(list_records).post(create_record),
@@ -98,6 +107,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/media/upload",
             post(upload_media).layer(DefaultBodyLimit::max(crate::media::MULTIPART_BODY_LIMIT)),
+        )
+        .route(
+            "/media/public-application/{token}",
+            post(upload_public_application_media)
+                .layer(DefaultBodyLimit::max(crate::media::MULTIPART_BODY_LIMIT)),
         )
         .nest("/v1", v1);
 
@@ -129,6 +143,49 @@ async fn upload_media(
     multipart: Multipart,
 ) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
     let media = crate::media::upload(&principal.student.tenant_id, multipart).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(media))))
+}
+
+async fn upload_public_application_media(
+    State(state): State<AppState>,
+    Path(token): Path<Uuid>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    let tenant = headers
+        .get("x-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ApiError::Unauthorized)?;
+    let verification = headers
+        .get("x-application-verification")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ApiError::Unauthorized)?;
+    let mut hasher = Sha256::new();
+    hasher.update(tenant.as_bytes());
+    hasher.update(b":");
+    hasher.update(verification.as_bytes());
+    let verification_hash = format!("{:x}", hasher.finalize());
+    let database = state
+        .tenant_database(tenant)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    let authorized = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM crm.application_invitations WHERE tenant_id = (SELECT id FROM platform.tenants WHERE slug = $1) AND token = $2 AND status = 'verified' AND verification_token_hash = $3 AND verified_at IS NOT NULL AND submitted_at IS NULL AND expires_at > now())",
+    )
+    .bind(tenant)
+    .bind(token)
+    .bind(verification_hash)
+    .fetch_one(database.pool())
+    .await
+    .map_err(|_| ApiError::Unauthorized)?;
+    if !authorized {
+        return Err(ApiError::Unauthorized);
+    }
+    let media = crate::media::upload(tenant, multipart).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(media))))
 }
 
@@ -323,10 +380,10 @@ async fn set_authorization_role_permissions(
     if request
         .permissions
         .iter()
-        .any(|grant| !matches!(grant.scope.as_str(), "all" | "assigned" | "own"))
+        .any(|grant| !valid_permission_scope(&grant.scope))
     {
         return Err(ApiError::BadRequest(
-            "permission scope must be all, assigned, or own".into(),
+            "permission scope must be own, assigned, department, institution, or all".into(),
         ));
     }
     let mut permission_keys = HashSet::new();
@@ -458,7 +515,7 @@ async fn set_tenant_user_access(
     require_effective_permission(&access, "authorization.users.update")?;
     validate_surface(&request.surface)?;
     if request.grants.iter().any(|grant| {
-        !matches!(grant.scope.as_str(), "all" | "assigned" | "own")
+        !valid_permission_scope(&grant.scope)
             || !matches!(grant.mode.as_str(), "allow" | "deny")
             || grant.key.trim().is_empty()
     }) {
@@ -523,6 +580,69 @@ fn valid_role_key(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+async fn list_student_master(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "students.directory.read")?;
+    let students = state
+        .list_student_master(&principal.student.tenant_id)
+        .await?;
+    Ok(Json(ApiResponse::new(students)))
+}
+
+async fn import_student_master(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(request): Json<BulkStudentImportRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "students.directory.create")?;
+    if request.rows.is_empty() || request.rows.len() > 1_000 {
+        return Err(ApiError::BadRequest(
+            "Provide between 1 and 1000 student rows".into(),
+        ));
+    }
+
+    let mut seen_roll_numbers = HashSet::new();
+    for (index, row) in request.rows.iter().enumerate() {
+        if row.name.trim().is_empty()
+            || row.roll_no.trim().is_empty()
+            || row.department.trim().is_empty()
+            || row.mobile_number.trim().is_empty()
+            || row.email.trim().is_empty()
+        {
+            return Err(ApiError::BadRequest(format!(
+                "Row {} has a missing required value",
+                index + 2
+            )));
+        }
+        let roll_no = row.roll_no.trim().to_ascii_lowercase();
+        if !seen_roll_numbers.insert(roll_no) {
+            return Err(ApiError::BadRequest(format!(
+                "Row {} repeats a roll number",
+                index + 2
+            )));
+        }
+        if !row.email.contains('@') {
+            return Err(ApiError::BadRequest(format!(
+                "Row {} has an invalid email",
+                index + 2
+            )));
+        }
+    }
+
+    let result = state
+        .import_student_master(
+            &principal.student.tenant_id,
+            &principal.student.id,
+            &request.rows,
+        )
+        .await?;
+    Ok(Json(ApiResponse::new(result)))
 }
 
 async fn list_records(
@@ -1048,6 +1168,9 @@ pub async fn authorize_request(
 
 fn requires_authorization(method: &Method, path: &str) -> bool {
     let is_public_crm_route = (*method == Method::GET && path == "/api/v1/crm/health")
+        || (path.starts_with("/api/v1/crm/public/applications/")
+            && (*method == Method::GET || *method == Method::POST))
+        || (*method == Method::POST && path.starts_with("/api/media/public-application/"))
         || (*method == Method::POST
             && path.starts_with("/api/v1/crm/public/forms/")
             && path.ends_with("/submit"));
@@ -1163,6 +1286,13 @@ fn secure_cookie_suffix() -> &'static str {
     }
 }
 
+fn valid_permission_scope(scope: &str) -> bool {
+    matches!(
+        scope,
+        "own" | "assigned" | "department" | "institution" | "all"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1209,5 +1339,14 @@ mod tests {
     #[test]
     fn media_upload_is_always_authenticated() {
         assert!(requires_authorization(&Method::POST, "/api/media/upload"));
+    }
+
+    #[test]
+    fn permission_scopes_cover_every_organizational_boundary() {
+        for scope in ["own", "assigned", "department", "institution", "all"] {
+            assert!(valid_permission_scope(scope), "{scope} should be accepted");
+        }
+        assert!(!valid_permission_scope("platform"));
+        assert!(!valid_permission_scope(""));
     }
 }

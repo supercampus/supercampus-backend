@@ -185,6 +185,8 @@ pub struct CreateAuthorizationRoleRequest {
     pub scope: String,
     #[serde(default = "default_portal_family")]
     pub portal_family: String,
+    #[serde(default = "default_role_surfaces")]
+    pub surfaces: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,6 +211,8 @@ pub struct PermissionGrantRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct SetRolePermissionsRequest {
+    #[serde(default = "default_website_surface")]
+    pub surface: String,
     pub permissions: Vec<PermissionGrantRequest>,
 }
 
@@ -264,6 +268,14 @@ fn default_permission_scope() -> String {
 
 fn default_portal_family() -> String {
     "staff".into()
+}
+
+fn default_role_surfaces() -> Vec<String> {
+    vec!["website".into(), "app".into()]
+}
+
+fn default_website_surface() -> String {
+    "website".into()
 }
 
 fn default_permission_mode() -> String {

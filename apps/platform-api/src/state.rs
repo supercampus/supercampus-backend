@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
@@ -10,6 +13,7 @@ use supercampus_notifications::{EmailMessage, LogMailer, Mailer};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::error::{ApiError, ApiResult};
 use crate::models::{
     AssignUserRolesRequest, AuthStudent, ConfigurationDocument, CreateAuthorizationRoleRequest,
     CreateTenantUserRequest, DynamicRecord, ModuleDescriptor, PermissionGrantRequest,
@@ -802,8 +806,12 @@ impl AppState {
                    JOIN authz.roles role ON role.tenant_id = tenant.id
                        AND role.role_key = ANY(membership.roles)
                        AND role.active
+                   JOIN authz.role_surfaces role_surface ON role_surface.tenant_id = tenant.id
+                       AND role_surface.role_id = role.id
+                       AND role_surface.surface = $3
                    LEFT JOIN authz.role_permissions role_grant ON role_grant.tenant_id = tenant.id
                        AND role_grant.role_id = role.id
+                       AND role_grant.surface = $3
                    LEFT JOIN authz.permission_definitions permission
                        ON permission.tenant_id = tenant.id
                        AND permission.permission_key = role_grant.permission_key
@@ -1081,6 +1089,12 @@ impl AppState {
             r#"SELECT role.id, role.role_key, role.name, role.team, role.scope_description,
                       role.portal_family, role.protected, role.active,
                       COALESCE((
+                          SELECT jsonb_agg(role_surface.surface ORDER BY role_surface.surface)
+                          FROM authz.role_surfaces role_surface
+                          WHERE role_surface.tenant_id = role.tenant_id
+                            AND role_surface.role_id = role.id
+                      ), '[]'::jsonb) AS surfaces,
+                      COALESCE((
                           SELECT jsonb_agg(jsonb_build_object(
                               'key', role_grant.permission_key,
                               'scope', role_grant.scope,
@@ -1088,7 +1102,32 @@ impl AppState {
                           ) ORDER BY role_grant.permission_key)
                           FROM authz.role_permissions role_grant
                           WHERE role_grant.tenant_id = role.tenant_id AND role_grant.role_id = role.id
+                            AND role_grant.surface = 'website'
                       ), '[]'::jsonb) AS permissions
+                      , jsonb_build_object(
+                          'website', COALESCE((
+                              SELECT jsonb_agg(jsonb_build_object(
+                                  'key', website_grant.permission_key,
+                                  'scope', website_grant.scope,
+                                  'constraints', website_grant.constraints
+                              ) ORDER BY website_grant.permission_key)
+                              FROM authz.role_permissions website_grant
+                              WHERE website_grant.tenant_id = role.tenant_id
+                                AND website_grant.role_id = role.id
+                                AND website_grant.surface = 'website'
+                          ), '[]'::jsonb),
+                          'app', COALESCE((
+                              SELECT jsonb_agg(jsonb_build_object(
+                                  'key', app_grant.permission_key,
+                                  'scope', app_grant.scope,
+                                  'constraints', app_grant.constraints
+                              ) ORDER BY app_grant.permission_key)
+                              FROM authz.role_permissions app_grant
+                              WHERE app_grant.tenant_id = role.tenant_id
+                                AND app_grant.role_id = role.id
+                                AND app_grant.surface = 'app'
+                          ), '[]'::jsonb)
+                      ) AS permissions_by_surface
                FROM authz.roles role
                JOIN platform.tenants tenant ON tenant.id = role.tenant_id
                WHERE tenant.slug = $1
@@ -1110,7 +1149,9 @@ impl AppState {
                     "portalFamily": row.try_get::<String, _>("portal_family")?,
                     "protected": row.try_get::<bool, _>("protected")?,
                     "active": row.try_get::<bool, _>("active")?,
+                    "surfaces": row.try_get::<Value, _>("surfaces")?,
                     "permissions": row.try_get::<Value, _>("permissions")?,
+                    "permissionsBySurface": row.try_get::<Value, _>("permissions_by_surface")?,
                 }))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -1122,9 +1163,10 @@ impl AppState {
         tenant_slug: &str,
         actor_id: &str,
         request: &CreateAuthorizationRoleRequest,
-    ) -> anyhow::Result<Value> {
+    ) -> ApiResult<Value> {
         let database = self.database.as_ref().context("PostgreSQL is required")?;
         let tenant_id = ensure_tenant(database, tenant_slug).await?;
+        let mut transaction = database.pool().begin().await?;
         let row = sqlx::query(
             r#"INSERT INTO authz.roles
                (tenant_id, role_key, name, team, scope_description, portal_family, created_by, updated_by)
@@ -1142,10 +1184,52 @@ impl AppState {
         .bind(request.scope.trim())
         .bind(validate_portal_family(&request.portal_family)?)
         .bind(actor_id)
-        .fetch_one(database.pool())
+        .fetch_one(&mut *transaction)
         .await
-        .context("failed to create tenant role")?;
-        authorization_role_row(&row, json!([]))
+        .map_err(|error| match &error {
+            sqlx::Error::Database(database_error)
+                if database_error.code().as_deref() == Some("23505") =>
+            {
+                ApiError::Conflict(
+                    "A role with this key already exists for the tenant".into(),
+                )
+            }
+            _ => error.into(),
+        })?;
+        let role_id: Uuid = row.try_get("id")?;
+        for surface in request
+            .surfaces
+            .iter()
+            .map(|surface| surface.trim())
+            .collect::<HashSet<_>>()
+        {
+            sqlx::query(
+                r#"INSERT INTO authz.role_surfaces
+                   (tenant_id, role_id, surface, enabled_by)
+                   VALUES ($1, $2, $3, $4)"#,
+            )
+            .bind(tenant_id)
+            .bind(role_id)
+            .bind(surface)
+            .bind(actor_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        self.authorization_roles(tenant_slug)
+            .await
+            .and_then(|roles| {
+                roles
+                    .as_array()
+                    .and_then(|items| {
+                        items
+                            .iter()
+                            .find(|role| role.get("id") == Some(&json!(role_id)))
+                            .cloned()
+                    })
+                    .context("created role not found")
+            })
+            .map_err(Into::into)
     }
 
     pub async fn update_authorization_role(
@@ -1195,6 +1279,7 @@ impl AppState {
         tenant_slug: &str,
         actor_id: &str,
         role_id: Uuid,
+        surface: &str,
         permissions: &[PermissionGrantRequest],
     ) -> anyhow::Result<Value> {
         let database = self.database.as_ref().context("PostgreSQL is required")?;
@@ -1212,22 +1297,35 @@ impl AppState {
         }
 
         let mut transaction = database.pool().begin().await?;
-        sqlx::query("DELETE FROM authz.role_permissions WHERE tenant_id = $1 AND role_id = $2")
+        sqlx::query("DELETE FROM authz.role_permissions WHERE tenant_id = $1 AND role_id = $2 AND surface = $3")
             .bind(tenant_id)
             .bind(role_id)
+            .bind(surface)
             .execute(&mut *transaction)
             .await?;
+        sqlx::query(
+            r#"INSERT INTO authz.role_surfaces (tenant_id, role_id, surface, enabled_by)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (tenant_id, role_id, surface) DO NOTHING"#,
+        )
+        .bind(tenant_id)
+        .bind(role_id)
+        .bind(surface)
+        .bind(actor_id)
+        .execute(&mut *transaction)
+        .await?;
         for grant in permissions {
             let inserted = sqlx::query(
                 r#"INSERT INTO authz.role_permissions
-                   (tenant_id, role_id, permission_key, scope, constraints, granted_by)
-                   SELECT $1, $2, permission.permission_key, $4, $5, $6
+                   (tenant_id, role_id, permission_key, surface, scope, constraints, granted_by)
+                   SELECT $1, $2, permission.permission_key, $4, $5, $6, $7
                    FROM authz.permission_definitions permission
                    WHERE permission.tenant_id = $1 AND permission.permission_key = $3 AND permission.active"#,
             )
             .bind(tenant_id)
             .bind(role_id)
             .bind(grant.key.trim())
+            .bind(surface)
             .bind(grant.scope.trim())
             .bind(&grant.constraints)
             .bind(actor_id)
@@ -2900,12 +2998,24 @@ async fn seed_identity(
     .fetch_one(database.pool())
     .await
     .context("failed to seed test authorization role")?;
+    sqlx::query(
+        r#"INSERT INTO authz.role_surfaces (tenant_id, role_id, surface, enabled_by)
+           SELECT $1, $2, surface, 'test-seeder'
+           FROM (VALUES ('website'::text), ('app'::text)) AS available(surface)
+           ON CONFLICT (tenant_id, role_id, surface) DO NOTHING"#,
+    )
+    .bind(tenant_id)
+    .bind(role_id)
+    .execute(database.pool())
+    .await
+    .context("failed to seed test role surfaces")?;
     if protected {
         sqlx::query(
             r#"INSERT INTO authz.role_permissions
-               (tenant_id, role_id, permission_key, scope, granted_by)
-               VALUES ($1, $2, '*', 'all', 'test-seeder')
-               ON CONFLICT (tenant_id, role_id, permission_key) DO NOTHING"#,
+               (tenant_id, role_id, permission_key, surface, scope, granted_by)
+               SELECT $1, $2, '*', surface, 'all', 'test-seeder'
+               FROM (VALUES ('website'::text), ('app'::text)) AS available(surface)
+               ON CONFLICT (tenant_id, role_id, surface, permission_key) DO NOTHING"#,
         )
         .bind(tenant_id)
         .bind(role_id)

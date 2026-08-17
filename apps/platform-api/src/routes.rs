@@ -326,6 +326,14 @@ async fn create_authorization_role(
             "name is required and key must use lowercase letters, numbers, or underscores".into(),
         ));
     }
+    if request.surfaces.is_empty() {
+        return Err(ApiError::BadRequest(
+            "at least one role surface is required".into(),
+        ));
+    }
+    for surface in &request.surfaces {
+        validate_surface(surface)?;
+    }
     let role = state
         .create_authorization_role(
             &principal.student.tenant_id,
@@ -377,6 +385,7 @@ async fn set_authorization_role_permissions(
     Json(request): Json<SetRolePermissionsRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require_effective_permission(&access, "authorization.roles.update")?;
+    validate_surface(&request.surface)?;
     if request
         .permissions
         .iter()
@@ -410,6 +419,7 @@ async fn set_authorization_role_permissions(
                 &principal.student.tenant_id,
                 &principal.student.id,
                 role_id,
+                &request.surface,
                 &request.permissions,
             )
             .await?,

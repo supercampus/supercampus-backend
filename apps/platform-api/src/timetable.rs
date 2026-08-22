@@ -246,7 +246,7 @@ async fn context(
                  ON enrollment.tenant_id = student.tenant_id
                 AND enrollment.student_id = student.id
                 AND enrollment.status IN ('provisional', 'active')
-               WHERE student.user_id = $2 AND student.status IN ('provisional', 'active')
+               WHERE student.user_account_id = $2 AND student.status IN ('provisional', 'active')
            ), visible_entries AS (
                SELECT DISTINCT entry.id
                FROM core.timetable_entries entry
@@ -266,7 +266,7 @@ async fn context(
                        JOIN core.students student ON student.id = member.student_id
                        WHERE member.tenant_id = entry.tenant_id
                          AND member.elective_group_id = entry.elective_group_id
-                         AND student.user_id = $2
+                         AND student.user_account_id = $2
                    )
                    OR teaching.faculty_user_id = $2
                    OR EXISTS (
@@ -1480,7 +1480,7 @@ fn require_timetable_manager(principal: &AuthPrincipal, access: &EffectiveAccess
 }
 
 fn principal_user_id(principal: &AuthPrincipal) -> ApiResult<Uuid> {
-    Uuid::parse_str(&principal.student.id).map_err(|_| ApiError::Unauthorized)
+    Uuid::parse_str(&principal.student.id).map_err(|_| ApiError::Internal)
 }
 
 fn json_uuid(value: &Value, key: &str) -> ApiResult<Uuid> {
@@ -1488,9 +1488,10 @@ fn json_uuid(value: &Value, key: &str) -> ApiResult<Uuid> {
         .get(key)
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| ApiError::Internal)
+        .ok_or(ApiError::Internal)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_event(
     tx: &mut Transaction<'_, Postgres>,
     tenant_slug: &str,

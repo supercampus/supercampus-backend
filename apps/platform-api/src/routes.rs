@@ -17,15 +17,18 @@ use crate::{
     error::{ApiError, ApiResult},
     models::{
         ApiResponse, AssignUserRolesRequest, BootstrapDocument, BulkStudentImportRequest,
+        StudentPhotoRequest,
         CreateAuthorizationRoleRequest, CreateRecordRequest, CreateTenantUserRequest,
-        ForgotPasswordRequest, HealthDocument, LoginData, LoginRequest, NavigationItem,
-        PutConfigurationRequest, ResetPasswordRequest, SaveAppStateRequest, SessionData,
-        SetRolePermissionsRequest, SetUserAccessRequest, UpdateAuthorizationRoleRequest,
-        UpdateRecordRequest, ValidateWorkflowTransitionRequest,
+        ForgotPasswordRequest, HealthDocument, LoginData, LoginRequest, LogoutRequest,
+        NavigationItem, PutConfigurationRequest, RefreshRequest, ResetPasswordRequest,
+        SaveAppStateRequest, SessionData, SessionMode, SetRolePermissionsRequest,
+        SetUserAccessRequest, UpdateAuthorizationRoleRequest, UpdateRecordRequest,
+        ValidateWorkflowTransitionRequest,
     },
+    realtime::RealtimePublication,
     state::{
-        AppState, AuthPrincipal, CreatedAuthSession, EffectiveAccess, MINIMUM_PASSWORD_LENGTH,
-        RefreshSessionResult,
+        AccessTokenAuthentication, AppState, AuthPrincipal, CreatedAuthSession, EffectiveAccess,
+        MINIMUM_PASSWORD_LENGTH, RefreshSessionResult,
     },
 };
 
@@ -81,11 +84,21 @@ pub fn router(state: AppState) -> Router {
         .route("/dashboard/effective", get(get_effective_dashboard))
         .route("/student-master", get(list_student_master))
         .route("/student-master/import", post(import_student_master))
+        .route("/student-master/{student_id}/photo", put(set_student_photo))
+        // Reached by a guardian holding a WhatsApp link and nothing else.
+        // Exempted from authorization in `requires_authorization` below.
+        .route(
+            "/public/gatepass/approvals/{token}",
+            get(crate::guardian_link::show_guardian_request)
+                .post(crate::guardian_link::decide_as_guardian),
+        )
+        .route("/realtime/ws", get(crate::realtime::websocket))
         .nest(
             "/academic-assignments",
             crate::academic_assignments::router(),
         )
         .nest("/timetable", crate::timetable::router())
+        .nest("/operations", crate::operations::router())
         .route(
             "/{module_key}/records",
             get(list_records).post(create_record),
@@ -169,10 +182,10 @@ async fn upload_public_application_media(
     hasher.update(b":");
     hasher.update(verification.as_bytes());
     let verification_hash = format!("{:x}", hasher.finalize());
-    let database = state
-        .tenant_database(tenant)
-        .await
-        .map_err(|_| ApiError::Unauthorized)?;
+    let database = state.tenant_database(tenant).await.map_err(|error| {
+        tracing::error!(tenant, %error, "public application tenant database resolution failed");
+        ApiError::ServiceUnavailable("Application media storage is temporarily unavailable".into())
+    })?;
     let authorized = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM crm.application_invitations WHERE tenant_id = (SELECT id FROM platform.tenants WHERE slug = $1) AND token = $2 AND status = 'verified' AND verification_token_hash = $3 AND verified_at IS NOT NULL AND submitted_at IS NULL AND expires_at > now())",
     )
@@ -181,7 +194,10 @@ async fn upload_public_application_media(
     .bind(verification_hash)
     .fetch_one(database.pool())
     .await
-    .map_err(|_| ApiError::Unauthorized)?;
+    .map_err(|error| {
+        tracing::error!(tenant, %error, "public application upload authorization query failed");
+        ApiError::Internal
+    })?;
     if !authorized {
         return Err(ApiError::Unauthorized);
     }
@@ -341,6 +357,11 @@ async fn create_authorization_role(
             &request,
         )
         .await?;
+    state.publish_realtime(RealtimePublication::tenant(
+        principal.student.tenant_id,
+        "authorization.changed",
+        json!({"resource": "role", "action": "created"}),
+    ));
     Ok((StatusCode::CREATED, Json(ApiResponse::new(role))))
 }
 
@@ -413,17 +434,21 @@ async fn set_authorization_role_permissions(
             "one or more permissions are inactive or do not belong to this tenant".into(),
         ));
     }
-    Ok(Json(ApiResponse::new(
-        state
-            .set_authorization_role_permissions(
-                &principal.student.tenant_id,
-                &principal.student.id,
-                role_id,
-                &request.surface,
-                &request.permissions,
-            )
-            .await?,
-    )))
+    let result = state
+        .set_authorization_role_permissions(
+            &principal.student.tenant_id,
+            &principal.student.id,
+            role_id,
+            &request.surface,
+            &request.permissions,
+        )
+        .await?;
+    state.publish_realtime(RealtimePublication::tenant(
+        principal.student.tenant_id,
+        "authorization.changed",
+        json!({"resource": "role_permissions", "roleId": role_id, "surface": request.surface}),
+    ));
+    Ok(Json(ApiResponse::new(result)))
 }
 
 async fn list_tenant_users(
@@ -554,16 +579,23 @@ async fn set_tenant_user_access(
             "one or more permissions are inactive or do not belong to this tenant".into(),
         ));
     }
-    Ok(Json(ApiResponse::new(
-        state
-            .set_tenant_user_access(
-                &principal.student.tenant_id,
-                &principal.student.id,
-                user_id,
-                &request,
-            )
-            .await?,
-    )))
+    let result = state
+        .set_tenant_user_access(
+            &principal.student.tenant_id,
+            &principal.student.id,
+            user_id,
+            &request,
+        )
+        .await?;
+    state.publish_realtime(
+        RealtimePublication::tenant(
+            principal.student.tenant_id,
+            "authorization.changed",
+            json!({"resource": "user_access", "userId": user_id, "surface": request.surface}),
+        )
+        .for_user(user_id.to_string()),
+    );
+    Ok(Json(ApiResponse::new(result)))
 }
 
 fn validate_surface(surface: &str) -> ApiResult<()> {
@@ -602,6 +634,43 @@ async fn list_student_master(
         .list_student_master(&principal.student.tenant_id)
         .await?;
     Ok(Json(ApiResponse::new(students)))
+}
+
+/// Sets or clears a student's photograph.
+///
+/// The image itself is uploaded to `/v1/media/upload` first, which stores it in
+/// the tenant's own Cloudinary folder and hands back a URL. Only that URL
+/// arrives here, so this endpoint never handles file bytes and cannot be used
+/// to attach media belonging to another tenant.
+async fn set_student_photo(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(student_id): Path<Uuid>,
+    Json(request): Json<StudentPhotoRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "students.directory.create")?;
+
+    let photo_url = request.photo_url.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    if let Some(url) = photo_url {
+        // Anything that is not an https URL has no business being rendered as a
+        // student's face in the app.
+        if !url.starts_with("https://") {
+            return Err(ApiError::BadRequest(
+                "A student photograph must be an https URL".into(),
+            ));
+        }
+        if url.len() > 2048 {
+            return Err(ApiError::BadRequest("That photograph URL is too long".into()));
+        }
+    }
+
+    let updated = state
+        .set_student_photo(&principal.student.tenant_id, student_id, photo_url)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Student not found".into()))?;
+
+    Ok(Json(ApiResponse::new(updated)))
 }
 
 async fn import_student_master(
@@ -747,7 +816,11 @@ async fn get_configuration(
     Extension(access): Extension<EffectiveAccess>,
     Path(namespace): Path<String>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    require_effective_permission(&access, "platform.configuration.read")?;
+    // Tenant branding drives every authenticated surface, including restricted
+    // student and vendor accounts. Other configuration namespaces remain gated.
+    if namespace != "tenant-branding" {
+        require_effective_permission(&access, "platform.configuration.read")?;
+    }
     let document = state
         .configuration(&principal.student.tenant_id, &namespace)
         .await?;
@@ -794,8 +867,17 @@ async fn put_configuration(
         ));
     }
     let document = state
-        .put_configuration(principal.student.tenant_id, namespace, request.value)
+        .put_configuration(
+            principal.student.tenant_id.clone(),
+            namespace.clone(),
+            request.value,
+        )
         .await?;
+    state.publish_realtime(RealtimePublication::tenant(
+        principal.student.tenant_id,
+        "configuration.changed",
+        json!({"namespace": namespace, "version": document.version}),
+    ));
     Ok(Json(ApiResponse::new(json!(document))))
 }
 
@@ -866,10 +948,13 @@ async fn login(
         .authenticate_credentials(&request.email, &request.password, None)
         .await?;
     let Some(identity) = identity else {
-        return Err(ApiError::Unauthorized);
+        return Err(ApiError::InvalidCredentials);
     };
     let session = state.create_session(identity).await?;
-    Ok(login_response(session))
+    Ok(login_response(
+        session,
+        request.session_mode == SessionMode::Token,
+    ))
 }
 
 /// Public reset request. Always answers 202 with the same body so the endpoint cannot
@@ -918,7 +1003,7 @@ async fn reset_password(
 }
 
 /// Origin used to build reset links. Must match where the frontend is served.
-fn public_base_url() -> String {
+pub(crate) fn public_base_url() -> String {
     std::env::var("APP_PUBLIC_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -938,23 +1023,52 @@ async fn me(
 async fn refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
+    request: Option<Json<RefreshRequest>>,
 ) -> ApiResult<impl IntoResponse> {
-    let token = cookie_value(&headers, "sc_session").ok_or(ApiError::Unauthorized)?;
+    let body_token = request
+        .and_then(|Json(request)| request.refresh_token)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let token_mode = body_token.is_some();
+    if !token_mode {
+        enforce_cookie_request_origin(&headers)?;
+    }
+    let token = body_token
+        .or_else(|| cookie_value(&headers, "sc_session"))
+        .ok_or(ApiError::InvalidRefreshToken)?;
     match state.refresh_session(&token).await? {
-        RefreshSessionResult::Rotated(session) => Ok(login_response(*session)),
-        RefreshSessionResult::Invalid | RefreshSessionResult::ReuseDetected => {
-            Err(ApiError::Unauthorized)
-        }
+        RefreshSessionResult::Rotated(session) => Ok(login_response(*session, token_mode)),
+        RefreshSessionResult::ConcurrentRefresh => Err(ApiError::Conflict(
+            "A refresh is already in progress; use the token returned by the first request".into(),
+        )),
+        RefreshSessionResult::Invalid => Err(ApiError::InvalidRefreshToken),
+        RefreshSessionResult::ReuseDetected => Err(ApiError::RefreshTokenReuse),
     }
 }
 
-async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<impl IntoResponse> {
-    if let Some(token) = access_token(&headers)
-        && let Some(principal) = state.authenticate_access_token(&token).await?
-    {
-        state.revoke_session(principal.session_id).await?;
+async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Option<Json<LogoutRequest>>,
+) -> ApiResult<impl IntoResponse> {
+    let body_token = request
+        .and_then(|Json(request)| request.refresh_token)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if body_token.is_none() && bearer_token(&headers).is_none() {
+        enforce_cookie_request_origin(&headers)?;
     }
-    if let Some(token) = cookie_value(&headers, "sc_session") {
+    if let Some(token) = access_token(&headers) {
+        match state.authenticate_access_token(&token).await? {
+            AccessTokenAuthentication::Authenticated(principal) => {
+                state.revoke_session(principal.session_id).await?;
+            }
+            AccessTokenAuthentication::Expired
+            | AccessTokenAuthentication::Invalid
+            | AccessTokenAuthentication::SessionInactive => {}
+        }
+    }
+    if let Some(token) = body_token.or_else(|| cookie_value(&headers, "sc_session")) {
         state.revoke_refresh_token(&token).await?;
     }
     let response_headers = cleared_auth_cookies();
@@ -1018,13 +1132,8 @@ async fn realtime_token(
 }
 
 async fn get_effective_dashboard(
-    State(state): State<AppState>,
-    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    let tenant_id = &principal.student.tenant_id;
-    let access = state
-        .effective_access(tenant_id, &principal.student.id)
-        .await?;
     let widgets = crate::dashboard::effective_widgets(None, &access);
     Ok(Json(ApiResponse::new(json!({ "widgets": widgets }))))
 }
@@ -1087,6 +1196,10 @@ fn cookie_value(headers: &HeaderMap, expected_name: &str) -> Option<String> {
 }
 
 fn access_token(headers: &HeaderMap) -> Option<String> {
+    bearer_token(headers).or_else(|| cookie_value(headers, "sc_access"))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -1095,7 +1208,30 @@ fn access_token(headers: &HeaderMap) -> Option<String> {
         .map(|(_, token)| token)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
-        .or_else(|| cookie_value(headers, "sc_access"))
+}
+
+fn enforce_cookie_request_origin(headers: &HeaderMap) -> ApiResult<()> {
+    if !matches!(
+        std::env::var("APP_ENV").as_deref(),
+        Ok("production") | Ok("staging")
+    ) {
+        return Ok(());
+    }
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ApiError::Forbidden)?;
+    let allowed = std::env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .any(|value| value == origin);
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
 }
 
 pub async fn authorize_request(
@@ -1103,8 +1239,22 @@ pub async fn authorize_request(
     mut request: Request,
     next: Next,
 ) -> ApiResult<Response> {
+    // WebSocket clients cannot reliably control cookies or attach a bearer header.
+    // Authenticate the one-time realtime ticket in the endpoint so a stale access
+    // cookie cannot take precedence over the fresh ticket during the upgrade.
+    if is_realtime_websocket(request.uri().path()) {
+        return Ok(next.run(request).await);
+    }
     if !requires_authorization(request.method(), request.uri().path()) {
         return Ok(next.run(request).await);
+    }
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) && bearer_token(request.headers()).is_none()
+        && cookie_value(request.headers(), "sc_access").is_some()
+    {
+        enforce_cookie_request_origin(request.headers())?;
     }
     let token = access_token(request.headers())
         .or_else(|| {
@@ -1113,10 +1263,12 @@ pub async fn authorize_request(
                 .flatten()
         })
         .ok_or(ApiError::Unauthorized)?;
-    let mut principal = state
-        .authenticate_access_token(&token)
-        .await?
-        .ok_or(ApiError::Unauthorized)?;
+    let mut principal = match state.authenticate_access_token(&token).await? {
+        AccessTokenAuthentication::Authenticated(principal) => *principal,
+        AccessTokenAuthentication::Expired => return Err(ApiError::AccessTokenExpired),
+        AccessTokenAuthentication::Invalid => return Err(ApiError::InvalidAccessToken),
+        AccessTokenAuthentication::SessionInactive => return Err(ApiError::SessionInactive),
+    };
     if let Some(requested_tenant) = request
         .headers()
         .get("x-tenant-id")
@@ -1139,37 +1291,37 @@ pub async fn authorize_request(
     principal.student.access = access.permissions.clone();
     request.headers_mut().insert(
         HeaderName::from_static("x-tenant-id"),
-        HeaderValue::from_str(&principal.student.tenant_id).map_err(|_| ApiError::Unauthorized)?,
+        HeaderValue::from_str(&principal.student.tenant_id).map_err(|_| ApiError::Internal)?,
     );
     request.headers_mut().insert(
         HeaderName::from_static("x-user-id"),
-        HeaderValue::from_str(&principal.student.id).map_err(|_| ApiError::Unauthorized)?,
+        HeaderValue::from_str(&principal.student.id).map_err(|_| ApiError::Internal)?,
     );
     let role = principal.roles.first().map_or("unassigned", String::as_str);
     request.headers_mut().insert(
         HeaderName::from_static("x-user-role"),
-        HeaderValue::from_str(role).map_err(|_| ApiError::Unauthorized)?,
+        HeaderValue::from_str(role).map_err(|_| ApiError::Internal)?,
     );
     request.headers_mut().insert(
         HeaderName::from_static("x-user-roles"),
         HeaderValue::from_str(
             &serde_json::to_string(&access.roles).map_err(|_| ApiError::Internal)?,
         )
-        .map_err(|_| ApiError::Unauthorized)?,
+        .map_err(|_| ApiError::Internal)?,
     );
     request.headers_mut().insert(
         HeaderName::from_static("x-user-permissions"),
         HeaderValue::from_str(
             &serde_json::to_string(&access.permissions).map_err(|_| ApiError::Internal)?,
         )
-        .map_err(|_| ApiError::Unauthorized)?,
+        .map_err(|_| ApiError::Internal)?,
     );
     request.headers_mut().insert(
         HeaderName::from_static("x-permission-scopes"),
         HeaderValue::from_str(
             &serde_json::to_string(&access.scopes).map_err(|_| ApiError::Internal)?,
         )
-        .map_err(|_| ApiError::Unauthorized)?,
+        .map_err(|_| ApiError::Internal)?,
     );
     request.extensions_mut().insert(access);
     request.extensions_mut().insert(principal);
@@ -1177,6 +1329,11 @@ pub async fn authorize_request(
 }
 
 fn requires_authorization(method: &Method, path: &str) -> bool {
+    // A guardian has no account: the one-time token in the path is the whole
+    // credential, and it authorises exactly one decision on one request.
+    let is_public_guardian_route = path.starts_with("/api/v1/public/gatepass/approvals/")
+        && (*method == Method::GET || *method == Method::POST);
+
     let is_public_crm_route = (*method == Method::GET && path == "/api/v1/crm/health")
         || (path.starts_with("/api/v1/crm/public/applications/")
             && (*method == Method::GET || *method == Method::POST))
@@ -1186,6 +1343,7 @@ fn requires_authorization(method: &Method, path: &str) -> bool {
             && path.ends_with("/submit"));
 
     !is_public_crm_route
+        && !is_public_guardian_route
         && (path == "/api/state"
             || path == "/api/media/upload"
             || path == "/api/v1"
@@ -1202,6 +1360,10 @@ fn requires_authorization(method: &Method, path: &str) -> bool {
 /// token minted by `POST /api/auth/realtime-token` in the query string instead.
 fn is_realtime_stream(path: &str) -> bool {
     path == "/api/v1/crm/events"
+}
+
+fn is_realtime_websocket(path: &str) -> bool {
+    path == "/api/v1/realtime/ws"
 }
 
 /// Reads the realtime token from the query string of a WebSocket handshake.
@@ -1233,31 +1395,37 @@ fn percent_decode(value: &str) -> String {
     out
 }
 
-fn login_response(session: CreatedAuthSession) -> (HeaderMap, Json<ApiResponse<LoginData>>) {
+fn login_response(
+    session: CreatedAuthSession,
+    expose_refresh_token: bool,
+) -> (HeaderMap, Json<ApiResponse<LoginData>>) {
     let mut headers = HeaderMap::new();
-    let secure = secure_cookie_suffix();
-    let access_max_age = (session.access_expires_at - Utc::now())
-        .num_seconds()
-        .max(1);
-    let refresh_max_age = (session.refresh_expires_at - Utc::now())
-        .num_seconds()
-        .max(1);
-    headers.append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&format!(
-            "sc_access={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={access_max_age}{secure}",
-            session.access_token
-        ))
-        .expect("generated access cookie is valid"),
-    );
-    headers.append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&format!(
-            "sc_session={}; HttpOnly; SameSite=Lax; Path=/api/auth; Max-Age={refresh_max_age}{secure}",
-            session.refresh_token
-        ))
-        .expect("generated refresh cookie is valid"),
-    );
+    if !expose_refresh_token {
+        let secure = secure_cookie_suffix();
+        let access_max_age = (session.access_expires_at - Utc::now())
+            .num_seconds()
+            .max(1);
+        let refresh_max_age = (session.refresh_expires_at - Utc::now())
+            .num_seconds()
+            .max(1);
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&format!(
+                "sc_access={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={access_max_age}{secure}",
+                session.access_token
+            ))
+            .expect("generated access cookie is valid"),
+        );
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&format!(
+                "sc_session={}; HttpOnly; SameSite=Lax; Path=/api/auth; Max-Age={refresh_max_age}{secure}",
+                session.refresh_token
+            ))
+            .expect("generated refresh cookie is valid"),
+        );
+    }
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     let data = LoginData {
         student: session.student,
         access_token: session.access_token,
@@ -1265,6 +1433,7 @@ fn login_response(session: CreatedAuthSession) -> (HeaderMap, Json<ApiResponse<L
         expires_at: session.access_expires_at,
         session_id: session.session_id,
         roles: session.roles,
+        refresh_token: expose_refresh_token.then_some(session.refresh_token),
     };
     (headers, Json(ApiResponse::new(data)))
 }
@@ -1349,6 +1518,13 @@ mod tests {
     #[test]
     fn media_upload_is_always_authenticated() {
         assert!(requires_authorization(&Method::POST, "/api/media/upload"));
+    }
+
+    #[test]
+    fn realtime_websocket_owns_its_ticket_authentication() {
+        assert!(is_realtime_websocket("/api/v1/realtime/ws"));
+        assert!(!is_realtime_websocket("/api/v1/crm/events"));
+        assert!(!is_realtime_websocket("/api/v1/realtime/ws/other"));
     }
 
     #[test]

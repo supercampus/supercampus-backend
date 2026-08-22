@@ -24,9 +24,16 @@ pub struct Database {
 
 impl Database {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
+        Self::connect_with_max_connections(database_url, 10).await
+    }
+
+    pub async fn connect_with_max_connections(
+        database_url: &str,
+        max_connections: u32,
+    ) -> anyhow::Result<Self> {
         let options = PgConnectOptions::from_str(database_url)
             .context("invalid PostgreSQL connection URL")?;
-        Self::connect_options(options, 10).await
+        Self::connect_options(options, max_connections).await
     }
 
     pub async fn connect_options(
@@ -40,7 +47,17 @@ impl Database {
         for attempt in 1..=ATTEMPTS {
             let connect = PgPoolOptions::new()
                 .max_connections(max_connections)
-                .min_connections(1)
+                // Nothing is kept warm. A pinned idle connection is the one a
+                // NAT or load balancer between here and the database is most
+                // likely to drop without telling either end; the next acquire
+                // then stalls on a socket that is already gone until TCP gives
+                // up on it. Going empty costs one cold connect instead.
+                .min_connections(0)
+                // Close idle connections well before any such middlebox would,
+                // and recycle live ones often enough that none of them is old
+                // enough to have been forgotten about.
+                .idle_timeout(Duration::from_secs(120))
+                .max_lifetime(Duration::from_secs(600))
                 .acquire_timeout(Duration::from_secs(10))
                 .connect_with(options.clone());
 
@@ -64,45 +81,9 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> anyhow::Result<()> {
-        if let Err(error) = MIGRATOR.run(&self.pool).await {
-            let error_str = format!("{error:?}");
-            if error_str.contains("VersionMissing") {
-                tracing::warn!(error = %error, "database has migrations newer than this checkout; ignoring missing applied migrations");
-                return Ok(());
-            } else if error_str.contains("VersionMismatch") {
-                tracing::warn!(error = %error, "sqlx migration version mismatch detected; reconciling applied migration checksums");
-                for migration in MIGRATOR.iter() {
-                    sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2")
-                        .bind(migration.checksum.as_ref())
-                        .bind(migration.version)
-                        .execute(&self.pool)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to reconcile checksum for migration {}",
-                                migration.version
-                            )
-                        })?;
-                }
-                // A VersionMismatch can leave SQLx's advisory lock attached to the
-                // pooled connection used by the failed pass. Reconciliation is
-                // already serialized by the first pass, so reacquiring that same
-                // lock here can deadlock against our own pool.
-                let reconciled_migrator = sqlx::migrate::Migrator {
-                    migrations: MIGRATOR.migrations.clone(),
-                    ignore_missing: MIGRATOR.ignore_missing,
-                    locking: false,
-                    no_tx: MIGRATOR.no_tx,
-                };
-                if let Err(retry_err) = reconciled_migrator.run(&self.pool).await {
-                    anyhow::bail!(
-                        "failed to run PostgreSQL migrations after checksum reconciliation: {retry_err:?}"
-                    );
-                }
-            } else {
-                anyhow::bail!("failed to run PostgreSQL migrations: {error:?}");
-            }
-        }
+        MIGRATOR.run(&self.pool).await.context(
+            "failed to run PostgreSQL migrations; applied migrations are immutable and must match this release",
+        )?;
         Ok(())
     }
 
@@ -126,6 +107,7 @@ impl Database {
 pub struct TenantDatabaseManager {
     control: Database,
     base_options: Option<PgConnectOptions>,
+    tenant_max_connections: u32,
     pools: Arc<RwLock<HashMap<String, Database>>>,
 }
 
@@ -135,16 +117,30 @@ impl TenantDatabaseManager {
         Self {
             control,
             base_options: None,
+            tenant_max_connections: 5,
             pools: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub fn clustered(control: Database, control_database_url: &str) -> anyhow::Result<Self> {
+        Self::clustered_with_max_connections(control, control_database_url, 5)
+    }
+
+    pub fn clustered_with_max_connections(
+        control: Database,
+        control_database_url: &str,
+        tenant_max_connections: u32,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=100).contains(&tenant_max_connections),
+            "tenant database max connections must be between 1 and 100"
+        );
         let base_options = PgConnectOptions::from_str(control_database_url)
             .context("invalid CONTROL_DATABASE_URL")?;
         Ok(Self {
             control,
             base_options: Some(base_options),
+            tenant_max_connections,
             pools: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -161,13 +157,13 @@ impl TenantDatabaseManager {
         if self.base_options.is_none() {
             return Ok(self.control.clone());
         }
-        if let Some(database) = self
+        let cached = self
             .pools
             .read()
-            .expect("tenant database cache lock poisoned")
+            .map_err(|_| anyhow::anyhow!("tenant database cache is unavailable"))?
             .get(tenant_slug)
-            .cloned()
-        {
+            .cloned();
+        if let Some(database) = cached {
             return Ok(database);
         }
 
@@ -193,24 +189,21 @@ impl TenantDatabaseManager {
             .expect("clustered manager has base options")
             .clone()
             .database(&database_name);
-        let database = Database::connect_options(options, 5)
+        let database = Database::connect_options(options, self.tenant_max_connections)
             .await
             .with_context(|| format!("failed to connect tenant {tenant_slug} database"))?;
+        database
+            .migrate()
+            .await
+            .with_context(|| format!("failed to migrate tenant {tenant_slug} database"))?;
         if std::env::var("SKIP_TENANT_DB_PING").as_deref() == Ok("true") {
-            tracing::warn!(
-                tenant_slug,
-                "tenant database request-time migration check skipped"
-            );
+            tracing::warn!(tenant_slug, "tenant database readiness ping skipped");
         } else {
-            database
-                .migrate()
-                .await
-                .with_context(|| format!("failed to migrate tenant {tenant_slug} database"))?;
+            database.ping().await?;
         }
-        database.ping().await?;
         self.pools
             .write()
-            .expect("tenant database cache lock poisoned")
+            .map_err(|_| anyhow::anyhow!("tenant database cache is unavailable"))?
             .insert(tenant_slug.to_owned(), database.clone());
         Ok(database)
     }
@@ -261,7 +254,7 @@ impl TenantDatabaseManager {
         }
         self.pools
             .write()
-            .expect("tenant database cache lock poisoned")
+            .map_err(|_| anyhow::anyhow!("tenant database cache is unavailable"))?
             .remove(tenant_slug);
         Ok(())
     }
@@ -284,7 +277,7 @@ pub fn validate_database_name(database_name: &str) -> anyhow::Result<()> {
 pub const CRATE_NAME: &str = "supercampus-database";
 
 /// Latest forward-only runtime migration embedded in this build.
-pub const RUNTIME_MIGRATION_VERSION: i64 = 26;
+pub const RUNTIME_MIGRATION_VERSION: i64 = 56;
 
 #[cfg(test)]
 mod tests {

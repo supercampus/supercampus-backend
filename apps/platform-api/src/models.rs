@@ -97,6 +97,14 @@ pub struct StudentImportRow {
     pub email: String,
 }
 
+/// Sets or clears a student's photograph. `null` removes it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StudentPhotoRequest {
+    #[serde(default)]
+    pub photo_url: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BulkStudentImportRequest {
@@ -287,6 +295,28 @@ fn default_permission_mode() -> String {
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub session_mode: SessionMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    #[default]
+    Cookie,
+    Token,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RefreshRequest {
+    pub refresh_token: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LogoutRequest {
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -343,6 +373,8 @@ pub struct LoginData {
     pub expires_at: DateTime<Utc>,
     pub session_id: Uuid,
     pub roles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

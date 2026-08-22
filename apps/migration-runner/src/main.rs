@@ -526,7 +526,7 @@ async fn sync_role_permissions(
 ) -> anyhow::Result<()> {
     let rows = fetch_source_rows(
         source,
-        r#"SELECT tenant_id, role_id, permission_key, scope, constraints, granted_by, granted_at
+        r#"SELECT tenant_id, role_id, surface, permission_key, scope, constraints, granted_by, granted_at
            FROM authz.role_permissions
            WHERE tenant_id = $1"#,
         tenant_id,
@@ -535,9 +535,9 @@ async fn sync_role_permissions(
     for row in rows {
         sqlx::query(
             r#"INSERT INTO authz.role_permissions
-                   (tenant_id, role_id, permission_key, scope, constraints, granted_by, granted_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)
-               ON CONFLICT (tenant_id, role_id, permission_key) DO UPDATE SET
+                   (tenant_id, role_id, surface, permission_key, scope, constraints, granted_by, granted_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (tenant_id, role_id, surface, permission_key) DO UPDATE SET
                    scope = EXCLUDED.scope,
                    constraints = EXCLUDED.constraints,
                    granted_by = EXCLUDED.granted_by,
@@ -545,6 +545,7 @@ async fn sync_role_permissions(
         )
         .bind(row.try_get::<uuid::Uuid, _>("tenant_id")?)
         .bind(row.try_get::<uuid::Uuid, _>("role_id")?)
+        .bind(row.try_get::<String, _>("surface")?)
         .bind(row.try_get::<String, _>("permission_key")?)
         .bind(row.try_get::<String, _>("scope")?)
         .bind(row.try_get::<serde_json::Value, _>("constraints")?)

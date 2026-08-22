@@ -100,6 +100,48 @@ pub async fn upload(tenant_id: &str, mut multipart: Multipart) -> ApiResult<Valu
     }))
 }
 
+/// Stores bytes the server produced itself.
+///
+/// The multipart path above exists for files a person chose; this one is for
+/// images the platform renders — a visitor's gate pass, which has to live at a
+/// public URL because Twilio fetches it to attach to the message. It shares the
+/// tenant folder and the signing, so a rendered pass is scoped exactly as an
+/// uploaded file is.
+pub async fn store_rendered_png(
+    tenant_id: &str,
+    file_name: &str,
+    bytes: Vec<u8>,
+) -> ApiResult<Value> {
+    if bytes.len() > MAX_MEDIA_BYTES {
+        return Err(ApiError::BadRequest("That image is too large".into()));
+    }
+    let folder = tenant_folder(tenant_id)?;
+    let config = CloudinaryConfig::from_environment().map_err(|error| {
+        tracing::error!(error = ?error, "Cloudinary media storage is not configured");
+        ApiError::ServiceUnavailable("Media storage is not configured".into())
+    })?;
+    let uploaded = upload_to_cloudinary(
+        &config,
+        &folder,
+        ValidatedMedia {
+            bytes,
+            file_name: file_name.to_owned(),
+            content_type: "image/png",
+        },
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(error = ?error, tenant = tenant_id, "Cloudinary upload failed");
+        ApiError::BadGateway("Media storage rejected the upload".into())
+    })?;
+
+    Ok(json!({
+        "secureUrl": uploaded.secure_url,
+        "publicId": uploaded.public_id,
+        "bytes": uploaded.bytes,
+    }))
+}
+
 async fn read_media(multipart: &mut Multipart) -> ApiResult<ValidatedMedia> {
     let mut selected = None;
     while let Some(field) = multipart

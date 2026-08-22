@@ -97,12 +97,7 @@ pub fn evaluate_intake(
     existing: &[OnboardingCase],
     mode: IntakeTriggerMode,
 ) -> IntakeDecision {
-    let application_submission =
-        trigger.admission_status == "APPLICATION" && !trigger.application_id.is_empty();
-    if mode == IntakeTriggerMode::OnConfirmed
-        && trigger.admission_status != "CONFIRMED"
-        && !application_submission
-    {
+    if mode == IntakeTriggerMode::OnConfirmed && trigger.admission_status != "CONFIRMED" {
         return IntakeDecision {
             create: false,
             reason: format!("Admission is {}, not CONFIRMED", trigger.admission_status),
@@ -263,8 +258,9 @@ pub fn create_case(
         })
         .collect();
 
-    documents.clear();
-    apply_application_document_mapping(&mut documents, &trigger.attributes);
+    if trigger.attributes.contains_key("applicationForm") {
+        apply_application_document_mapping(&mut documents, &trigger.attributes);
+    }
 
     OnboardingCase {
         id: options.id,

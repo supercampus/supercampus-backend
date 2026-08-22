@@ -439,9 +439,12 @@ async fn refresh_rotation_and_logout_revoke_the_server_session() {
         )
         .await
         .unwrap();
-    assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(reused.status(), StatusCode::CONFLICT);
+    let reused_body: Value =
+        serde_json::from_slice(&to_bytes(reused.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(reused_body["code"], "conflict");
 
-    let revoked_access = app
+    let active_access = app
         .clone()
         .oneshot(
             Request::get("/api/auth/me")
@@ -451,9 +454,10 @@ async fn refresh_rotation_and_logout_revoke_the_server_session() {
         )
         .await
         .unwrap();
-    assert_eq!(revoked_access.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(active_access.status(), StatusCode::OK);
 
     let logout = app
+        .clone()
         .oneshot(
             Request::post("/api/auth/logout")
                 .header(header::COOKIE, new_refresh_cookie)
@@ -463,6 +467,137 @@ async fn refresh_rotation_and_logout_revoke_the_server_session() {
         .await
         .unwrap();
     assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+
+    let revoked_access = app
+        .oneshot(
+            Request::get("/api/auth/me")
+                .header(header::AUTHORIZATION, format!("Bearer {new_access_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked_access.status(), StatusCode::UNAUTHORIZED);
+    let revoked_body: Value = serde_json::from_slice(
+        &to_bytes(revoked_access.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(revoked_body["code"], "session_inactive");
+}
+
+#[tokio::test]
+async fn native_token_sessions_refresh_and_logout_without_cookies() {
+    let app = test_app();
+    let login = app
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}","sessionMode":"token"}}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    assert!(login.headers().get(header::SET_COOKIE).is_none());
+    assert_eq!(login.headers()[header::CACHE_CONTROL], "no-store");
+    let login_body: Value =
+        serde_json::from_slice(&to_bytes(login.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let first_refresh = login_body["data"]["refreshToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let refreshed = app
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/refresh")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "refreshToken": first_refresh }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    assert!(refreshed.headers().get(header::SET_COOKIE).is_none());
+    let refreshed_body: Value =
+        serde_json::from_slice(&to_bytes(refreshed.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let access_token = refreshed_body["data"]["accessToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let refresh_token = refreshed_body["data"]["refreshToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let authenticated = app
+        .clone()
+        .oneshot(
+            Request::get("/api/auth/me")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authenticated.status(), StatusCode::OK);
+
+    let logout = app
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/logout")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "refreshToken": refresh_token }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+
+    let revoked = app
+        .oneshot(
+            Request::get("/api/auth/me")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn bearer_failures_return_machine_readable_no_store_errors() {
+    let response = test_app()
+        .oneshot(
+            Request::get("/api/auth/me")
+                .header(header::AUTHORIZATION, "Bearer definitely-not-a-jwt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(
+        response.headers()[header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap()
+            .contains("invalid_access_token")
+    );
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["code"], "invalid_access_token");
 }
 
 #[tokio::test]

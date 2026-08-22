@@ -8,7 +8,7 @@
 //! `STUDENT_CREATION`.
 
 use super::{
-    types::OnboardingStage,
+    types::{DocumentRequirement, OnboardingStage},
     workflow::{
         ActionKind, ApprovalStep, EffectKind, GuardKey, WorkflowDefinition, WorkflowStage,
         WorkflowTransition,
@@ -17,6 +17,29 @@ use super::{
 
 pub const DEFAULT_WORKFLOW_ID: &str = "application-desk-default";
 pub const DEFAULT_WORKFLOW_VERSION: i32 = 1;
+
+fn requirement(document_type: &str, label: &str, required: bool) -> DocumentRequirement {
+    DocumentRequirement {
+        document_type: document_type.into(),
+        label: label.into(),
+        required,
+    }
+}
+
+/// Safe baseline used when a tenant has not supplied a published form schema.
+/// Submitted application-form requirements replace this checklist at intake.
+pub fn default_document_checklist() -> Vec<DocumentRequirement> {
+    vec![
+        requirement("certificate-10", "10th Certificate", true),
+        requirement("certificate-12", "12th Certificate", true),
+        requirement("transfer-certificate", "Transfer Certificate", true),
+        requirement("identity-proof", "Identity Proof", true),
+        requirement("address-proof", "Address Proof", false),
+        requirement("photo", "Passport Photo", true),
+        requirement("admission-proof", "Admission Proof", true),
+        requirement("category-certificate", "Category Certificate", false),
+    ]
+}
 
 fn stage(
     id: OnboardingStage,
@@ -173,7 +196,7 @@ pub fn default_workflow(tenant_id: &str) -> WorkflowDefinition {
                 guards: Vec::new(),
             },
         ],
-        document_checklist: Vec::new(),
+        document_checklist: default_document_checklist(),
         approval_chain: vec![
             ApprovalStep {
                 step: 1,
@@ -194,6 +217,12 @@ pub fn international_workflow(tenant_id: &str) -> WorkflowDefinition {
     let mut definition = default_workflow(tenant_id);
     definition.id = "application-desk-international".into();
     definition.name = "International Admission Onboarding".into();
+    definition
+        .document_checklist
+        .push(requirement("passport", "Passport", true));
+    definition
+        .document_checklist
+        .push(requirement("visa", "Student Visa", true));
     definition.approval_chain.push(ApprovalStep {
         step: 3,
         role: "international-office".into(),

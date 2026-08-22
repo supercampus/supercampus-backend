@@ -119,7 +119,7 @@ async fn context(
                  ON enrollment.tenant_id = student.tenant_id
                 AND enrollment.student_id = student.id
                 AND enrollment.status IN ('provisional', 'active')
-               WHERE student.user_id = $2
+               WHERE student.user_account_id = $2
                  AND student.status IN ('provisional', 'active')
                  AND enrollment.section_id IS NOT NULL
            ), visible_offerings AS (
@@ -700,7 +700,7 @@ fn require_assignment_manager(
 }
 
 fn parse_user_id(principal: &AuthPrincipal) -> ApiResult<Uuid> {
-    Uuid::parse_str(&principal.student.id).map_err(|_| ApiError::Unauthorized)
+    Uuid::parse_str(&principal.student.id).map_err(|_| ApiError::Internal)
 }
 
 async fn ensure_target_role(
@@ -869,9 +869,11 @@ mod tests {
         EffectiveAccess {
             roles: vec![],
             portal_families: vec!["staff".into()],
-            permissions: permission
-                .then(|| vec!["academics.assignments.manage".into()])
-                .unwrap_or_default(),
+            permissions: if permission {
+                vec!["academics.assignments.manage".into()]
+            } else {
+                Vec::new()
+            },
             scopes,
         }
     }

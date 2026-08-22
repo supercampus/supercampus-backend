@@ -8,6 +8,8 @@
 //! - [`SmtpMailer`] sends real mail over SMTP and is selected when `SMTP_HOST` is set.
 //! - [`LogMailer`] writes the message to the tracing log and is the development default.
 
+pub mod whatsapp;
+
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
@@ -154,6 +156,10 @@ pub fn mailer_from_environment() -> anyhow::Result<Arc<dyn Mailer>> {
         .ok()
         .filter(|v| !v.trim().is_empty());
     let Some(host) = host else {
+        let environment = std::env::var("APP_ENV").unwrap_or_else(|_| "development".into());
+        if matches!(environment.as_str(), "production" | "staging") {
+            bail!("SMTP_HOST is required outside development; refusing to log email contents");
+        }
         return Ok(Arc::new(LogMailer));
     };
 

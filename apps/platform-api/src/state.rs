@@ -1,15 +1,22 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
-use supercampus_authn::{AccessClaims, AuthService, generate_refresh_token, hash_refresh_token};
+use supercampus_authn::{
+    AccessClaims, AuthError, AuthService, generate_refresh_token, hash_refresh_token,
+};
 use supercampus_database::{Database, TenantDatabaseManager};
-use supercampus_notifications::{EmailMessage, LogMailer, Mailer};
+use supercampus_notifications::{
+    EmailMessage, LogMailer, Mailer,
+    whatsapp::{LogWhatsApp, WhatsAppSender},
+};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -21,6 +28,7 @@ use crate::models::{
     UpdateAuthorizationRoleRequest, WorkflowDefinition, WorkflowState, WorkflowStateStatus,
     WorkflowTransition,
 };
+use crate::realtime::{RealtimeHub, RealtimePublication};
 
 /// Reset links stay valid for one hour.
 const PASSWORD_RESET_TTL_MINUTES: i64 = 60;
@@ -31,6 +39,33 @@ const PASSWORD_RESET_THROTTLE_MINUTES: i64 = 15;
 pub const MINIMUM_PASSWORD_LENGTH: usize = 12;
 /// Realtime handshake tokens travel in a URL, so they expire almost immediately.
 const REALTIME_TOKEN_TTL_SECONDS: i64 = 60;
+const REFRESH_ROTATION_GRACE_SECONDS: i64 = 10;
+const LOGIN_FAILURE_WINDOW_MINUTES: i64 = 15;
+const LOGIN_BLOCK_MINUTES: i64 = 15;
+const LOGIN_MAX_FAILURES: i32 = 8;
+const FAILED_LOGIN_MINIMUM_DELAY_MS: u64 = 150;
+const SESSION_VALIDATION_CACHE_TTL: Duration = Duration::from_secs(5);
+const EFFECTIVE_ACCESS_CACHE_TTL: Duration = Duration::from_secs(5);
+const CONFIGURATION_CACHE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+struct CachedValue<T> {
+    value: T,
+    expires_at: Instant,
+}
+
+impl<T> CachedValue<T> {
+    fn new(value: T, ttl: Duration) -> Self {
+        Self {
+            value,
+            expires_at: Instant::now() + ttl,
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.expires_at > Instant::now()
+    }
+}
 
 #[derive(Debug, Clone)]
 struct StoredAuthSession {
@@ -39,6 +74,7 @@ struct StoredAuthSession {
     roles: Vec<String>,
     refresh_token_hash: [u8; 32],
     previous_refresh_token_hash: Option<[u8; 32]>,
+    rotated_at: Option<DateTime<Utc>>,
     expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
 }
@@ -137,8 +173,17 @@ pub struct CreatedAuthSession {
 #[derive(Debug, Clone)]
 pub enum RefreshSessionResult {
     Rotated(Box<CreatedAuthSession>),
+    ConcurrentRefresh,
     Invalid,
     ReuseDetected,
+}
+
+#[derive(Debug, Clone)]
+pub enum AccessTokenAuthentication {
+    Authenticated(Box<AuthPrincipal>),
+    Expired,
+    Invalid,
+    SessionInactive,
 }
 
 #[derive(Clone)]
@@ -149,11 +194,16 @@ pub struct AppState {
     tenant_databases: Option<TenantDatabaseManager>,
     records: Arc<RwLock<HashMap<String, DynamicRecord>>>,
     configurations: Arc<RwLock<HashMap<String, ConfigurationDocument>>>,
+    configuration_cache: Arc<RwLock<HashMap<String, CachedValue<Option<ConfigurationDocument>>>>>,
     auth: Arc<AuthService>,
     mailer: Arc<dyn Mailer>,
+    whatsapp: Arc<dyn WhatsAppSender>,
     sessions: Arc<RwLock<HashMap<Uuid, StoredAuthSession>>>,
     identities: Arc<RwLock<HashMap<String, StoredIdentity>>>,
     app_states: Arc<RwLock<HashMap<String, StoredAppState>>>,
+    validated_principals: Arc<RwLock<HashMap<Uuid, CachedValue<AuthPrincipal>>>>,
+    effective_access_cache: Arc<RwLock<HashMap<String, CachedValue<EffectiveAccess>>>>,
+    realtime: RealtimeHub,
 }
 
 impl Default for AppState {
@@ -165,16 +215,33 @@ impl Default for AppState {
             tenant_databases: None,
             records: Arc::new(RwLock::new(HashMap::new())),
             configurations: Arc::new(RwLock::new(HashMap::new())),
+            configuration_cache: Arc::new(RwLock::new(HashMap::new())),
             auth: Arc::new(AuthService::default()),
             mailer: Arc::new(LogMailer),
+            whatsapp: Arc::new(LogWhatsApp),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             identities: Arc::new(RwLock::new(HashMap::new())),
             app_states: Arc::new(RwLock::new(HashMap::new())),
+            validated_principals: Arc::new(RwLock::new(HashMap::new())),
+            effective_access_cache: Arc::new(RwLock::new(HashMap::new())),
+            realtime: RealtimeHub::default(),
         }
     }
 }
 
 impl AppState {
+    pub fn subscribe_realtime(&self) -> tokio::sync::broadcast::Receiver<RealtimePublication> {
+        self.realtime.subscribe()
+    }
+
+    pub fn publish_realtime(&self, publication: RealtimePublication) {
+        self.realtime.publish(publication);
+    }
+
+    async fn invalidate_effective_access(&self) {
+        self.effective_access_cache.write().await.clear();
+    }
+
     pub fn with_database(database: Database) -> Self {
         Self {
             database: Some(database.clone()),
@@ -194,6 +261,37 @@ impl AppState {
     pub fn with_auth(mut self, auth: AuthService) -> Self {
         self.auth = Arc::new(auth);
         self
+    }
+
+    pub fn with_whatsapp(mut self, whatsapp: Arc<dyn WhatsAppSender>) -> Self {
+        self.whatsapp = whatsapp;
+        self
+    }
+
+    /// Every tenant with an active database.
+    ///
+    /// Needed by the public guardian-approval link, which arrives with no
+    /// session and no tenant header: the token itself is the only thing that
+    /// identifies where it belongs, so each tenant is asked in turn.
+    pub async fn registered_tenant_slugs(&self) -> anyhow::Result<Vec<String>> {
+        let Some(database) = &self.database else {
+            return Ok(Vec::new());
+        };
+        let slugs = sqlx::query_scalar::<_, String>(
+            r#"SELECT tenant.slug
+               FROM platform.tenant_databases registry
+               JOIN platform.tenants tenant ON tenant.id = registry.tenant_id
+               WHERE tenant.status = 'active' AND registry.status = 'active'
+               ORDER BY tenant.slug"#,
+        )
+        .fetch_all(database.pool())
+        .await?;
+        Ok(slugs)
+    }
+
+    /// The transport visitor passes go out over.
+    pub fn whatsapp(&self) -> Arc<dyn WhatsAppSender> {
+        self.whatsapp.clone()
     }
 
     pub fn with_mailer(mut self, mailer: Arc<dyn Mailer>) -> Self {
@@ -351,10 +449,60 @@ impl AppState {
             .collect())
     }
 
+    /// Sets or clears a student's photograph.
+    ///
+    /// The URL is stored on `core.students.profile` rather than in a column of
+    /// its own: the mobile roster already reads the profile, and a photograph
+    /// is one of several things a tenant may want to hang off a student without
+    /// a migration each time. Passing `None` removes the key entirely instead
+    /// of leaving an empty string behind, so "no photo" has one representation.
+    pub async fn set_student_photo(
+        &self,
+        tenant_slug: &str,
+        student_id: Uuid,
+        photo_url: Option<&str>,
+    ) -> anyhow::Result<Option<Value>> {
+        let database = self.tenant_database(tenant_slug).await?;
+        let row = sqlx::query(
+            r#"UPDATE core.students student
+               SET profile = CASE
+                       WHEN $3::text IS NULL THEN COALESCE(student.profile, '{}'::jsonb) - 'photoUrl'
+                       ELSE jsonb_set(
+                           COALESCE(student.profile, '{}'::jsonb),
+                           '{photoUrl}',
+                           to_jsonb($3::text),
+                           true
+                       )
+                   END,
+                   updated_at = now()
+               FROM platform.tenants tenant
+               WHERE tenant.id = student.tenant_id
+                 AND tenant.slug = $1
+                 AND student.id = $2
+               RETURNING student.id,
+                         student.full_name,
+                         NULLIF(student.profile ->> 'photoUrl', '') AS photo_url"#,
+        )
+        .bind(tenant_slug)
+        .bind(student_id)
+        .bind(photo_url)
+        .fetch_optional(database.pool())
+        .await
+        .context("failed to update the student photograph")?;
+
+        let Some(row) = row else { return Ok(None) };
+        Ok(Some(json!({
+            "id": row.try_get::<Uuid, _>("id")?,
+            "name": row.try_get::<String, _>("full_name")?,
+            "photoUrl": row.try_get::<Option<String>, _>("photo_url")?,
+        })))
+    }
+
     pub async fn list_student_master(&self, tenant_slug: &str) -> anyhow::Result<Value> {
         let database = self.tenant_database(tenant_slug).await?;
         let rows = sqlx::query(
-            r#"SELECT student.id, student.student_number, student.full_name,
+            r#"SELECT student.id, student.user_account_id AS user_id,
+                      student.student_number, student.full_name,
                       COALESCE(
                           department.name,
                           NULLIF(student.profile ->> 'department', ''),
@@ -362,6 +510,7 @@ impl AppState {
                           ''
                       ) AS department,
                       student.phone, student.email, student.status,
+                      NULLIF(student.profile ->> 'photoUrl', '') AS photo_url,
                       student.created_at, student.updated_at
                FROM core.students student
                JOIN platform.tenants tenant ON tenant.id = student.tenant_id
@@ -381,12 +530,14 @@ impl AppState {
             .map(|row| {
                 Ok(json!({
                     "id": row.try_get::<Uuid, _>("id")?,
+                    "userId": row.try_get::<Option<Uuid>, _>("user_id")?,
                     "rollNo": row.try_get::<String, _>("student_number")?,
                     "name": row.try_get::<String, _>("full_name")?,
                     "department": row.try_get::<String, _>("department")?,
                     "mobileNumber": row.try_get::<Option<String>, _>("phone")?.unwrap_or_default(),
                     "email": row.try_get::<Option<String>, _>("email")?.unwrap_or_default(),
                     "status": row.try_get::<String, _>("status")?,
+                    "photoUrl": row.try_get::<Option<String>, _>("photo_url")?,
                     "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?,
                     "updatedAt": row.try_get::<DateTime<Utc>, _>("updated_at")?,
                 }))
@@ -604,6 +755,12 @@ impl AppState {
         namespace: &str,
     ) -> anyhow::Result<Option<ConfigurationDocument>> {
         if self.database.is_some() {
+            let key = configuration_key(tenant_id, namespace);
+            if let Some(cached) = self.configuration_cache.read().await.get(&key)
+                && cached.is_fresh()
+            {
+                return Ok(cached.value.clone());
+            }
             let database = self.tenant_database(tenant_id).await?;
             let row = sqlx::query(
                 r#"SELECT t.slug AS tenant_slug, d.namespace, d.version, d.value, d.updated_at
@@ -616,7 +773,12 @@ impl AppState {
             .fetch_optional(database.pool())
             .await
             .context("failed to read tenant configuration")?;
-            return row.as_ref().map(row_to_configuration).transpose();
+            let document = row.as_ref().map(row_to_configuration).transpose()?;
+            self.configuration_cache.write().await.insert(
+                key,
+                CachedValue::new(document.clone(), CONFIGURATION_CACHE_TTL),
+            );
+            return Ok(document);
         }
 
         Ok(self
@@ -653,13 +815,18 @@ impl AppState {
             .await
             .context("failed to save tenant configuration")?;
             let version: i64 = row.try_get("version")?;
-            return Ok(ConfigurationDocument {
+            let document = ConfigurationDocument {
                 tenant_id,
                 namespace,
                 version: u64::try_from(version).context("invalid configuration version")?,
                 value,
                 updated_at: row.try_get("updated_at")?,
-            });
+            };
+            self.configuration_cache.write().await.insert(
+                configuration_key(&document.tenant_id, &document.namespace),
+                CachedValue::new(Some(document.clone()), CONFIGURATION_CACHE_TTL),
+            );
+            return Ok(document);
         }
 
         let mut configurations = self.configurations.write().await;
@@ -704,6 +871,25 @@ impl AppState {
     ) -> anyhow::Result<Option<AuthenticatedIdentity>> {
         let email = email.trim().to_ascii_lowercase();
         if let Some(database) = &self.database {
+            let throttle_key = login_throttle_key(&email, tenant_slug);
+            let blocked = sqlx::query_scalar::<_, bool>(
+                r#"SELECT COALESCE(blocked_until > now(), false)
+                   FROM identity.login_throttle
+                   WHERE identifier_hash = $1"#,
+            )
+            .bind(&throttle_key)
+            .fetch_optional(database.pool())
+            .await
+            .context("failed to inspect login throttle")?
+            .unwrap_or(false);
+            if blocked {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    FAILED_LOGIN_MINIMUM_DELAY_MS,
+                ))
+                .await;
+                return Ok(None);
+            }
+
             let row = sqlx::query(
                 r#"SELECT u.id::text AS user_id, u.email, u.display_name, u.initials,
                           m.roles, m.profile, t.slug, t.code, t.name, t.city
@@ -724,6 +910,41 @@ impl AppState {
             .await
             .context("failed to authenticate identity")?;
             let Some(row) = row else {
+                sqlx::query(
+                    r#"INSERT INTO identity.login_throttle
+                           (identifier_hash, failure_count, window_started_at, blocked_until, updated_at)
+                       VALUES ($1, 1, now(), NULL, now())
+                       ON CONFLICT (identifier_hash) DO UPDATE SET
+                           failure_count = CASE
+                               WHEN identity.login_throttle.window_started_at < now() - make_interval(mins => $2)
+                                   THEN 1
+                               ELSE identity.login_throttle.failure_count + 1
+                           END,
+                           window_started_at = CASE
+                               WHEN identity.login_throttle.window_started_at < now() - make_interval(mins => $2)
+                                   THEN now()
+                               ELSE identity.login_throttle.window_started_at
+                           END,
+                           blocked_until = CASE
+                               WHEN identity.login_throttle.window_started_at < now() - make_interval(mins => $2)
+                                   THEN NULL
+                               WHEN identity.login_throttle.failure_count + 1 >= $3
+                                   THEN now() + make_interval(mins => $4)
+                               ELSE identity.login_throttle.blocked_until
+                           END,
+                           updated_at = now()"#,
+                )
+                .bind(&throttle_key)
+                .bind(LOGIN_FAILURE_WINDOW_MINUTES as i32)
+                .bind(LOGIN_MAX_FAILURES)
+                .bind(LOGIN_BLOCK_MINUTES as i32)
+                .execute(database.pool())
+                .await
+                .context("failed to record login failure")?;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    FAILED_LOGIN_MINIMUM_DELAY_MS,
+                ))
+                .await;
                 return Ok(None);
             };
             let roles: Vec<String> = row.try_get("roles")?;
@@ -747,11 +968,19 @@ impl AppState {
                 role: primary_role,
                 profile,
             });
-            sqlx::query("UPDATE identity.users SET last_login_at = now() WHERE id = $1::uuid")
-                .bind(&student.id)
-                .execute(database.pool())
-                .await
-                .context("failed to update identity login time")?;
+            sqlx::query(
+                r#"WITH updated_user AS (
+                       UPDATE identity.users
+                       SET last_login_at = now()
+                       WHERE id = $1::uuid
+                   )
+                   DELETE FROM identity.login_throttle WHERE identifier_hash = $2"#,
+            )
+            .bind(&student.id)
+            .bind(&throttle_key)
+            .execute(database.pool())
+            .await
+            .context("failed to finalize successful identity login")?;
             let access = self
                 .effective_access(&student.tenant_id, &student.id)
                 .await?;
@@ -794,6 +1023,12 @@ impl AppState {
         user_id: &str,
         surface: &str,
     ) -> anyhow::Result<EffectiveAccess> {
+        let cache_key = format!("{tenant_slug}\u{1f}{user_id}\u{1f}{surface}");
+        if let Some(cached) = self.effective_access_cache.read().await.get(&cache_key)
+            && cached.is_fresh()
+        {
+            return Ok(cached.value.clone());
+        }
         if let Some(database) = &self.database {
             let rows = sqlx::query(
                 r#"SELECT role.role_key, role.portal_family, role_grant.permission_key, role_grant.scope,
@@ -902,12 +1137,17 @@ impl AppState {
                 .unwrap_or_default();
             }
 
-            return Ok(EffectiveAccess {
+            let access = EffectiveAccess {
                 roles,
                 portal_families,
                 permissions,
                 scopes,
-            });
+            };
+            self.effective_access_cache.write().await.insert(
+                cache_key,
+                CachedValue::new(access.clone(), EFFECTIVE_ACCESS_CACHE_TTL),
+            );
+            return Ok(access);
         }
 
         let identities = self.identities.read().await;
@@ -1022,6 +1262,7 @@ impl AppState {
             .await?;
         }
         transaction.commit().await?;
+        self.invalidate_effective_access().await;
         Ok(json!({
             "userId": user_id,
             "surface": request.surface,
@@ -1217,6 +1458,7 @@ impl AppState {
             .await?;
         }
         transaction.commit().await?;
+        self.invalidate_effective_access().await;
         self.authorization_roles(tenant_slug)
             .await
             .and_then(|roles| {
@@ -1272,6 +1514,7 @@ impl AppState {
         .await
         .context("failed to update tenant role")?
         .context("role was not found or is protected")?;
+        self.invalidate_effective_access().await;
         authorization_role_row(&row, json!([]))
     }
 
@@ -1337,6 +1580,7 @@ impl AppState {
             }
         }
         transaction.commit().await?;
+        self.invalidate_effective_access().await;
         self.authorization_roles(tenant_slug)
             .await
             .and_then(|roles| {
@@ -1387,6 +1631,7 @@ impl AppState {
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
+        self.invalidate_effective_access().await;
         Ok(())
     }
 
@@ -1519,6 +1764,7 @@ impl AppState {
         )
         .await?;
         transaction.commit().await?;
+        self.invalidate_effective_access().await;
 
         Ok(Some(json!({
             "id": user_id,
@@ -1566,6 +1812,7 @@ impl AppState {
         )
         .await?;
         transaction.commit().await?;
+        self.invalidate_effective_access().await;
         Ok(json!({ "userId": user_id, "roleIds": request.role_ids }))
     }
 
@@ -1699,6 +1946,7 @@ impl AppState {
                     roles: roles.clone(),
                     refresh_token_hash,
                     previous_refresh_token_hash: None,
+                    rotated_at: None,
                     expires_at: refresh_expires_at,
                     revoked_at: None,
                 },
@@ -1719,12 +1967,32 @@ impl AppState {
     pub async fn authenticate_access_token(
         &self,
         token: &str,
-    ) -> anyhow::Result<Option<AuthPrincipal>> {
+    ) -> anyhow::Result<AccessTokenAuthentication> {
         let claims = match self.auth.verify_access_token(token) {
             Ok(claims) => claims,
-            Err(_) => return Ok(None),
+            Err(AuthError::ExpiredToken(_)) => return Ok(AccessTokenAuthentication::Expired),
+            Err(_) => return Ok(AccessTokenAuthentication::Invalid),
         };
-        self.principal_for_claims(&claims).await
+        if let Some(cached) = self.validated_principals.read().await.get(&claims.sid)
+            && cached.is_fresh()
+            && cached.value.student.id == claims.sub
+            && cached.value.student.tenant_id == claims.tid
+        {
+            return Ok(AccessTokenAuthentication::Authenticated(Box::new(
+                cached.value.clone(),
+            )));
+        }
+
+        Ok(match self.principal_for_claims(&claims).await? {
+            Some(principal) => {
+                self.validated_principals.write().await.insert(
+                    claims.sid,
+                    CachedValue::new(principal.clone(), SESSION_VALIDATION_CACHE_TTL),
+                );
+                AccessTokenAuthentication::Authenticated(Box::new(principal))
+            }
+            None => AccessTokenAuthentication::SessionInactive,
+        })
     }
 
     async fn principal_for_claims(
@@ -1733,12 +2001,16 @@ impl AppState {
     ) -> anyhow::Result<Option<AuthPrincipal>> {
         if let Some(database) = &self.database {
             let row = sqlx::query(
-                r#"SELECT s.profile, s.roles
+                r#"SELECT s.profile, m.roles
                    FROM identity.auth_sessions s
                    JOIN platform.tenants t ON t.id = s.tenant_id
+                   JOIN identity.users u ON u.id::text = s.user_id AND u.active
+                   JOIN identity.tenant_memberships m
+                     ON m.tenant_id = s.tenant_id AND m.user_id = u.id AND m.active
                    WHERE s.id = $1
                      AND s.user_id = $2
                      AND t.slug = $3
+                     AND t.status = 'active'
                      AND s.revoked_at IS NULL
                      AND s.expires_at > now()"#,
             )
@@ -1785,11 +2057,16 @@ impl AppState {
                 .context("start session refresh transaction")?;
             let row = sqlx::query(
                 r#"SELECT s.id, t.slug AS tenant_slug, s.user_id, s.roles, s.profile,
-                          s.refresh_token_hash, s.previous_refresh_token_hash, s.expires_at
+                          s.refresh_token_hash, s.previous_refresh_token_hash, s.rotated_at,
+                          s.expires_at
                    FROM identity.auth_sessions s
                    JOIN platform.tenants t ON t.id = s.tenant_id
+                   JOIN identity.users u ON u.id::text = s.user_id AND u.active
+                   JOIN identity.tenant_memberships m
+                     ON m.tenant_id = s.tenant_id AND m.user_id = u.id AND m.active
                    WHERE (s.refresh_token_hash = $1 OR s.previous_refresh_token_hash = $1)
                      AND s.revoked_at IS NULL
+                     AND t.status = 'active'
                    FOR UPDATE OF s"#,
             )
             .bind(supplied_hash.to_vec())
@@ -1804,6 +2081,19 @@ impl AppState {
             let current_hash: Vec<u8> = row.try_get("refresh_token_hash")?;
             let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
             if current_hash.as_slice() != supplied_hash || expires_at <= Utc::now() {
+                let rotated_at: Option<DateTime<Utc>> = row.try_get("rotated_at")?;
+                if expires_at > Utc::now()
+                    && rotated_at.is_some_and(|value| {
+                        Utc::now().signed_duration_since(value).num_seconds()
+                            <= REFRESH_ROTATION_GRACE_SECONDS
+                    })
+                {
+                    transaction
+                        .commit()
+                        .await
+                        .context("commit concurrent refresh")?;
+                    return Ok(RefreshSessionResult::ConcurrentRefresh);
+                }
                 sqlx::query("UPDATE identity.auth_sessions SET revoked_at = now() WHERE id = $1")
                     .bind(session_id)
                     .execute(&mut *transaction)
@@ -1871,6 +2161,12 @@ impl AppState {
             return Ok(RefreshSessionResult::Invalid);
         }
         if session.refresh_token_hash != supplied_hash {
+            if session.rotated_at.is_some_and(|value| {
+                Utc::now().signed_duration_since(value).num_seconds()
+                    <= REFRESH_ROTATION_GRACE_SECONDS
+            }) {
+                return Ok(RefreshSessionResult::ConcurrentRefresh);
+            }
             session.revoked_at = Some(Utc::now());
             return Ok(RefreshSessionResult::ReuseDetected);
         }
@@ -1878,6 +2174,7 @@ impl AppState {
         let new_refresh_hash = hash_refresh_token(&new_refresh_token);
         session.previous_refresh_token_hash = Some(session.refresh_token_hash);
         session.refresh_token_hash = new_refresh_hash;
+        session.rotated_at = Some(Utc::now());
         let access = self
             .auth
             .issue_access_token(
@@ -1901,6 +2198,7 @@ impl AppState {
     }
 
     pub async fn revoke_session(&self, session_id: Uuid) -> anyhow::Result<()> {
+        self.validated_principals.write().await.remove(&session_id);
         if let Some(database) = &self.database {
             sqlx::query(
                 "UPDATE identity.auth_sessions SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
@@ -1918,6 +2216,7 @@ impl AppState {
     }
 
     pub async fn revoke_refresh_token(&self, token: &str) -> anyhow::Result<()> {
+        self.validated_principals.write().await.clear();
         let token_hash = hash_refresh_token(token);
         if let Some(database) = &self.database {
             sqlx::query(
@@ -2190,6 +2489,7 @@ impl AppState {
         .context("failed to revoke sessions after the password change")?;
 
         transaction.commit().await?;
+        self.validated_principals.write().await.clear();
         tracing::info!(%user_id, "password reset completed and sessions revoked");
         Ok(true)
     }
@@ -2266,6 +2566,14 @@ impl AppState {
         states.insert(key, document.clone());
         Ok(document)
     }
+}
+
+fn login_throttle_key(email: &str, tenant_slug: Option<&str>) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(email.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(tenant_slug.unwrap_or("*").as_bytes());
+    hasher.finalize().to_vec()
 }
 
 fn authorization_role_row(row: &PgRow, permissions: Value) -> anyhow::Result<Value> {

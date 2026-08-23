@@ -360,6 +360,8 @@ pub struct AuthStudent {
     pub college: String,
     pub dept: String,
     pub year: String,
+    #[serde(default)]
+    pub photo_url: String,
     pub full_college: String,
     pub tenant: TenantSummary,
 }

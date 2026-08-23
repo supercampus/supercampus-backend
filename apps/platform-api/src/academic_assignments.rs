@@ -849,6 +849,7 @@ mod tests {
                 college: String::new(),
                 dept: String::new(),
                 year: String::new(),
+                photo_url: String::new(),
                 full_college: String::new(),
                 tenant: TenantSummary {
                     id: "tenant-local".into(),

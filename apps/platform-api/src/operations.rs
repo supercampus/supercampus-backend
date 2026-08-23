@@ -57,8 +57,7 @@ pub fn router() -> Router<AppState> {
         .route("/gatepass/scan", post(scan_gatepass))
         .route(
             "/gatepass/visitors",
-            get(crate::visitors::list_visitor_passes)
-                .post(crate::visitors::create_visitor_pass),
+            get(crate::visitors::list_visitor_passes).post(crate::visitors::create_visitor_pass),
         )
         .route(
             "/gatepass/visitors/{pass_id}/decision",
@@ -1805,13 +1804,18 @@ struct DailyAccessRequest {
 /// not drawn a fence yet is let through, because failing closed would lock out
 /// every institution that upgrades before configuring one; that is the single
 /// deliberate hole, and it closes the moment a campus gets a geofence.
-async fn is_inside_campus(
+struct CampusFenceCheck {
+    inside: bool,
+    nearest_fence: Option<(f64, f64, f64)>,
+}
+
+async fn campus_fence_check(
     pool: &sqlx::PgPool,
     tenant: Uuid,
     latitude: f64,
     longitude: f64,
     accuracy_metres: Option<f64>,
-) -> ApiResult<bool> {
+) -> ApiResult<CampusFenceCheck> {
     if !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
         return Err(ApiError::BadRequest("That is not a valid location".into()));
     }
@@ -1831,7 +1835,10 @@ async fn is_inside_campus(
     .await?;
 
     if fences.is_empty() {
-        return Ok(true);
+        return Ok(CampusFenceCheck {
+            inside: true,
+            nearest_fence: None,
+        });
     }
 
     // Phone fixes report their uncertainty as a radius. Allow a small,
@@ -1842,6 +1849,10 @@ async fn is_inside_campus(
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(0.0)
         .min(100.0);
+    let nearest_fence = fences.iter().copied().min_by(|left, right| {
+        metres_between(latitude, longitude, left.0, left.1)
+            .total_cmp(&metres_between(latitude, longitude, right.0, right.1))
+    });
     let inside = fences.iter().any(|(fence_lat, fence_lon, radius)| {
         position_is_within_fence(
             latitude,
@@ -1852,7 +1863,10 @@ async fn is_inside_campus(
             accuracy_margin,
         )
     });
-    Ok(inside)
+    Ok(CampusFenceCheck {
+        inside,
+        nearest_fence,
+    })
 }
 
 fn position_is_within_fence(
@@ -1891,7 +1905,7 @@ async fn activate_daily_access(
     require(&access, "gatepass.access.read")?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let inside = is_inside_campus(
+    let fence_check = campus_fence_check(
         db.pool(),
         tenant,
         input.latitude,
@@ -1899,7 +1913,7 @@ async fn activate_daily_access(
         input.accuracy_metres,
     )
     .await?;
-    if !inside {
+    if !fence_check.inside {
         // Crossing out of the zone invalidates the previously displayed token
         // immediately. Merely hiding it in the app would leave a screenshot of
         // the old QR valid at the scanner until another token replaced it.
@@ -1915,8 +1929,28 @@ async fn activate_daily_access(
     }
     let raw = Uuid::new_v4().to_string();
     let hash = token_hash(&raw);
-    let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.daily_access_passes(tenant_id,user_id,valid_on,qr_token_hash,activated_latitude,activated_longitude) VALUES($1,$2,CURRENT_DATE,$3,$4,$5) ON CONFLICT(tenant_id,user_id,valid_on) DO UPDATE SET qr_token_hash=EXCLUDED.qr_token_hash,activated_latitude=EXCLUDED.activated_latitude,activated_longitude=EXCLUDED.activated_longitude,activated_at=now() RETURNING jsonb_build_object('id',id,'validOn',valid_on,'validFrom',activated_at,'validUntil',(valid_on+1)::timestamptz,'qrPayload',$6::text)")
+    let mut value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.daily_access_passes(tenant_id,user_id,valid_on,qr_token_hash,activated_latitude,activated_longitude) VALUES($1,$2,CURRENT_DATE,$3,$4,$5) ON CONFLICT(tenant_id,user_id,valid_on) DO UPDATE SET qr_token_hash=EXCLUDED.qr_token_hash,activated_latitude=EXCLUDED.activated_latitude,activated_longitude=EXCLUDED.activated_longitude,activated_at=now() RETURNING jsonb_build_object('id',id,'validOn',valid_on,'validFrom',activated_at,'validUntil',(valid_on+1)::timestamptz,'qrPayload',$6::text)")
  .bind(tenant).bind(&principal.student.id).bind(hash).bind(input.latitude).bind(input.longitude).bind(&raw).fetch_one(db.pool()).await?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "location".into(),
+            json!({
+                "latitude": input.latitude,
+                "longitude": input.longitude,
+                "accuracyMetres": input.accuracy_metres,
+            }),
+        );
+        if let Some((latitude, longitude, radius_metres)) = fence_check.nearest_fence {
+            object.insert(
+                "campusGeofence".into(),
+                json!({
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "radiusMetres": radius_metres,
+                }),
+            );
+        }
+    }
     emit(
         &state,
         &principal.student.tenant_id,
@@ -1960,7 +1994,8 @@ async fn scan_gatepass(
     // geofenced daily gate-in, or a visitor's card. A visitor has no account, so
     // their pass id stands in for the user id — gate_movements.user_id is NOT
     // NULL and every "movements for this person" query already keys on it.
-    let match_row=sqlx::query_as::<_,(String,Option<Uuid>,Option<Uuid>)>(r#"SELECT user_id,request_id,visitor_pass_id FROM (
+    let match_row = sqlx::query_as::<_, (String, Option<Uuid>, Option<Uuid>)>(
+        r#"SELECT user_id,request_id,visitor_pass_id FROM (
           SELECT requester_user_id user_id,id request_id,NULL::uuid visitor_pass_id
             FROM campus_ops.gatepass_requests
            WHERE tenant_id=$1 AND state='approved' AND qr_token_hash=$2
@@ -1974,7 +2009,13 @@ async fn scan_gatepass(
             FROM campus_ops.visitor_passes
            WHERE tenant_id=$1 AND state='approved' AND qr_token_hash=$2
              AND now() BETWEEN visit_from AND visit_until
-        ) valid LIMIT 1"#).bind(tenant).bind(hash).fetch_optional(db.pool()).await?.ok_or_else(||ApiError::NotFound("QR is invalid or expired".into()))?;
+        ) valid LIMIT 1"#,
+    )
+    .bind(tenant)
+    .bind(hash)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("QR is invalid or expired".into()))?;
     let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.gate_movements(tenant_id,user_id,request_id,visitor_pass_id,direction,checkpoint,scanned_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING jsonb_build_object('id',id,'userId',user_id,'requestId',request_id,'visitorPassId',visitor_pass_id,'direction',direction,'checkpoint',checkpoint,'createdAt',created_at)")
  .bind(tenant).bind(&match_row.0).bind(match_row.1).bind(match_row.2).bind(&input.direction).bind(input.checkpoint.trim()).bind(&principal.student.id).fetch_one(db.pool()).await?;
     emit(
@@ -2582,12 +2623,9 @@ mod tests {
 
     #[test]
     fn gps_accuracy_margin_keeps_an_inside_device_inside() {
-        let without_margin = position_is_within_fence(
-            13.0144, 80.2356, 13.0104, 80.2356, 400.0, 0.0,
-        );
-        let with_margin = position_is_within_fence(
-            13.0144, 80.2356, 13.0104, 80.2356, 400.0, 50.0,
-        );
+        let without_margin =
+            position_is_within_fence(13.0144, 80.2356, 13.0104, 80.2356, 400.0, 0.0);
+        let with_margin = position_is_within_fence(13.0144, 80.2356, 13.0104, 80.2356, 400.0, 50.0);
 
         assert!(!without_margin);
         assert!(with_margin);

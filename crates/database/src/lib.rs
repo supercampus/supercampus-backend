@@ -192,10 +192,19 @@ impl TenantDatabaseManager {
         let database = Database::connect_options(options, self.tenant_max_connections)
             .await
             .with_context(|| format!("failed to connect tenant {tenant_slug} database"))?;
-        database
-            .migrate()
-            .await
-            .with_context(|| format!("failed to migrate tenant {tenant_slug} database"))?;
+        if std::env::var("SKIP_STARTUP_MIGRATIONS")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+        {
+            tracing::warn!(
+                tenant_slug,
+                "tenant database migration check skipped; migrations must be managed by the release job"
+            );
+        } else {
+            database
+                .migrate()
+                .await
+                .with_context(|| format!("failed to migrate tenant {tenant_slug} database"))?;
+        }
         if std::env::var("SKIP_TENANT_DB_PING").as_deref() == Ok("true") {
             tracing::warn!(tenant_slug, "tenant database readiness ping skipped");
         } else {

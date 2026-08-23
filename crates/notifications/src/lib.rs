@@ -7,6 +7,7 @@
 //!
 //! - [`SmtpMailer`] sends real mail over SMTP and is selected when `SMTP_HOST` is set.
 //! - [`LogMailer`] writes the message to the tracing log and is the development default.
+//! - [`DisabledMailer`] discards messages when email is explicitly disabled.
 
 pub mod whatsapp;
 
@@ -53,6 +54,22 @@ impl Mailer for LogMailer {
 
     fn transport(&self) -> &'static str {
         "log"
+    }
+}
+
+/// Explicitly disabled transport. This is safe for production environments that
+/// have not provisioned SMTP yet because message contents are never logged.
+pub struct DisabledMailer;
+
+#[async_trait]
+impl Mailer for DisabledMailer {
+    async fn send(&self, _message: EmailMessage) -> anyhow::Result<()> {
+        tracing::warn!("email delivery is disabled; message discarded");
+        Ok(())
+    }
+
+    fn transport(&self) -> &'static str {
+        "disabled"
     }
 }
 
@@ -152,6 +169,12 @@ impl Mailer for SmtpMailer {
 /// local development works with no mail server. Outside development a misconfigured
 /// SMTP block is a hard error rather than a silent downgrade to logging.
 pub fn mailer_from_environment() -> anyhow::Result<Arc<dyn Mailer>> {
+    if std::env::var("EMAIL_TRANSPORT")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("disabled"))
+    {
+        return Ok(Arc::new(DisabledMailer));
+    }
+
     let host = std::env::var("SMTP_HOST")
         .ok()
         .filter(|v| !v.trim().is_empty());
@@ -233,5 +256,20 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(mailer.transport(), "log");
+    }
+
+    #[tokio::test]
+    async fn disabled_mailer_discards_a_message() {
+        let mailer = DisabledMailer;
+        let result = mailer
+            .send(EmailMessage {
+                to: "student@example.com".into(),
+                subject: "Reset".into(),
+                text_body: "secret reset link".into(),
+                html_body: None,
+            })
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(mailer.transport(), "disabled");
     }
 }

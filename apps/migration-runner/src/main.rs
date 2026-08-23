@@ -66,7 +66,7 @@ async fn repair_mec_geofence() -> anyhow::Result<()> {
                    ),
                true
            )
-           FROM core.tenants AS tenant
+           FROM platform.tenants AS tenant
            WHERE campus.tenant_id = tenant.id
              AND tenant.slug = 'mec'
              AND campus.active

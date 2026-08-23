@@ -2634,6 +2634,7 @@ fn identity_student(input: IdentityStudentInput) -> AuthStudent {
         college: profile_string("college", &tenant_name),
         dept: profile_string("dept", ""),
         year: profile_string("year", ""),
+        photo_url: profile_string("photoUrl", ""),
         full_college: profile_string("fullCollege", &tenant_name),
         tenant,
     }

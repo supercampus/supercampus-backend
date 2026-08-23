@@ -18,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str).unwrap_or("migrate") {
         "migrate" => migrate_registered_databases().await,
+        "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
         "inspect-source" => inspect_source().await,
@@ -40,9 +41,49 @@ async fn main() -> anyhow::Result<()> {
             provision_tenant(tenant_slug, database_name).await
         }
         command => bail!(
-            "unknown command {command}; expected migrate, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
+            "unknown command {command}; expected migrate, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
+}
+
+/// Applies the guarded MEC coordinate correction even when legacy migration
+/// checksums prevent the general release migrator from advancing. The WHERE
+/// clause makes the repair idempotent and refuses to overwrite any later edit.
+async fn repair_mec_geofence() -> anyhow::Result<()> {
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    let manager = TenantDatabaseManager::clustered(control, &control_url)?;
+    let mec = manager.tenant("mec").await?;
+    let result = sqlx::query(
+        r#"UPDATE core.campuses AS campus
+           SET metadata = jsonb_set(
+               COALESCE(campus.metadata, '{}'::jsonb),
+               '{geofence}',
+               COALESCE(campus.metadata -> 'geofence', '{}'::jsonb)
+                   || jsonb_build_object(
+                       'latitude', 12.9277504,
+                       'longitude', 79.9926235
+                   ),
+               true
+           )
+           FROM core.tenants AS tenant
+           WHERE campus.tenant_id = tenant.id
+             AND tenant.slug = 'mec'
+             AND campus.active
+             AND abs((campus.metadata -> 'geofence' ->> 'latitude')::double precision
+                     - 13.0104) < 0.000001
+             AND abs((campus.metadata -> 'geofence' ->> 'longitude')::double precision
+                     - 80.2356) < 0.000001"#,
+    )
+    .execute(mec.pool())
+    .await
+    .context("failed to repair the MEC campus geofence")?;
+
+    println!(
+        "MEC geofence repair complete; {} stale campus record(s) corrected",
+        result.rows_affected()
+    );
+    Ok(())
 }
 
 async fn inspect_source() -> anyhow::Result<()> {

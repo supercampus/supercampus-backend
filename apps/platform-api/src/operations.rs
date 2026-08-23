@@ -52,6 +52,8 @@ pub fn router() -> Router<AppState> {
             post(decide_gatepass_request),
         )
         .route("/gatepass/daily-access", post(activate_daily_access))
+        .route("/campuses", get(list_campuses).post(create_campus))
+        .route("/campuses/{campus_id}/geofence", put(set_campus_geofence))
         .route("/gatepass/scan", post(scan_gatepass))
         .route(
             "/gatepass/visitors",
@@ -85,6 +87,194 @@ pub fn router() -> Router<AppState> {
             "/attendance/reports/{report_id}/submit",
             post(submit_attendance_report),
         )
+}
+
+// ---------------------------------------------------------------- campuses
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CampusGeofenceRequest {
+    /// Null clears the fence and permits activation from any location.
+    geofence: Option<CampusGeofence>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CampusGeofence {
+    latitude: f64,
+    longitude: f64,
+    radius_metres: f64,
+}
+
+const MIN_GEOFENCE_RADIUS_METRES: f64 = 50.0;
+const MAX_GEOFENCE_RADIUS_METRES: f64 = 20_000.0;
+
+async fn list_campuses(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "platform.configuration.read")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+                     'id', id,
+                     'code', code,
+                     'name', name,
+                     'geofence', metadata -> 'geofence')
+           FROM core.campuses
+           WHERE tenant_id = $1 AND active
+           ORDER BY name"#,
+    )
+    .bind(tenant)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({ "campuses": rows }))))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateCampusRequest {
+    name: String,
+    code: Option<String>,
+}
+
+async fn create_campus(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<CreateCampusRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require(&access, "platform.configuration.update")?;
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("A campus name is required".into()));
+    }
+    let code = match input.code.as_deref().map(str::trim) {
+        Some(value) if !value.is_empty() => value.to_uppercase(),
+        _ => campus_code_from(name),
+    };
+
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let created = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO core.campuses (tenant_id, code, name)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (tenant_id, code) DO NOTHING
+           RETURNING jsonb_build_object(
+                       'id', id, 'code', code, 'name', name,
+                       'geofence', metadata -> 'geofence')"#,
+    )
+    .bind(tenant)
+    .bind(&code)
+    .bind(name)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::Conflict(format!("A campus with code {code} already exists")))?;
+
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(created))))
+}
+
+fn campus_code_from(name: &str) -> String {
+    let slug: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let joined = slug
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("-");
+    if joined.is_empty() {
+        "CAMPUS".into()
+    } else {
+        joined.chars().take(24).collect()
+    }
+}
+
+async fn set_campus_geofence(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(campus_id): Path<Uuid>,
+    Json(input): Json<CampusGeofenceRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "platform.configuration.update")?;
+
+    let patch = match input.geofence {
+        None => Value::Null,
+        Some(fence) => {
+            if !(-90.0..=90.0).contains(&fence.latitude)
+                || !(-180.0..=180.0).contains(&fence.longitude)
+            {
+                return Err(ApiError::BadRequest(
+                    "That is not a valid campus location".into(),
+                ));
+            }
+            if !(MIN_GEOFENCE_RADIUS_METRES..=MAX_GEOFENCE_RADIUS_METRES)
+                .contains(&fence.radius_metres)
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "Radius must be between {MIN_GEOFENCE_RADIUS_METRES:.0} and \
+                     {MAX_GEOFENCE_RADIUS_METRES:.0} metres"
+                )));
+            }
+            json!({
+                "latitude": fence.latitude,
+                "longitude": fence.longitude,
+                "radiusMetres": fence.radius_metres,
+            })
+        }
+    };
+
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let updated = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE core.campuses
+           SET metadata = CASE
+                            WHEN $3::jsonb IS NULL OR $3::jsonb = 'null'::jsonb
+                              THEN COALESCE(metadata, '{}'::jsonb) - 'geofence'
+                            ELSE jsonb_set(
+                                   COALESCE(metadata, '{}'::jsonb),
+                                   '{geofence}', $3::jsonb, true)
+                          END
+           WHERE tenant_id = $1 AND id = $2 AND active
+           RETURNING jsonb_build_object(
+                       'id', id,
+                       'code', code,
+                       'name', name,
+                       'geofence', metadata -> 'geofence')"#,
+    )
+    .bind(tenant)
+    .bind(campus_id)
+    .bind(&patch)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Campus not found".into()))?;
+
+    emit(
+        &state,
+        &principal.student.tenant_id,
+        db.pool(),
+        tenant,
+        "gatepass",
+        "campus_geofence",
+        &campus_id.to_string(),
+        "campus_geofence.updated",
+        &principal.student.id,
+        &json!({ "geofence": patch }),
+    )
+    .await?;
+
+    Ok(Json(ApiResponse::new(updated)))
 }
 
 #[derive(Deserialize)]
@@ -1605,6 +1795,7 @@ async fn decide_gatepass_request(
 struct DailyAccessRequest {
     latitude: f64,
     longitude: f64,
+    accuracy_metres: Option<f64>,
 }
 /// Rejects a gate-in activation raised from outside the campus.
 ///
@@ -1614,12 +1805,13 @@ struct DailyAccessRequest {
 /// not drawn a fence yet is let through, because failing closed would lock out
 /// every institution that upgrades before configuring one; that is the single
 /// deliberate hole, and it closes the moment a campus gets a geofence.
-async fn ensure_inside_campus(
+async fn is_inside_campus(
     pool: &sqlx::PgPool,
     tenant: Uuid,
     latitude: f64,
     longitude: f64,
-) -> ApiResult<()> {
+    accuracy_metres: Option<f64>,
+) -> ApiResult<bool> {
     if !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
         return Err(ApiError::BadRequest("That is not a valid location".into()));
     }
@@ -1639,17 +1831,40 @@ async fn ensure_inside_campus(
     .await?;
 
     if fences.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
 
+    // Phone fixes report their uncertainty as a radius. Allow a small,
+    // bounded accuracy margin so a learner physically inside the configured
+    // boundary is not rejected merely because the current GPS fix is noisy.
+    // The cap prevents a low-quality location from opening the fence broadly.
+    let accuracy_margin = accuracy_metres
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(0.0)
+        .min(100.0);
     let inside = fences.iter().any(|(fence_lat, fence_lon, radius)| {
-        metres_between(latitude, longitude, *fence_lat, *fence_lon) <= *radius
+        position_is_within_fence(
+            latitude,
+            longitude,
+            *fence_lat,
+            *fence_lon,
+            *radius,
+            accuracy_margin,
+        )
     });
-    if inside {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden)
-    }
+    Ok(inside)
+}
+
+fn position_is_within_fence(
+    latitude: f64,
+    longitude: f64,
+    fence_latitude: f64,
+    fence_longitude: f64,
+    radius_metres: f64,
+    accuracy_margin_metres: f64,
+) -> bool {
+    metres_between(latitude, longitude, fence_latitude, fence_longitude)
+        <= radius_metres + accuracy_margin_metres
 }
 
 /// Great-circle distance in metres.
@@ -1676,7 +1891,28 @@ async fn activate_daily_access(
     require(&access, "gatepass.access.read")?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    ensure_inside_campus(db.pool(), tenant, input.latitude, input.longitude).await?;
+    let inside = is_inside_campus(
+        db.pool(),
+        tenant,
+        input.latitude,
+        input.longitude,
+        input.accuracy_metres,
+    )
+    .await?;
+    if !inside {
+        // Crossing out of the zone invalidates the previously displayed token
+        // immediately. Merely hiding it in the app would leave a screenshot of
+        // the old QR valid at the scanner until another token replaced it.
+        sqlx::query(
+            "DELETE FROM campus_ops.daily_access_passes \
+             WHERE tenant_id = $1 AND user_id = $2 AND valid_on = CURRENT_DATE",
+        )
+        .bind(tenant)
+        .bind(&principal.student.id)
+        .execute(db.pool())
+        .await?;
+        return Err(ApiError::Forbidden);
+    }
     let raw = Uuid::new_v4().to_string();
     let hash = token_hash(&raw);
     let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.daily_access_passes(tenant_id,user_id,valid_on,qr_token_hash,activated_latitude,activated_longitude) VALUES($1,$2,CURRENT_DATE,$3,$4,$5) ON CONFLICT(tenant_id,user_id,valid_on) DO UPDATE SET qr_token_hash=EXCLUDED.qr_token_hash,activated_latitude=EXCLUDED.activated_latitude,activated_longitude=EXCLUDED.activated_longitude,activated_at=now() RETURNING jsonb_build_object('id',id,'validOn',valid_on,'validFrom',activated_at,'validUntil',(valid_on+1)::timestamptz,'qrPayload',$6::text)")
@@ -2342,5 +2578,26 @@ mod tests {
 
         let admin = access("admin", &["*"]);
         assert_eq!(authorized_change_modules(&admin).len(), 3);
+    }
+
+    #[test]
+    fn gps_accuracy_margin_keeps_an_inside_device_inside() {
+        let without_margin = position_is_within_fence(
+            13.0144, 80.2356, 13.0104, 80.2356, 400.0, 0.0,
+        );
+        let with_margin = position_is_within_fence(
+            13.0144, 80.2356, 13.0104, 80.2356, 400.0, 50.0,
+        );
+
+        assert!(!without_margin);
+        assert!(with_margin);
+    }
+
+    #[test]
+    fn campus_codes_are_stable_and_url_safe() {
+        assert_eq!(
+            campus_code_from("Madras Engineering College"),
+            "MADRAS-ENGINEERING"
+        );
     }
 }

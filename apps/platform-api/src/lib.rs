@@ -178,8 +178,16 @@ pub async fn run() -> anyhow::Result<()> {
     let control_database =
         Database::connect_with_max_connections(&control_database_url, control_max_connections)
             .await?;
-    control_database.migrate().await?;
-    tracing::info!("control database migration check completed");
+    if std::env::var("SKIP_STARTUP_MIGRATIONS")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        tracing::warn!(
+            "control database migration check skipped; migrations must be managed by the release job"
+        );
+    } else {
+        control_database.migrate().await?;
+        tracing::info!("control database migration check completed");
+    }
     let tenant_databases = TenantDatabaseManager::clustered_with_max_connections(
         control_database.clone(),
         &control_database_url,

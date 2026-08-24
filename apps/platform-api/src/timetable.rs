@@ -853,10 +853,8 @@ async fn create_course_delivery_plan(
            FROM platform.tenants tenant
            JOIN core.subject_offerings offering
              ON offering.tenant_id = tenant.id AND offering.id = $2 AND offering.active
-           JOIN identity.tenant_memberships membership
-             ON membership.tenant_id = tenant.id AND membership.user_id = $3 AND membership.active
            JOIN identity.users user_account
-             ON user_account.id = membership.user_id AND user_account.active
+             ON user_account.id = $3 AND user_account.active
            JOIN core.departments faculty_department
              ON faculty_department.tenant_id = tenant.id AND faculty_department.id = $4
                 AND faculty_department.active

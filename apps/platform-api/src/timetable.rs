@@ -6,10 +6,13 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use chrono::{NaiveDate, NaiveTime};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::Duration,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -269,7 +272,10 @@ struct GeneratorRoom {
 #[derive(Debug, sqlx::FromRow)]
 struct GeneratorWorkload {
     subject_offering_id: Uuid,
+    subject_code: String,
+    subject_name: String,
     section_id: Uuid,
+    section_name: String,
     section_capacity: i32,
     credits: f64,
     delivery_type: String,
@@ -279,6 +285,58 @@ struct GeneratorWorkload {
     required_room_types: Vec<String>,
     teaching_assignment_id: Uuid,
     faculty_user_id: Uuid,
+    faculty_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiTimetablePlan {
+    #[serde(default)]
+    placements: Vec<AiTimetablePlacement>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiTimetablePlacement {
+    subject_offering_id: Uuid,
+    delivery_type: String,
+    day_of_week: i16,
+    start_sequence: i16,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChatResponse {
+    choices: Vec<OpenAiChatChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChatChoice {
+    message: OpenAiChatMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChatMessage {
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiChatRequest<'a> {
+    model: &'a str,
+    messages: Vec<OpenAiChatRequestMessage<'a>>,
+    temperature: f32,
+    max_tokens: u32,
+    response_format: OpenAiResponseFormat<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiChatRequestMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiResponseFormat<'a> {
+    r#type: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1755,6 +1813,152 @@ async fn delete_entry(
     )))
 }
 
+type AiPlacementPreferences = HashMap<(Uuid, String), VecDeque<(i16, i16)>>;
+
+fn timetable_ai_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with("/v1") {
+        format!("{base_url}/chat/completions")
+    } else {
+        format!("{base_url}/v1/chat/completions")
+    }
+}
+
+fn parse_ai_timetable_plan(content: &str) -> Result<AiTimetablePlan, serde_json::Error> {
+    let trimmed = content.trim();
+    let json_content = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    serde_json::from_str(json_content)
+}
+
+async fn request_ai_timetable_preferences(
+    slots: &[GeneratorSlot],
+    rooms: &[GeneratorRoom],
+    workloads: &[GeneratorWorkload],
+    max_faculty_periods: i16,
+) -> Result<Option<AiPlacementPreferences>, String> {
+    let base_url = match std::env::var("TIMETABLE_AI_BASE_URL") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(None),
+    };
+    let api_key = std::env::var("TIMETABLE_AI_API_KEY")
+        .map_err(|_| "TIMETABLE_AI_API_KEY is not configured".to_owned())?;
+    let model = std::env::var("TIMETABLE_AI_MODEL")
+        .unwrap_or_else(|_| "Qwen/Qwen2.5-7B-Instruct".to_owned());
+    let timeout_seconds = std::env::var("TIMETABLE_AI_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (5..=90).contains(value))
+        .unwrap_or(25);
+
+    let input = json!({
+        "workingSlots": slots.iter().map(|slot| json!({
+            "dayOfWeek": slot.day_of_week,
+            "sequence": slot.sequence,
+            "startsAt": slot.starts_at.format("%H:%M").to_string(),
+            "endsAt": slot.ends_at.format("%H:%M").to_string(),
+        })).collect::<Vec<_>>(),
+        "availableRooms": rooms.iter().map(|room| json!({
+            "roomType": room.room_type,
+            "capacity": room.capacity,
+        })).collect::<Vec<_>>(),
+        "maxFacultyPeriodsPerDay": max_faculty_periods,
+        "courseWorkloads": workloads.iter().map(|workload| json!({
+            "subjectOfferingId": workload.subject_offering_id,
+            "subjectCode": workload.subject_code,
+            "subjectName": workload.subject_name,
+            "sectionId": workload.section_id,
+            "sectionName": workload.section_name,
+            "sectionCapacity": workload.section_capacity,
+            "facultyUserId": workload.faculty_user_id,
+            "facultyName": workload.faculty_name,
+            "deliveryType": workload.delivery_type,
+            "credits": workload.credits,
+            "periodsPerWeek": workload.periods_per_week,
+            "blockSize": workload.block_size,
+            "maxBlocksPerDay": workload.max_blocks_per_day,
+            "requiredRoomTypes": workload.required_room_types,
+        })).collect::<Vec<_>>(),
+    });
+    let prompt = format!(
+        "Create preferred timetable placements for the supplied tenant data. Return JSON only as {{\"placements\":[{{\"subjectOfferingId\":\"uuid\",\"deliveryType\":\"class\",\"dayOfWeek\":1,\"startSequence\":1}}]}}. Return one placement per required block, not one per period. Keep each block consecutive; use only supplied day and sequence values; distribute theory across the week; keep labs together; avoid faculty and section collisions; respect maximum blocks per day, room types, capacities, and the faculty daily limit. Higher-credit theory should prefer earlier periods. Do not invent courses, faculty, rooms, days, or sequences. Input: {input}"
+    );
+    let system =
+        "You are a college timetable planning engine. Produce compact, valid JSON and no prose.";
+    let request = OpenAiChatRequest {
+        model: &model,
+        messages: vec![
+            OpenAiChatRequestMessage {
+                role: "system",
+                content: system,
+            },
+            OpenAiChatRequestMessage {
+                role: "user",
+                content: &prompt,
+            },
+        ],
+        temperature: 0.1,
+        max_tokens: 4096,
+        response_format: OpenAiResponseFormat {
+            r#type: "json_object",
+        },
+    };
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_seconds))
+        .build()
+        .map_err(|error| format!("failed to prepare timetable AI client: {error}"))?
+        .post(timetable_ai_endpoint(&base_url))
+        .bearer_auth(api_key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| format!("timetable AI request failed: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("timetable AI returned HTTP {status}"));
+    }
+    let response: OpenAiChatResponse = response
+        .json()
+        .await
+        .map_err(|error| format!("invalid timetable AI response: {error}"))?;
+    let content = response
+        .choices
+        .first()
+        .map(|choice| choice.message.content.as_str())
+        .ok_or_else(|| "timetable AI returned no choices".to_owned())?;
+    let plan = parse_ai_timetable_plan(content)
+        .map_err(|error| format!("timetable AI returned invalid JSON: {error}"))?;
+
+    let valid_workloads: HashSet<(Uuid, String)> = workloads
+        .iter()
+        .map(|workload| (workload.subject_offering_id, workload.delivery_type.clone()))
+        .collect();
+    let valid_slots: HashSet<(i16, i16)> = slots
+        .iter()
+        .map(|slot| (slot.day_of_week, slot.sequence))
+        .collect();
+    let mut preferences: AiPlacementPreferences = HashMap::new();
+    for placement in plan.placements {
+        let key = (placement.subject_offering_id, placement.delivery_type);
+        if valid_workloads.contains(&key)
+            && valid_slots.contains(&(placement.day_of_week, placement.start_sequence))
+        {
+            preferences
+                .entry(key)
+                .or_default()
+                .push_back((placement.day_of_week, placement.start_sequence));
+        }
+    }
+    if preferences.is_empty() {
+        return Err("timetable AI returned no usable placements".to_owned());
+    }
+    Ok(Some(preferences))
+}
+
 async fn generate_version(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -1791,14 +1995,16 @@ async fn generate_version(
         WHERE version.id = $1 AND room.active ORDER BY room.capacity, room.code"#)
         .bind(version_id).fetch_all(&mut *tx).await?;
     let mut workloads = sqlx::query_as::<_, GeneratorWorkload>(r#"SELECT offering.id AS subject_offering_id,
-        offering.section_id, COALESCE(section.capacity, 0) AS section_capacity,
+        subject.code AS subject_code, subject.name AS subject_name,
+        offering.section_id, section.name AS section_name, COALESCE(section.capacity, 0) AS section_capacity,
         COALESCE(subject.credits, 0)::float8 AS credits,
         COALESCE(requirement.delivery_type, 'class') AS delivery_type,
         COALESCE(requirement.periods_per_week, GREATEST(2, CEIL(COALESCE(subject.credits, 3))::smallint))::smallint AS periods_per_week,
         COALESCE(requirement.block_size, 1)::smallint AS block_size,
         COALESCE(requirement.max_blocks_per_day, 1)::smallint AS max_blocks_per_day,
         COALESCE(requirement.required_room_types, ARRAY[]::text[]) AS required_room_types,
-        teaching.id AS teaching_assignment_id, teaching.faculty_user_id
+        teaching.id AS teaching_assignment_id, teaching.faculty_user_id,
+        faculty_user.display_name AS faculty_name
         FROM core.timetable_versions version
         JOIN core.timetable_configurations configuration ON configuration.id = version.configuration_id AND configuration.tenant_id = version.tenant_id
         JOIN core.subject_offerings offering ON offering.tenant_id = version.tenant_id AND offering.academic_year_id = configuration.academic_year_id
@@ -1809,6 +2015,7 @@ async fn generate_version(
         JOIN LATERAL (SELECT candidate.id, candidate.faculty_user_id FROM core.teaching_assignments candidate
           WHERE candidate.tenant_id = offering.tenant_id AND candidate.subject_offering_id = offering.id AND candidate.active
           ORDER BY CASE candidate.assignment_type WHEN 'primary' THEN 0 ELSE 1 END, candidate.created_at LIMIT 1) teaching ON true
+        JOIN identity.users faculty_user ON faculty_user.id = teaching.faculty_user_id AND faculty_user.tenant_id = offering.tenant_id
         WHERE version.id = $1"#)
         .bind(version_id).fetch_all(&mut *tx).await?;
     if request.prioritize_high_credits {
@@ -1850,11 +2057,29 @@ async fn generate_version(
     }
     let mut scheduled = 0_i32;
     let mut unscheduled = Vec::new();
+    let (mut ai_preferences, ai_status) = match request_ai_timetable_preferences(
+        &slots,
+        &rooms,
+        &workloads,
+        max_faculty_periods,
+    )
+    .await
+    {
+        Ok(Some(preferences)) => (preferences, "applied"),
+        Ok(None) => (HashMap::new(), "not_configured"),
+        Err(error) => {
+            tracing::warn!(error = %error, "timetable AI unavailable; using constraint optimizer");
+            (HashMap::new(), "fallback")
+        }
+    };
 
     for workload in workloads {
         let mut remaining = workload.periods_per_week;
         while remaining > 0 {
             let length = workload.block_size.min(remaining).max(1);
+            let preferred = ai_preferences
+                .get_mut(&(workload.subject_offering_id, workload.delivery_type.clone()))
+                .and_then(VecDeque::pop_front);
             let mut best: Option<(i64, i16, Vec<Uuid>, Uuid)> = None;
             for day in 1_i16..=7 {
                 if subject_day_blocks
@@ -1914,7 +2139,13 @@ async fn generate_version(
                     } else {
                         first_sequence * 5
                     };
-                    let score = daily_load * 1_000 + position_score + i64::from(day);
+                    let ai_preference_score = if preferred == Some((day, window[0].sequence)) {
+                        -1_000_000
+                    } else {
+                        0
+                    };
+                    let score =
+                        ai_preference_score + daily_load * 1_000 + position_score + i64::from(day);
                     if best.as_ref().is_none_or(|candidate| score < candidate.0) {
                         best = Some((
                             score,
@@ -1932,12 +2163,15 @@ async fn generate_version(
                             (tenant_id, version_id, slot_id, subject_offering_id, teaching_assignment_id, room_id,
                              delivery_type, session_block_id, block_sequence, block_length, metadata, created_by)
                             SELECT tenant.id, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                              jsonb_build_object('generatedBy', 'constraint-optimizer', 'creditPriority', $12), $11
+                              jsonb_build_object('generatedBy', $13, 'creditPriority', $12, 'aiStatus', $14), $11
                             FROM platform.tenants tenant WHERE tenant.slug = $1"#)
                             .bind(&principal.student.tenant_id).bind(version_id).bind(slot_id)
                             .bind(workload.subject_offering_id).bind(workload.teaching_assignment_id).bind(room_id)
                             .bind(&workload.delivery_type).bind(block_id).bind(index as i16 + 1).bind(length).bind(actor)
-                            .bind(request.prioritize_high_credits).execute(&mut *tx).await?;
+                            .bind(request.prioritize_high_credits)
+                            .bind(if ai_status == "applied" { "jarvislabs-ai-assisted" } else { "constraint-optimizer" })
+                            .bind(ai_status)
+                            .execute(&mut *tx).await?;
                     section_busy.insert((workload.section_id, *slot_id));
                     faculty_busy.insert((workload.faculty_user_id, *slot_id));
                     room_busy.insert((room_id, *slot_id));
@@ -1958,7 +2192,9 @@ async fn generate_version(
         }
     }
     let payload = json!({"versionId": version_id, "scheduledPeriods": scheduled, "unscheduled": unscheduled,
-        "preservedExisting": request.preserve_existing, "engine": "constraint-optimizer-v1"});
+        "preservedExisting": request.preserve_existing,
+        "engine": if ai_status == "applied" { "jarvislabs-ai-assisted-v1" } else { "constraint-optimizer-v1" },
+        "aiStatus": ai_status});
     emit_event(
         &mut tx,
         &principal.student.tenant_id,
@@ -2548,5 +2784,34 @@ mod tests {
             assert!(valid_room_type(room_type));
         }
         assert!(!valid_room_type("department_room_1"));
+    }
+
+    #[test]
+    fn timetable_ai_endpoint_accepts_host_or_v1_base() {
+        assert_eq!(
+            timetable_ai_endpoint("https://ai.example.test"),
+            "https://ai.example.test/v1/chat/completions"
+        );
+        assert_eq!(
+            timetable_ai_endpoint("https://ai.example.test/v1/"),
+            "https://ai.example.test/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn timetable_ai_plan_accepts_plain_or_fenced_json() {
+        let offering_id = Uuid::new_v4();
+        let plain = format!(
+            r#"{{"placements":[{{"subjectOfferingId":"{offering_id}","deliveryType":"laboratory","dayOfWeek":2,"startSequence":5}}]}}"#
+        );
+        let fenced = format!("```json\n{plain}\n```");
+        for content in [plain.as_str(), fenced.as_str()] {
+            let plan = parse_ai_timetable_plan(content).expect("valid AI plan");
+            assert_eq!(plan.placements.len(), 1);
+            assert_eq!(plan.placements[0].subject_offering_id, offering_id);
+            assert_eq!(plan.placements[0].delivery_type, "laboratory");
+            assert_eq!(plan.placements[0].day_of_week, 2);
+            assert_eq!(plan.placements[0].start_sequence, 5);
+        }
     }
 }

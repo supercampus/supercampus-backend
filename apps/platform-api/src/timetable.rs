@@ -23,6 +23,8 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/context", get(context))
         .route("/changes", get(changes))
+        .route("/departments", post(create_department))
+        .route("/classes", post(create_class))
         .route("/configurations", post(create_configuration))
         .route(
             "/configurations/{configuration_id}",
@@ -31,6 +33,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/configurations/{configuration_id}/slots",
             put(replace_slots),
+        )
+        .route(
+            "/configurations/{configuration_id}/draft-entries",
+            delete(clear_draft_entries),
         )
         .route("/rooms", post(create_room))
         .route("/rooms/bulk", post(create_rooms_bulk))
@@ -75,6 +81,27 @@ struct CreateConfigurationRequest {
     max_consecutive_faculty_periods: i16,
     #[serde(default)]
     rules: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateDepartmentRequest {
+    code: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateClassRequest {
+    department_id: Uuid,
+    academic_year_id: Uuid,
+    programme_code: String,
+    programme_name: String,
+    batch_code: String,
+    batch_name: String,
+    section_code: String,
+    section_name: String,
+    capacity: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -636,6 +663,150 @@ async fn create_configuration(
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
 }
 
+async fn create_department(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(request): Json<CreateDepartmentRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require_timetable_manager(&principal, &access)?;
+    if request.code.trim().is_empty() || request.name.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "department code and name are required".into(),
+        ));
+    }
+    let actor = principal_user_id(&principal)?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let mut tx = database.pool().begin().await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO core.departments (tenant_id, code, name)
+           SELECT tenant.id, UPPER(BTRIM($2)), BTRIM($3)
+           FROM platform.tenants tenant WHERE tenant.slug = $1
+           ON CONFLICT (tenant_id, code) DO UPDATE
+           SET name = EXCLUDED.name, active = true, updated_at = now()
+           RETURNING to_jsonb(core.departments.*)"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(&request.code)
+    .bind(&request.name)
+    .fetch_one(&mut *tx)
+    .await?;
+    let id = json_uuid(&value, "id")?;
+    emit_event(
+        &mut tx,
+        &principal.student.tenant_id,
+        "department",
+        id,
+        "timetable.department.saved",
+        actor,
+        value.clone(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn create_class(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(request): Json<CreateClassRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require_timetable_manager(&principal, &access)?;
+    if request.programme_code.trim().is_empty()
+        || request.programme_name.trim().is_empty()
+        || request.batch_code.trim().is_empty()
+        || request.batch_name.trim().is_empty()
+        || request.section_code.trim().is_empty()
+        || request.section_name.trim().is_empty()
+        || request.capacity.is_some_and(|capacity| capacity < 1)
+    {
+        return Err(ApiError::BadRequest(
+            "programme, batch, and class details are required".into(),
+        ));
+    }
+    let actor = principal_user_id(&principal)?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let mut tx = database.pool().begin().await?;
+    let programme_id = sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO core.programmes (tenant_id, department_id, code, name)
+           SELECT tenant.id, department.id, UPPER(BTRIM($3)), BTRIM($4)
+           FROM platform.tenants tenant
+           JOIN core.departments department ON department.tenant_id = tenant.id
+                AND department.id = $2 AND department.active
+           WHERE tenant.slug = $1
+           ON CONFLICT (tenant_id, code) DO UPDATE
+           SET name = EXCLUDED.name, active = true, updated_at = now()
+           WHERE core.programmes.department_id = EXCLUDED.department_id
+           RETURNING id"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(request.department_id)
+    .bind(&request.programme_code)
+    .bind(&request.programme_name)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        ApiError::BadRequest(
+            "department was not found, or the programme code belongs to another department".into(),
+        )
+    })?;
+    let batch_id = sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO core.batches
+               (tenant_id, programme_id, academic_year_id, code, name)
+           SELECT tenant.id, $2, year.id, UPPER(BTRIM($4)), BTRIM($5)
+           FROM platform.tenants tenant
+           JOIN core.academic_years year ON year.tenant_id = tenant.id AND year.id = $3
+           WHERE tenant.slug = $1
+           ON CONFLICT (tenant_id, programme_id, code) DO UPDATE
+           SET name = EXCLUDED.name, active = true, updated_at = now()
+           RETURNING id"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(programme_id)
+    .bind(request.academic_year_id)
+    .bind(&request.batch_code)
+    .bind(&request.batch_name)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("academic year was not found".into()))?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO core.sections (tenant_id, batch_id, code, name, capacity)
+           SELECT tenant.id, $2, UPPER(BTRIM($3)), BTRIM($4), $5
+           FROM platform.tenants tenant WHERE tenant.slug = $1
+           ON CONFLICT (tenant_id, batch_id, code) DO UPDATE
+           SET name = EXCLUDED.name, capacity = EXCLUDED.capacity,
+               active = true, updated_at = now()
+           RETURNING to_jsonb(core.sections.*)"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(batch_id)
+    .bind(&request.section_code)
+    .bind(&request.section_name)
+    .bind(request.capacity)
+    .fetch_one(&mut *tx)
+    .await?;
+    let section_id = json_uuid(&value, "id")?;
+    let payload = json!({
+        "section": value,
+        "departmentId": request.department_id,
+        "programmeId": programme_id,
+        "batchId": batch_id
+    });
+    emit_event(
+        &mut tx,
+        &principal.student.tenant_id,
+        "section",
+        section_id,
+        "timetable.class.saved",
+        actor,
+        payload.clone(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(payload))))
+}
+
 async fn update_configuration(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -776,6 +947,45 @@ async fn replace_slots(
         "configuration",
         configuration_id,
         "timetable.slots.replaced",
+        actor,
+        payload.clone(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(payload)))
+}
+
+async fn clear_draft_entries(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(configuration_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_timetable_manager(&principal, &access)?;
+    let actor = principal_user_id(&principal)?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let mut tx = database.pool().begin().await?;
+    let result = sqlx::query(
+        r#"DELETE FROM core.timetable_entries entry
+           USING core.timetable_versions version, platform.tenants tenant
+           WHERE version.id = entry.version_id AND tenant.id = entry.tenant_id
+             AND tenant.slug = $1 AND version.configuration_id = $2
+             AND version.status = 'draft'"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(configuration_id)
+    .execute(&mut *tx)
+    .await?;
+    let payload = json!({
+        "configurationId": configuration_id,
+        "removedEntries": result.rows_affected()
+    });
+    emit_event(
+        &mut tx,
+        &principal.student.tenant_id,
+        "configuration",
+        configuration_id,
+        "timetable.draft.cleared",
         actor,
         payload.clone(),
     )

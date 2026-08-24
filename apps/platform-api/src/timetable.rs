@@ -24,6 +24,7 @@ pub fn router() -> Router<AppState> {
         .route("/context", get(context))
         .route("/changes", get(changes))
         .route("/terms", post(create_term))
+        .route("/course-delivery-plans", post(create_course_delivery_plan))
         .route("/departments", post(create_department))
         .route("/classes", post(create_class))
         .route("/configurations", post(create_configuration))
@@ -102,6 +103,20 @@ struct CreateTermRequest {
     ends_on: Option<NaiveDate>,
     #[serde(default = "default_term_status")]
     status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateCourseDeliveryPlanRequest {
+    department_id: Uuid,
+    code: String,
+    name: String,
+    credits: Option<f64>,
+    academic_year_id: Uuid,
+    term_id: Option<Uuid>,
+    section_id: Uuid,
+    faculty_user_id: Uuid,
+    faculty_department_id: Uuid,
 }
 
 fn default_term_status() -> String {
@@ -741,6 +756,151 @@ async fn create_term(
     .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn create_course_delivery_plan(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(request): Json<CreateCourseDeliveryPlanRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require_timetable_manager(&principal, &access)?;
+    if request.code.trim().is_empty()
+        || request.name.trim().is_empty()
+        || request.credits.is_some_and(|credits| credits < 0.0)
+    {
+        return Err(ApiError::BadRequest(
+            "course code and name are required, and credits cannot be negative".into(),
+        ));
+    }
+    let actor = principal_user_id(&principal)?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let mut tx = database.pool().begin().await?;
+    let subject_id = sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO core.subjects (tenant_id, department_id, code, name, credits)
+           SELECT tenant.id, department.id, UPPER(BTRIM($3)), BTRIM($4), $5
+           FROM platform.tenants tenant
+           JOIN core.departments department
+             ON department.tenant_id = tenant.id AND department.id = $2 AND department.active
+           WHERE tenant.slug = $1
+           ON CONFLICT (tenant_id, code) DO UPDATE SET
+               department_id = EXCLUDED.department_id, name = EXCLUDED.name,
+               credits = EXCLUDED.credits, active = true, updated_at = now()
+           RETURNING id"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(request.department_id)
+    .bind(&request.code)
+    .bind(&request.name)
+    .bind(request.credits)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("department does not belong to this tenant".into()))?;
+    let created_offering_id = sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO core.subject_offerings
+               (tenant_id, subject_id, academic_year_id, term_id, section_id)
+           SELECT tenant.id, subject.id, year.id, term.id, section.id
+           FROM platform.tenants tenant
+           JOIN core.subjects subject
+             ON subject.tenant_id = tenant.id AND subject.id = $2 AND subject.active
+           JOIN core.academic_years year
+             ON year.tenant_id = tenant.id AND year.id = $3
+           JOIN core.sections section
+             ON section.tenant_id = tenant.id AND section.id = $5 AND section.active
+           LEFT JOIN core.terms term
+             ON term.tenant_id = tenant.id AND term.id = $4
+           WHERE tenant.slug = $1 AND ($4 IS NULL OR term.id IS NOT NULL)
+           ON CONFLICT DO NOTHING
+           RETURNING id"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(subject_id)
+    .bind(request.academic_year_id)
+    .bind(request.term_id)
+    .bind(request.section_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let offering_id = match created_offering_id {
+        Some(id) => id,
+        None => sqlx::query_scalar::<_, Uuid>(
+            r#"UPDATE core.subject_offerings offering
+               SET active = true, updated_at = now()
+               FROM platform.tenants tenant
+               WHERE tenant.id = offering.tenant_id AND tenant.slug = $1
+                 AND offering.subject_id = $2
+                 AND offering.academic_year_id = $3
+                 AND offering.term_id IS NOT DISTINCT FROM $4
+                 AND offering.section_id = $5
+               RETURNING offering.id"#,
+        )
+        .bind(&principal.student.tenant_id)
+        .bind(subject_id)
+        .bind(request.academic_year_id)
+        .bind(request.term_id)
+        .bind(request.section_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "academic year, term, or section does not belong to this tenant".into(),
+            )
+        })?,
+    };
+    let assignment_id = sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO core.teaching_assignments
+               (tenant_id, subject_offering_id, faculty_user_id, assignment_type, assigned_by)
+           SELECT tenant.id, offering.id, user_account.id, 'primary', $7
+           FROM platform.tenants tenant
+           JOIN core.subject_offerings offering
+             ON offering.tenant_id = tenant.id AND offering.id = $2 AND offering.active
+           JOIN identity.tenant_memberships membership
+             ON membership.tenant_id = tenant.id AND membership.user_id = $3 AND membership.active
+           JOIN identity.users user_account
+             ON user_account.id = membership.user_id AND user_account.active
+           JOIN core.departments faculty_department
+             ON faculty_department.tenant_id = tenant.id AND faculty_department.id = $4
+                AND faculty_department.active
+           LEFT JOIN core.employees employee
+             ON employee.tenant_id = tenant.id AND employee.user_id = user_account.id
+           WHERE tenant.slug = $1 AND (
+               employee.status = 'active'
+               OR EXISTS (
+                   SELECT 1 FROM core.teaching_assignments existing
+                   WHERE existing.tenant_id = tenant.id
+                     AND existing.faculty_user_id = user_account.id AND existing.active
+               )
+           )
+           ON CONFLICT (tenant_id, subject_offering_id, faculty_user_id, assignment_type)
+           DO UPDATE SET assigned_by = EXCLUDED.assigned_by, active = true, updated_at = now()
+           RETURNING id"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(offering_id)
+    .bind(request.faculty_user_id)
+    .bind(request.faculty_department_id)
+    .bind(request.academic_year_id)
+    .bind(request.term_id)
+    .bind(actor)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("faculty is not active in this tenant".into()))?;
+    let payload = json!({
+        "subjectId": subject_id,
+        "subjectOfferingId": offering_id,
+        "teachingAssignmentId": assignment_id,
+    });
+    emit_event(
+        &mut tx,
+        &principal.student.tenant_id,
+        "subject_offering",
+        offering_id,
+        "timetable.course_delivery_plan.saved",
+        actor,
+        payload.clone(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(payload))))
 }
 
 async fn create_department(

@@ -321,6 +321,7 @@ pub struct CrmAssistantActionRequest {
 
 #[derive(Debug, Deserialize)]
 struct AiPlannerResponse {
+    #[serde(default)]
     answer: String,
     #[serde(default)]
     action: Option<AiPlannedAction>,
@@ -455,6 +456,21 @@ fn parse_planner_response(content: &str) -> Option<AiPlannerResponse> {
     serde_json::from_str(json_text).ok()
 }
 
+fn normalize_lead_query(query: &str) -> String {
+    let query = query.trim().trim_matches(['"', '\'', '`']);
+    let lower = query.to_ascii_lowercase();
+    if let Some(index) = lower.find("lead workspace") {
+        let name = query[..index]
+            .trim()
+            .trim_end_matches(['-', '·', ':'])
+            .trim();
+        if !name.is_empty() {
+            return name.to_owned();
+        }
+    }
+    query.to_owned()
+}
+
 async fn resolve_action_proposal(
     service: &CrmService,
     context: &RequestContext,
@@ -469,7 +485,8 @@ async fn resolve_action_proposal(
     ) {
         return Ok(None);
     }
-    let query = planned.lead_query.trim();
+    let normalized_query = normalize_lead_query(&planned.lead_query);
+    let query = normalized_query.trim();
     if query.is_empty() {
         return Ok(None);
     }
@@ -624,7 +641,23 @@ pub async fn text_assistant(
             Some(action) => resolve_action_proposal(&service, &context, action).await?,
             None => None,
         };
-        (planned.answer, action)
+        let answer = if planned.answer.trim().is_empty() {
+            action
+                .as_ref()
+                .map(|proposal| {
+                    format!(
+                        "I prepared this change for your review: {}. Confirm it below to update the portal.",
+                        proposal.description
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "I could not identify one exact lead for that action. Use the lead's full name, email, phone number, or complete ID and try again."
+                        .into()
+                })
+        } else {
+            planned.answer
+        };
+        (answer, action)
     } else {
         (raw_content, None)
     };
@@ -1081,7 +1114,7 @@ pub async fn approve_move_request(
 mod application_desk_trigger_tests {
     use super::{
         ApplicationDeskHandoff, ai_chat_endpoint, application_desk_handoff, assistant_instruction,
-        parse_planner_response, pipeline_summary,
+        normalize_lead_query, parse_planner_response, pipeline_summary,
     };
     use serde_json::json;
 
@@ -1151,6 +1184,19 @@ mod application_desk_trigger_tests {
         .expect("valid planner response");
         assert_eq!(response.answer, "There are 4 leads.");
         assert!(response.action.is_none());
+    }
+
+    #[test]
+    fn assistant_accepts_action_only_json_and_cleans_workspace_label() {
+        let response = parse_planner_response(
+            r#"{"action":{"type":"move_lead","leadQuery":"kamal Lead workspace · cae63ad1","payload":{"toStage":"nurture"}}}"#,
+        )
+        .expect("valid action-only response");
+        assert!(response.answer.is_empty());
+        assert_eq!(
+            normalize_lead_query(&response.action.expect("action").lead_query),
+            "kamal"
+        );
     }
 
     #[test]

@@ -388,7 +388,7 @@ async fn context(
                JOIN core.teaching_assignments teaching ON teaching.id = entry.teaching_assignment_id
                LEFT JOIN core.employees faculty
                  ON faculty.tenant_id = entry.tenant_id AND faculty.user_id = teaching.faculty_user_id
-               WHERE version.status = 'published' AND (
+               WHERE (version.status = 'published' OR $6) AND (
                    $3 OR offering.section_id IN (SELECT section_id FROM member_sections)
                    OR EXISTS (
                        SELECT 1 FROM core.elective_group_students member

@@ -299,11 +299,16 @@ async fn context(
                    JOIN tenant ON tenant.id = membership.tenant_id
                    JOIN identity.users user_account
                      ON user_account.id = membership.user_id AND user_account.active
-                   JOIN core.employees employee
+                   LEFT JOIN core.employees employee
                      ON employee.tenant_id = membership.tenant_id
                     AND employee.user_id = membership.user_id
                    WHERE $6 AND membership.active
-                     AND employee.status = 'active'
+                     AND EXISTS (
+                         SELECT 1 FROM core.teaching_assignments teaching
+                         WHERE teaching.tenant_id = membership.tenant_id
+                           AND teaching.faculty_user_id = membership.user_id
+                           AND teaching.active
+                     )
                ), '[]'::jsonb)
            )"#,
     )
@@ -722,7 +727,15 @@ async fn ensure_target_role(
                 AND employee.user_id = membership.user_id
                WHERE tenant.slug = $1 AND (
                    $3 = ANY(membership.roles)
-                   OR ($3 = 'faculty' AND employee.status = 'active')
+                   OR ($3 = 'faculty' AND (
+                       employee.status = 'active'
+                       OR EXISTS (
+                           SELECT 1 FROM core.teaching_assignments teaching
+                           WHERE teaching.tenant_id = membership.tenant_id
+                             AND teaching.faculty_user_id = membership.user_id
+                             AND teaching.active
+                       )
+                   ))
                )
            )"#,
     )

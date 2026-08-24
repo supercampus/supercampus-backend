@@ -64,6 +64,7 @@ pub fn router() -> Router<AppState> {
             post(crate::visitors::decide_visitor_pass),
         )
         .route("/attendance/roster", get(attendance_roster))
+        .route("/student/assessments", get(student_assessments))
         .route("/advisor/students", get(advisor_students))
         .route(
             "/advisor/students/{student_id}/assessments",
@@ -2377,6 +2378,56 @@ async fn update_advisor_student_assessment(
         "assessment.updated",
     );
     Ok(Json(ApiResponse::new(updated)))
+}
+
+/// Assessment marks for the student linked to the signed-in user account.
+/// The student identity is resolved from the bearer token rather than a path
+/// parameter so a learner cannot request another student's results.
+async fn student_assessments(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "academics.marks.read")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let student_id = sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT id
+           FROM core.students
+           WHERE tenant_id = $1
+             AND user_account_id::text = $2
+             AND status IN ('provisional', 'active')
+           LIMIT 1"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Student profile not found".into()))?;
+
+    let assessments = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'id', mark.id,
+             'assessmentKind', mark.assessment_kind,
+             'title', mark.title,
+             'semester', mark.semester,
+             'marksObtained', mark.marks_obtained,
+             'maximumMarks', mark.maximum_marks,
+             'notes', mark.notes,
+             'assessedOn', mark.assessed_on,
+             'updatedAt', mark.updated_at
+           ) ORDER BY mark.semester DESC NULLS LAST,
+                      mark.assessed_on DESC NULLS LAST,
+                      mark.created_at DESC), '[]'::jsonb)
+           FROM core.student_assessment_marks mark
+           WHERE mark.tenant_id = $1 AND mark.student_id = $2"#,
+    )
+    .bind(tenant)
+    .bind(student_id)
+    .fetch_one(db.pool())
+    .await?;
+
+    Ok(Json(ApiResponse::new(json!({"assessments": assessments}))))
 }
 
 async fn attendance_roster(

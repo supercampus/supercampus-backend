@@ -18,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str).unwrap_or("migrate") {
         "migrate" => migrate_registered_databases().await,
+        "apply-mec-advisors" => apply_mec_advisors().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
@@ -44,6 +45,49 @@ async fn main() -> anyhow::Result<()> {
             "unknown command {command}; expected migrate, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
+}
+
+/// Applies the isolated MEC advisor change when a legacy installation cannot
+/// run the full migrator because an old migration checksum predates immutable
+/// migration enforcement. This deliberately does not edit migration history.
+async fn apply_mec_advisors() -> anyhow::Result<()> {
+    const SQL: &str =
+        include_str!("../../../migrations/runtime/0063_class_advisor_assignments.sql");
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    sqlx::raw_sql(SQL)
+        .execute(control.pool())
+        .await
+        .context("failed to apply advisor schema to the control plane")?;
+
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug, registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id = registry.tenant_id
+           WHERE registry.status = 'active' AND tenant.status = 'active'
+           ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await
+    .context("failed to list tenant databases")?;
+
+    let base_options = PgConnectOptions::from_str(&control_url)
+        .context("invalid CONTROL_DATABASE_URL")?;
+    for (slug, database_name) in &databases {
+        validate_database_name(database_name)?;
+        let tenant = Database::connect_options(base_options.clone().database(database_name), 2)
+            .await
+            .with_context(|| format!("failed to connect tenant {slug} database"))?;
+        sqlx::raw_sql(SQL)
+            .execute(tenant.pool())
+            .await
+            .with_context(|| format!("failed to apply advisor schema to {slug}"))?;
+    }
+    println!(
+        "applied MEC advisor assignments to control and {} tenant database(s)",
+        databases.len()
+    );
+    Ok(())
 }
 
 /// Applies the guarded MEC coordinate correction even when legacy migration

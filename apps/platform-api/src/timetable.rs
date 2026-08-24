@@ -742,6 +742,23 @@ async fn replace_slots(
             "published timetable slots cannot be replaced; create a new configuration".into(),
         ));
     }
+    let has_entries = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM core.timetable_entries entry
+               JOIN core.timetable_versions version ON version.id = entry.version_id
+               JOIN platform.tenants tenant ON tenant.id = entry.tenant_id
+               WHERE tenant.slug = $1 AND version.configuration_id = $2
+           )"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(configuration_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_entries {
+        return Err(ApiError::Conflict(
+            "clear the generated timetable before changing its days or periods".into(),
+        ));
+    }
     sqlx::query("DELETE FROM core.timetable_slots slot USING platform.tenants tenant WHERE tenant.id = slot.tenant_id AND tenant.slug = $1 AND slot.configuration_id = $2")
         .bind(&principal.student.tenant_id).bind(configuration_id).execute(&mut *tx).await?;
     for slot in &request.slots {
@@ -1329,7 +1346,7 @@ async fn generate_version(
         offering.section_id, COALESCE(section.capacity, 0) AS section_capacity,
         COALESCE(subject.credits, 0)::float8 AS credits,
         COALESCE(requirement.delivery_type, 'class') AS delivery_type,
-        COALESCE(requirement.periods_per_week, GREATEST(2, CEIL(COALESCE(subject.credits, 3))::smallint)) AS periods_per_week,
+        COALESCE(requirement.periods_per_week, GREATEST(2, CEIL(COALESCE(subject.credits, 3))::smallint))::smallint AS periods_per_week,
         COALESCE(requirement.block_size, 1)::smallint AS block_size,
         COALESCE(requirement.max_blocks_per_day, 1)::smallint AS max_blocks_per_day,
         COALESCE(requirement.required_room_types, ARRAY[]::text[]) AS required_room_types,

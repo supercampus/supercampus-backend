@@ -9,6 +9,7 @@ use chrono::{NaiveDate, NaiveTime};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::{
@@ -32,7 +33,12 @@ pub fn router() -> Router<AppState> {
         .route("/workload-requirements", put(upsert_workload_requirement))
         .route("/elective-groups", post(create_elective_group))
         .route("/versions", post(create_version))
+        .route("/versions/{version_id}/generate", post(generate_version))
         .route("/entries", post(create_entry))
+        .route(
+            "/entries/{entry_id}",
+            put(update_entry).delete(delete_entry),
+        )
         .route("/versions/{version_id}/publish", post(publish_version))
         .route("/substitutions", post(request_substitution))
         .route(
@@ -157,6 +163,44 @@ struct CreateEntryRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GenerateVersionRequest {
+    #[serde(default = "default_true")]
+    preserve_existing: bool,
+    #[serde(default = "default_true")]
+    prioritize_high_credits: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GeneratorSlot {
+    id: Uuid,
+    day_of_week: i16,
+    sequence: i16,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GeneratorRoom {
+    id: Uuid,
+    room_type: String,
+    capacity: i32,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GeneratorWorkload {
+    subject_offering_id: Uuid,
+    section_id: Uuid,
+    section_capacity: i32,
+    credits: f64,
+    delivery_type: String,
+    periods_per_week: i16,
+    block_size: i16,
+    max_blocks_per_day: i16,
+    required_room_types: Vec<String>,
+    teaching_assignment_id: Uuid,
+    faculty_user_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RequestSubstitutionRequest {
     timetable_entry_id: Uuid,
     service_date: NaiveDate,
@@ -210,6 +254,9 @@ fn default_max_blocks_per_day() -> i16 {
 }
 fn default_change_limit() -> i64 {
     100
+}
+fn default_true() -> bool {
+    true
 }
 
 async fn context(
@@ -327,6 +374,7 @@ async fn context(
                    SELECT jsonb_agg(jsonb_build_object(
                        'id', offering.id, 'subjectId', subject.id,
                        'code', subject.code, 'name', subject.name,
+                       'credits', COALESCE(subject.credits, 0),
                        'academicYearId', offering.academic_year_id,
                        'termId', offering.term_id, 'sectionId', offering.section_id,
                        'sectionName', section.name,
@@ -1021,6 +1069,288 @@ async fn create_entry(
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
 }
 
+async fn update_entry(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(entry_id): Path<Uuid>,
+    Json(request): Json<CreateEntryRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_timetable_manager(&principal, &access)?;
+    if !valid_delivery_type(&request.delivery_type)
+        || !(1..=7).contains(&request.block_length)
+        || !(1..=request.block_length).contains(&request.block_sequence)
+    {
+        return Err(ApiError::BadRequest(
+            "invalid delivery type or session block position".into(),
+        ));
+    }
+    let actor = principal_user_id(&principal)?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let mut tx = database.pool().begin().await?;
+    let session_block_id = request.session_block_id.unwrap_or_else(Uuid::new_v4);
+    let value = sqlx::query_scalar::<_, Value>(r#"UPDATE core.timetable_entries entry SET
+        slot_id = slot.id, subject_offering_id = offering.id,
+        teaching_assignment_id = teaching.id, room_id = room.id,
+        elective_group_id = elective.id, delivery_type = $9,
+        session_block_id = $10, block_sequence = $11, block_length = $12,
+        metadata = entry.metadata || jsonb_build_object('lastEditedBy', $13::uuid), updated_at = now()
+        FROM platform.tenants tenant
+        JOIN core.timetable_versions version ON version.tenant_id = tenant.id AND version.id = $3 AND version.status = 'draft'
+        JOIN core.timetable_slots slot ON slot.tenant_id = tenant.id AND slot.id = $4 AND slot.configuration_id = version.configuration_id AND slot.slot_type = 'instructional'
+        JOIN core.subject_offerings offering ON offering.tenant_id = tenant.id AND offering.id = $5 AND offering.active
+        JOIN core.teaching_assignments teaching ON teaching.tenant_id = tenant.id AND teaching.id = $6 AND teaching.subject_offering_id = offering.id AND teaching.active
+        JOIN core.rooms room ON room.tenant_id = tenant.id AND room.id = $7 AND room.active
+        LEFT JOIN core.elective_groups elective ON elective.tenant_id = tenant.id AND elective.id = $8 AND elective.active
+        WHERE tenant.slug = $1 AND entry.tenant_id = tenant.id AND entry.id = $2
+          AND entry.version_id = version.id AND ($8 IS NULL OR elective.id IS NOT NULL)
+        RETURNING to_jsonb(entry.*)"#)
+        .bind(&principal.student.tenant_id).bind(entry_id).bind(request.version_id)
+        .bind(request.slot_id).bind(request.subject_offering_id).bind(request.teaching_assignment_id)
+        .bind(request.room_id).bind(request.elective_group_id).bind(&request.delivery_type)
+        .bind(session_block_id).bind(request.block_sequence).bind(request.block_length).bind(actor)
+        .fetch_optional(&mut *tx).await?
+        .ok_or_else(|| ApiError::BadRequest("entry relationships are invalid or the version is not a draft".into()))?;
+    emit_event(
+        &mut tx,
+        &principal.student.tenant_id,
+        "entry",
+        entry_id,
+        "timetable.entry.updated",
+        actor,
+        value.clone(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(value)))
+}
+
+async fn delete_entry(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(entry_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_timetable_manager(&principal, &access)?;
+    let actor = principal_user_id(&principal)?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let mut tx = database.pool().begin().await?;
+    let deleted = sqlx::query_scalar::<_, Value>(r#"DELETE FROM core.timetable_entries entry
+        USING platform.tenants tenant, core.timetable_versions version
+        WHERE tenant.slug = $1 AND entry.tenant_id = tenant.id AND entry.id = $2
+          AND version.id = entry.version_id AND version.tenant_id = tenant.id AND version.status = 'draft'
+        RETURNING to_jsonb(entry.*)"#)
+        .bind(&principal.student.tenant_id).bind(entry_id)
+        .fetch_optional(&mut *tx).await?
+        .ok_or_else(|| ApiError::Conflict("only entries in a draft timetable can be removed".into()))?;
+    emit_event(
+        &mut tx,
+        &principal.student.tenant_id,
+        "entry",
+        entry_id,
+        "timetable.entry.deleted",
+        actor,
+        deleted.clone(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(
+        json!({"id": entry_id, "deleted": true}),
+    )))
+}
+
+async fn generate_version(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(version_id): Path<Uuid>,
+    Json(request): Json<GenerateVersionRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_timetable_manager(&principal, &access)?;
+    let actor = principal_user_id(&principal)?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let mut tx = database.pool().begin().await?;
+
+    let (max_faculty_periods,): (i16,) = sqlx::query_as(r#"SELECT configuration.max_faculty_periods_per_day
+        FROM core.timetable_versions version
+        JOIN core.timetable_configurations configuration ON configuration.id = version.configuration_id AND configuration.tenant_id = version.tenant_id
+        JOIN platform.tenants tenant ON tenant.id = version.tenant_id
+        WHERE tenant.slug = $1 AND version.id = $2 AND version.status = 'draft' FOR UPDATE OF version"#)
+        .bind(&principal.student.tenant_id).bind(version_id).fetch_optional(&mut *tx).await?
+        .ok_or_else(|| ApiError::Conflict("AI generation requires a draft timetable".into()))?;
+
+    if !request.preserve_existing {
+        sqlx::query("DELETE FROM core.timetable_entries WHERE version_id = $1")
+            .bind(version_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    let slots = sqlx::query_as::<_, GeneratorSlot>(r#"SELECT slot.id, slot.day_of_week, slot.sequence
+        FROM core.timetable_slots slot JOIN core.timetable_versions version ON version.configuration_id = slot.configuration_id AND version.tenant_id = slot.tenant_id
+        WHERE version.id = $1 AND slot.slot_type = 'instructional' ORDER BY slot.day_of_week, slot.sequence"#)
+        .bind(version_id).fetch_all(&mut *tx).await?;
+    let rooms = sqlx::query_as::<_, GeneratorRoom>(r#"SELECT room.id, room.room_type, room.capacity
+        FROM core.rooms room JOIN core.timetable_versions version ON version.tenant_id = room.tenant_id
+        WHERE version.id = $1 AND room.active ORDER BY room.capacity, room.code"#)
+        .bind(version_id).fetch_all(&mut *tx).await?;
+    let mut workloads = sqlx::query_as::<_, GeneratorWorkload>(r#"SELECT offering.id AS subject_offering_id,
+        offering.section_id, COALESCE(section.capacity, 0) AS section_capacity,
+        COALESCE(subject.credits, 0)::float8 AS credits,
+        COALESCE(requirement.delivery_type, 'class') AS delivery_type,
+        COALESCE(requirement.periods_per_week, GREATEST(2, CEIL(COALESCE(subject.credits, 3))::smallint)) AS periods_per_week,
+        COALESCE(requirement.block_size, 1)::smallint AS block_size,
+        COALESCE(requirement.max_blocks_per_day, 1)::smallint AS max_blocks_per_day,
+        COALESCE(requirement.required_room_types, ARRAY[]::text[]) AS required_room_types,
+        teaching.id AS teaching_assignment_id, teaching.faculty_user_id
+        FROM core.timetable_versions version
+        JOIN core.timetable_configurations configuration ON configuration.id = version.configuration_id AND configuration.tenant_id = version.tenant_id
+        JOIN core.subject_offerings offering ON offering.tenant_id = version.tenant_id AND offering.academic_year_id = configuration.academic_year_id
+          AND offering.term_id IS NOT DISTINCT FROM configuration.term_id AND offering.active
+        JOIN core.subjects subject ON subject.id = offering.subject_id AND subject.tenant_id = offering.tenant_id AND subject.active
+        JOIN core.sections section ON section.id = offering.section_id AND section.tenant_id = offering.tenant_id AND section.active
+        LEFT JOIN core.subject_offering_workload_requirements requirement ON requirement.tenant_id = offering.tenant_id AND requirement.subject_offering_id = offering.id
+        JOIN LATERAL (SELECT candidate.id, candidate.faculty_user_id FROM core.teaching_assignments candidate
+          WHERE candidate.tenant_id = offering.tenant_id AND candidate.subject_offering_id = offering.id AND candidate.active
+          ORDER BY CASE candidate.assignment_type WHEN 'primary' THEN 0 ELSE 1 END, candidate.created_at LIMIT 1) teaching ON true
+        WHERE version.id = $1"#)
+        .bind(version_id).fetch_all(&mut *tx).await?;
+    if request.prioritize_high_credits {
+        workloads.sort_by(|a, b| {
+            b.credits
+                .total_cmp(&a.credits)
+                .then_with(|| b.periods_per_week.cmp(&a.periods_per_week))
+        });
+    }
+
+    let existing = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Uuid, i16)>(
+        r#"SELECT entry.slot_id, offering.section_id,
+        assignment.faculty_user_id, entry.room_id, slot.day_of_week
+        FROM core.timetable_entries entry
+        JOIN core.subject_offerings offering ON offering.id = entry.subject_offering_id
+        JOIN core.teaching_assignments assignment ON assignment.id = entry.teaching_assignment_id
+        JOIN core.timetable_slots slot ON slot.id = entry.slot_id WHERE entry.version_id = $1"#,
+    )
+    .bind(version_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut section_busy = HashSet::new();
+    let mut faculty_busy = HashSet::new();
+    let mut room_busy = HashSet::new();
+    let mut faculty_daily: HashMap<(Uuid, i16), i16> = HashMap::new();
+    for (slot, section, faculty, room, day) in existing {
+        section_busy.insert((section, slot));
+        faculty_busy.insert((faculty, slot));
+        room_busy.insert((room, slot));
+        *faculty_daily.entry((faculty, day)).or_default() += 1;
+    }
+    let mut subject_day_blocks: HashMap<(Uuid, i16), i16> = HashMap::new();
+    let mut scheduled = 0_i32;
+    let mut unscheduled = Vec::new();
+
+    for workload in workloads {
+        let mut remaining = workload.periods_per_week;
+        while remaining > 0 {
+            let length = workload.block_size.min(remaining).max(1);
+            let mut placed = false;
+            for day in 1_i16..=7 {
+                if subject_day_blocks
+                    .get(&(workload.subject_offering_id, day))
+                    .copied()
+                    .unwrap_or(0)
+                    >= workload.max_blocks_per_day
+                {
+                    continue;
+                }
+                let day_slots: Vec<&GeneratorSlot> = slots
+                    .iter()
+                    .filter(|slot| slot.day_of_week == day)
+                    .collect();
+                for window in day_slots.windows(length as usize) {
+                    if window.len() != length as usize
+                        || !window
+                            .windows(2)
+                            .all(|pair| pair[1].sequence == pair[0].sequence + 1)
+                    {
+                        continue;
+                    }
+                    if window.iter().any(|slot| {
+                        section_busy.contains(&(workload.section_id, slot.id))
+                            || faculty_busy.contains(&(workload.faculty_user_id, slot.id))
+                    }) {
+                        continue;
+                    }
+                    if faculty_daily
+                        .get(&(workload.faculty_user_id, day))
+                        .copied()
+                        .unwrap_or(0)
+                        + length
+                        > max_faculty_periods
+                    {
+                        continue;
+                    }
+                    let room = rooms.iter().find(|room| {
+                        room.capacity >= workload.section_capacity
+                            && (workload.required_room_types.is_empty()
+                                || workload.required_room_types.contains(&room.room_type))
+                            && window
+                                .iter()
+                                .all(|slot| !room_busy.contains(&(room.id, slot.id)))
+                    });
+                    let Some(room) = room else { continue };
+                    let block_id = Uuid::new_v4();
+                    for (index, slot) in window.iter().enumerate() {
+                        sqlx::query(r#"INSERT INTO core.timetable_entries
+                            (tenant_id, version_id, slot_id, subject_offering_id, teaching_assignment_id, room_id,
+                             delivery_type, session_block_id, block_sequence, block_length, metadata, created_by)
+                            SELECT tenant.id, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                              jsonb_build_object('generatedBy', 'constraint-optimizer', 'creditPriority', $12), $11
+                            FROM platform.tenants tenant WHERE tenant.slug = $1"#)
+                            .bind(&principal.student.tenant_id).bind(version_id).bind(slot.id)
+                            .bind(workload.subject_offering_id).bind(workload.teaching_assignment_id).bind(room.id)
+                            .bind(&workload.delivery_type).bind(block_id).bind(index as i16 + 1).bind(length).bind(actor)
+                            .bind(request.prioritize_high_credits).execute(&mut *tx).await?;
+                        section_busy.insert((workload.section_id, slot.id));
+                        faculty_busy.insert((workload.faculty_user_id, slot.id));
+                        room_busy.insert((room.id, slot.id));
+                    }
+                    *faculty_daily
+                        .entry((workload.faculty_user_id, day))
+                        .or_default() += length;
+                    *subject_day_blocks
+                        .entry((workload.subject_offering_id, day))
+                        .or_default() += 1;
+                    scheduled += i32::from(length);
+                    remaining -= length;
+                    placed = true;
+                    break;
+                }
+                if placed {
+                    break;
+                }
+            }
+            if !placed {
+                unscheduled.push(json!({"subjectOfferingId": workload.subject_offering_id, "remainingPeriods": remaining}));
+                break;
+            }
+        }
+    }
+    let payload = json!({"versionId": version_id, "scheduledPeriods": scheduled, "unscheduled": unscheduled,
+        "preservedExisting": request.preserve_existing, "engine": "constraint-optimizer-v1"});
+    emit_event(
+        &mut tx,
+        &principal.student.tenant_id,
+        "version",
+        version_id,
+        "timetable.version.generated",
+        actor,
+        payload.clone(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(payload)))
+}
+
 async fn publish_version(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -1465,10 +1795,7 @@ fn timetable_manager_allowed(principal: &AuthPrincipal, access: &EffectiveAccess
         && access
             .scope_for("academics.timetable.manage")
             .is_some_and(|scope| matches!(scope, "institution" | "all"))
-        && any_role_may_perform(
-            principal.roles.iter().map(String::as_str),
-            GovernedCapability::TimetableManagement,
-        )
+        && principal.roles.iter().any(|role| role == "principal")
 }
 
 fn require_timetable_manager(principal: &AuthPrincipal, access: &EffectiveAccess) -> ApiResult<()> {
@@ -1567,7 +1894,7 @@ mod tests {
     fn timetable_writes_require_permission_scope_and_governed_role() {
         let allowed = access("academics.timetable.manage", "institution");
         assert!(require_timetable_manager(&principal("principal"), &allowed).is_ok());
-        assert!(require_timetable_manager(&principal("academic_administrator"), &allowed).is_ok());
+        assert!(require_timetable_manager(&principal("academic_administrator"), &allowed).is_err());
         assert!(require_timetable_manager(&principal("hod"), &allowed).is_err());
         assert!(
             require_timetable_manager(

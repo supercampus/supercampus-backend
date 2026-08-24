@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::time::Duration;
 use supercampus_application_desk::{
     application::{ActorContext as DeskActorContext, ApplicationDeskService},
     domain::{AdmissionTrigger, ApplicantSnapshot},
@@ -246,6 +247,14 @@ impl IntoResponse for CrmHttpError {
                 "database_unavailable",
                 "CRM database is not configured".to_owned(),
             ),
+            CrmError::ExternalService(message) => {
+                tracing::error!(error = %message, "CRM AI request failed");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "ai_service_unavailable",
+                    "The AI assistant is temporarily unavailable".to_owned(),
+                )
+            }
             CrmError::Storage(message) => {
                 tracing::error!(error = %message, "CRM storage request failed");
                 let client_message = if cfg!(debug_assertions) {
@@ -274,6 +283,197 @@ fn ok<T: Serialize>(data: T) -> Json<ApiResponse<T>> {
 
 pub async fn health() -> Json<Value> {
     Json(json!({ "module": "crm", "status": "ok", "contract": "v1" }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CrmTextAssistantRequest {
+    pub input: String,
+    #[serde(default = "default_assistant_intent")]
+    pub intent: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrmTextAssistantResponse {
+    pub content: String,
+    pub intent: String,
+    pub model: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AiChatRequest<'a> {
+    model: &'a str,
+    messages: Vec<AiChatRequestMessage<'a>>,
+    temperature: f32,
+    max_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct AiChatRequestMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiChatResponse {
+    choices: Vec<AiChatChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiChatChoice {
+    message: AiChatMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiChatMessage {
+    content: String,
+}
+
+fn default_assistant_intent() -> String {
+    "general".into()
+}
+
+fn ai_environment(primary: &str, legacy: &str) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var(legacy)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+fn ai_chat_endpoint(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.ends_with("/v1") {
+        format!("{base_url}/chat/completions")
+    } else {
+        format!("{base_url}/v1/chat/completions")
+    }
+}
+
+fn assistant_instruction(intent: &str) -> Option<&'static str> {
+    match intent {
+        "general" => Some("Answer the user's admissions CRM request directly and practically."),
+        "summarize" => Some("Summarize the text into key facts, concerns, and next steps."),
+        "extract" => Some(
+            "Extract lead details into a clear field-value list. Mark missing fields instead of inventing values.",
+        ),
+        "follow_up" => Some(
+            "Draft a concise, warm follow-up message suitable for an admissions counselor. Do not claim actions or approvals that have not happened.",
+        ),
+        "next_actions" => Some(
+            "Recommend a prioritized counselor action list with short reasons and any information that must be verified.",
+        ),
+        _ => None,
+    }
+}
+
+pub async fn text_assistant(
+    headers: HeaderMap,
+    Json(request): Json<CrmTextAssistantRequest>,
+) -> Result<Json<ApiResponse<CrmTextAssistantResponse>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    if !context
+        .actor
+        .has_any(&["crm.leads.read", "crm.dashboard.read"])
+    {
+        return Err(CrmHttpError(CrmError::Forbidden(
+            "crm.leads.read or crm.dashboard.read is required".into(),
+        )));
+    }
+    let input = request.input.trim();
+    if input.is_empty() {
+        return Err(CrmHttpError(CrmError::Validation(
+            "text input is required".into(),
+        )));
+    }
+    if input.chars().count() > 12_000 {
+        return Err(CrmHttpError(CrmError::Validation(
+            "text input is limited to 12000 characters".into(),
+        )));
+    }
+    let intent = request.intent.trim().to_ascii_lowercase();
+    let instruction = assistant_instruction(&intent)
+        .ok_or_else(|| CrmHttpError(CrmError::Validation("unknown assistant intent".into())))?;
+    let base_url =
+        ai_environment("SUPERCAMPUS_AI_BASE_URL", "TIMETABLE_AI_BASE_URL").ok_or_else(|| {
+            CrmHttpError(CrmError::ExternalService(
+                "AI base URL is not configured".into(),
+            ))
+        })?;
+    let api_key =
+        ai_environment("SUPERCAMPUS_AI_API_KEY", "TIMETABLE_AI_API_KEY").ok_or_else(|| {
+            CrmHttpError(CrmError::ExternalService(
+                "AI API key is not configured".into(),
+            ))
+        })?;
+    let model = ai_environment("SUPERCAMPUS_AI_MODEL", "TIMETABLE_AI_MODEL")
+        .unwrap_or_else(|| "Qwen/Qwen2.5-7B-Instruct".into());
+    let timeout_seconds = ai_environment(
+        "SUPERCAMPUS_AI_TIMEOUT_SECONDS",
+        "TIMETABLE_AI_TIMEOUT_SECONDS",
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|value| (5..=90).contains(value))
+    .unwrap_or(25);
+    let system = format!(
+        "You are the SuperCampus admissions CRM assistant for tenant {}. Help authorized admissions staff with the text they provide. Use only supplied facts, clearly label uncertainty, never invent applicant data, never make final eligibility or admission decisions, and avoid discriminatory recommendations. {}",
+        context.tenant, instruction
+    );
+    let payload = AiChatRequest {
+        model: &model,
+        messages: vec![
+            AiChatRequestMessage {
+                role: "system",
+                content: &system,
+            },
+            AiChatRequestMessage {
+                role: "user",
+                content: input,
+            },
+        ],
+        temperature: if intent == "extract" { 0.1 } else { 0.3 },
+        max_tokens: 1400,
+    };
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_seconds))
+        .build()
+        .map_err(|error| CrmHttpError(CrmError::ExternalService(error.to_string())))?
+        .post(ai_chat_endpoint(&base_url))
+        .bearer_auth(api_key)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| CrmHttpError(CrmError::ExternalService(error.to_string())))?;
+    if !response.status().is_success() {
+        return Err(CrmHttpError(CrmError::ExternalService(format!(
+            "AI returned HTTP {}",
+            response.status()
+        ))));
+    }
+    let response: AiChatResponse = response
+        .json()
+        .await
+        .map_err(|error| CrmHttpError(CrmError::ExternalService(error.to_string())))?;
+    let content = response
+        .choices
+        .first()
+        .map(|choice| choice.message.content.trim())
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| {
+            CrmHttpError(CrmError::ExternalService(
+                "AI returned an empty response".into(),
+            ))
+        })?
+        .to_owned();
+    Ok(ok(CrmTextAssistantResponse {
+        content,
+        intent,
+        model,
+    }))
 }
 
 pub async fn roles(
@@ -667,7 +867,9 @@ pub async fn approve_move_request(
 
 #[cfg(test)]
 mod application_desk_trigger_tests {
-    use super::{ApplicationDeskHandoff, application_desk_handoff};
+    use super::{
+        ApplicationDeskHandoff, ai_chat_endpoint, application_desk_handoff, assistant_instruction,
+    };
 
     #[test]
     fn admission_desk_opens_only_after_offer_acceptance() {
@@ -696,6 +898,32 @@ mod application_desk_trigger_tests {
         assert_eq!(
             application_desk_handoff("offer_status", Some("rejected")),
             None
+        );
+    }
+
+    #[test]
+    fn assistant_accepts_only_supported_tasks() {
+        for intent in [
+            "general",
+            "summarize",
+            "extract",
+            "follow_up",
+            "next_actions",
+        ] {
+            assert!(assistant_instruction(intent).is_some());
+        }
+        assert!(assistant_instruction("make_admission_decision").is_none());
+    }
+
+    #[test]
+    fn assistant_accepts_host_or_v1_ai_base() {
+        assert_eq!(
+            ai_chat_endpoint("https://ai.example.test"),
+            "https://ai.example.test/v1/chat/completions"
+        );
+        assert_eq!(
+            ai_chat_endpoint("https://ai.example.test/v1/"),
+            "https://ai.example.test/v1/chat/completions"
         );
     }
 }

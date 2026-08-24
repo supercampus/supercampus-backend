@@ -88,6 +88,7 @@ pub fn router(databases: Option<TenantDatabaseManager>) -> Router {
         .route("/dashboard", get(handlers::board))
         .route("/dashboard/operations", get(handlers::operations_dashboard))
         .route("/activity", get(handlers::recent_activity))
+        .route("/assistant/text", post(handlers::text_assistant))
         .route("/events", get(handlers::realtime_events))
         .route(
             "/forms",

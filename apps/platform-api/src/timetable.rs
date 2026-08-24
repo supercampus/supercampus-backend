@@ -1841,19 +1841,30 @@ async fn request_ai_timetable_preferences(
     workloads: &[GeneratorWorkload],
     max_faculty_periods: i16,
 ) -> Result<Option<AiPlacementPreferences>, String> {
-    let base_url = match std::env::var("TIMETABLE_AI_BASE_URL") {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => return Ok(None),
+    let configured = |primary: &str, legacy: &str| {
+        std::env::var(primary)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var(legacy)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
     };
-    let api_key = std::env::var("TIMETABLE_AI_API_KEY")
-        .map_err(|_| "TIMETABLE_AI_API_KEY is not configured".to_owned())?;
-    let model = std::env::var("TIMETABLE_AI_MODEL")
-        .unwrap_or_else(|_| "Qwen/Qwen2.5-7B-Instruct".to_owned());
-    let timeout_seconds = std::env::var("TIMETABLE_AI_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| (5..=90).contains(value))
-        .unwrap_or(25);
+    let Some(base_url) = configured("SUPERCAMPUS_AI_BASE_URL", "TIMETABLE_AI_BASE_URL") else {
+        return Ok(None);
+    };
+    let api_key = configured("SUPERCAMPUS_AI_API_KEY", "TIMETABLE_AI_API_KEY")
+        .ok_or_else(|| "SuperCampus AI API key is not configured".to_owned())?;
+    let model = configured("SUPERCAMPUS_AI_MODEL", "TIMETABLE_AI_MODEL")
+        .unwrap_or_else(|| "Qwen/Qwen2.5-7B-Instruct".to_owned());
+    let timeout_seconds = configured(
+        "SUPERCAMPUS_AI_TIMEOUT_SECONDS",
+        "TIMETABLE_AI_TIMEOUT_SECONDS",
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|value| (5..=90).contains(value))
+    .unwrap_or(25);
 
     let input = json!({
         "workingSlots": slots.iter().map(|slot| json!({

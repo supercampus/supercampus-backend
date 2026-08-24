@@ -16,4 +16,6 @@ pub enum CrmError {
     Storage(String),
     #[error("CRM database is not configured")]
     Unavailable,
+    #[error("CRM external service failed: {0}")]
+    ExternalService(String),
 }

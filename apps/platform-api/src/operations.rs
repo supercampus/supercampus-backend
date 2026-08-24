@@ -65,6 +65,14 @@ pub fn router() -> Router<AppState> {
         )
         .route("/attendance/roster", get(attendance_roster))
         .route("/advisor/students", get(advisor_students))
+        .route(
+            "/advisor/students/{student_id}/assessments",
+            get(advisor_student_assessments).post(create_advisor_student_assessment),
+        )
+        .route(
+            "/advisor/students/{student_id}/assessments/{assessment_id}",
+            put(update_advisor_student_assessment),
+        )
         .route("/attendance/wards", get(attendance_wards))
         .route("/attendance/summary/{student_id}", get(attendance_summary))
         .route(
@@ -2118,6 +2126,259 @@ async fn advisor_students(
     Ok(Json(ApiResponse::new(json!({"students": students}))))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdvisorAssessmentRequest {
+    assessment_kind: String,
+    title: String,
+    semester: Option<i16>,
+    marks_obtained: f64,
+    maximum_marks: f64,
+    notes: Option<String>,
+    assessed_on: Option<NaiveDate>,
+}
+
+struct ValidatedAdvisorAssessment {
+    assessment_kind: String,
+    title: String,
+    semester: Option<i16>,
+    marks_obtained: f64,
+    maximum_marks: f64,
+    notes: Option<String>,
+    assessed_on: Option<NaiveDate>,
+}
+
+fn validate_advisor_assessment(
+    input: AdvisorAssessmentRequest,
+) -> ApiResult<ValidatedAdvisorAssessment> {
+    let kind = input.assessment_kind.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "semester" | "internal" | "test") {
+        return Err(ApiError::BadRequest(
+            "Assessment type must be semester, internal, or test".into(),
+        ));
+    }
+    let title = input.title.trim();
+    if title.is_empty() || title.chars().count() > 120 {
+        return Err(ApiError::BadRequest(
+            "Assessment title must contain 1 to 120 characters".into(),
+        ));
+    }
+    if input
+        .semester
+        .is_some_and(|value| !(1..=12).contains(&value))
+    {
+        return Err(ApiError::BadRequest(
+            "Semester must be between 1 and 12".into(),
+        ));
+    }
+    if !input.maximum_marks.is_finite()
+        || input.maximum_marks <= 0.0
+        || input.maximum_marks > 10_000.0
+        || !input.marks_obtained.is_finite()
+        || input.marks_obtained < 0.0
+        || input.marks_obtained > input.maximum_marks
+    {
+        return Err(ApiError::BadRequest(
+            "Marks must be between zero and the maximum mark".into(),
+        ));
+    }
+    let notes = input
+        .notes
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if notes
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 2_000)
+    {
+        return Err(ApiError::BadRequest(
+            "Assessment notes cannot exceed 2000 characters".into(),
+        ));
+    }
+    Ok(ValidatedAdvisorAssessment {
+        assessment_kind: kind,
+        title: title.to_owned(),
+        semester: input.semester,
+        marks_obtained: input.marks_obtained,
+        maximum_marks: input.maximum_marks,
+        notes,
+        assessed_on: input.assessed_on,
+    })
+}
+
+fn require_class_advisor(access: &EffectiveAccess) -> ApiResult<()> {
+    if !access.roles.iter().any(|role| role == "class_advisor") {
+        return Err(ApiError::Forbidden);
+    }
+    require(access, "students.directory.read")
+}
+
+async fn ensure_advisor_owns_student(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    advisor_user_id: &str,
+    student_id: Uuid,
+) -> ApiResult<()> {
+    let owned = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+             SELECT 1
+             FROM core.students student
+             JOIN core.class_advisor_assignments assignment
+               ON assignment.tenant_id = student.tenant_id
+              AND assignment.department_id::text = student.department_id
+              AND assignment.advisor_user_id::text = $2
+              AND assignment.active
+             WHERE student.tenant_id = $1
+               AND student.id = $3
+               AND student.status IN ('provisional', 'active')
+           )"#,
+    )
+    .bind(tenant)
+    .bind(advisor_user_id)
+    .bind(student_id)
+    .fetch_one(pool)
+    .await?;
+    if owned {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound("Student not found".into()))
+    }
+}
+
+async fn advisor_student_assessments(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(student_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_class_advisor(&access)?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    ensure_advisor_owns_student(db.pool(), tenant, &principal.student.id, student_id).await?;
+
+    let assessments = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'id', mark.id,
+             'assessmentKind', mark.assessment_kind,
+             'title', mark.title,
+             'semester', mark.semester,
+             'marksObtained', mark.marks_obtained,
+             'maximumMarks', mark.maximum_marks,
+             'notes', mark.notes,
+             'assessedOn', mark.assessed_on,
+             'updatedAt', mark.updated_at
+           ) ORDER BY mark.semester DESC NULLS LAST,
+                      mark.assessed_on DESC NULLS LAST,
+                      mark.created_at DESC), '[]'::jsonb)
+           FROM core.student_assessment_marks mark
+           WHERE mark.tenant_id = $1 AND mark.student_id = $2"#,
+    )
+    .bind(tenant)
+    .bind(student_id)
+    .fetch_one(db.pool())
+    .await?;
+
+    Ok(Json(ApiResponse::new(json!({"assessments": assessments}))))
+}
+
+async fn create_advisor_student_assessment(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(student_id): Path<Uuid>,
+    Json(input): Json<AdvisorAssessmentRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require_class_advisor(&access)?;
+    let input = validate_advisor_assessment(input)?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    ensure_advisor_owns_student(db.pool(), tenant, &principal.student.id, student_id).await?;
+
+    let created = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO core.student_assessment_marks
+             (tenant_id, student_id, advisor_user_id, assessment_kind, title,
+              semester, marks_obtained, maximum_marks, notes, assessed_on)
+           VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8, $9, $10)
+           RETURNING jsonb_build_object(
+             'id', id, 'assessmentKind', assessment_kind, 'title', title,
+             'semester', semester, 'marksObtained', marks_obtained,
+             'maximumMarks', maximum_marks, 'notes', notes,
+             'assessedOn', assessed_on, 'updatedAt', updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(student_id)
+    .bind(&principal.student.id)
+    .bind(&input.assessment_kind)
+    .bind(&input.title)
+    .bind(input.semester)
+    .bind(input.marks_obtained)
+    .bind(input.maximum_marks)
+    .bind(&input.notes)
+    .bind(input.assessed_on)
+    .fetch_one(db.pool())
+    .await?;
+
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "students",
+        "assessment",
+        &student_id.to_string(),
+        "assessment.created",
+    );
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(created))))
+}
+
+async fn update_advisor_student_assessment(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path((student_id, assessment_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<AdvisorAssessmentRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_class_advisor(&access)?;
+    let input = validate_advisor_assessment(input)?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    ensure_advisor_owns_student(db.pool(), tenant, &principal.student.id, student_id).await?;
+
+    let updated = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE core.student_assessment_marks
+           SET assessment_kind = $4, title = $5, semester = $6,
+               marks_obtained = $7, maximum_marks = $8, notes = $9,
+               assessed_on = $10, advisor_user_id = $11::uuid, updated_at = now()
+           WHERE tenant_id = $1 AND student_id = $2 AND id = $3
+           RETURNING jsonb_build_object(
+             'id', id, 'assessmentKind', assessment_kind, 'title', title,
+             'semester', semester, 'marksObtained', marks_obtained,
+             'maximumMarks', maximum_marks, 'notes', notes,
+             'assessedOn', assessed_on, 'updatedAt', updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(student_id)
+    .bind(assessment_id)
+    .bind(&input.assessment_kind)
+    .bind(&input.title)
+    .bind(input.semester)
+    .bind(input.marks_obtained)
+    .bind(input.maximum_marks)
+    .bind(&input.notes)
+    .bind(input.assessed_on)
+    .bind(&principal.student.id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Assessment not found".into()))?;
+
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "students",
+        "assessment",
+        &assessment_id.to_string(),
+        "assessment.updated",
+    );
+    Ok(Json(ApiResponse::new(updated)))
+}
+
 async fn attendance_roster(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -2687,6 +2948,36 @@ mod tests {
 
         let admin = access("admin", &["*"]);
         assert_eq!(authorized_change_modules(&admin).len(), 3);
+    }
+
+    #[test]
+    fn advisor_assessment_validation_accepts_manual_tests() {
+        let value = validate_advisor_assessment(AdvisorAssessmentRequest {
+            assessment_kind: "test".into(),
+            title: "Weekly quiz 3".into(),
+            semester: Some(2),
+            marks_obtained: 17.5,
+            maximum_marks: 20.0,
+            notes: Some("Improved presentation".into()),
+            assessed_on: None,
+        })
+        .expect("valid manual test");
+        assert_eq!(value.assessment_kind, "test");
+        assert_eq!(value.title, "Weekly quiz 3");
+    }
+
+    #[test]
+    fn advisor_assessment_validation_rejects_impossible_marks() {
+        let result = validate_advisor_assessment(AdvisorAssessmentRequest {
+            assessment_kind: "internal".into(),
+            title: "Internal 1".into(),
+            semester: Some(1),
+            marks_obtained: 41.0,
+            maximum_marks: 40.0,
+            notes: None,
+            assessed_on: None,
+        });
+        assert!(matches!(result, Err(ApiError::BadRequest(_))));
     }
 
     #[test]

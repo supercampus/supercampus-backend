@@ -378,10 +378,15 @@ pub async fn text_assistant(
     let context = RequestContext::from_headers(&headers)?;
     if !context
         .actor
-        .has_any(&["crm.leads.read", "crm.dashboard.read"])
+        .has_any(&[
+            "crm.leads.read",
+            "crm.dashboard.read",
+            "admissions.read",
+            "admissions.records.read",
+        ])
     {
         return Err(CrmHttpError(CrmError::Forbidden(
-            "crm.leads.read or crm.dashboard.read is required".into(),
+            "Admissions or CRM read access is required".into(),
         )));
     }
     let input = request.input.trim();

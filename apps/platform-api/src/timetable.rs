@@ -175,6 +175,8 @@ struct GeneratorSlot {
     id: Uuid,
     day_of_week: i16,
     sequence: i16,
+    starts_at: NaiveTime,
+    ends_at: NaiveTime,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1186,7 +1188,7 @@ async fn generate_version(
             .await?;
     }
 
-    let slots = sqlx::query_as::<_, GeneratorSlot>(r#"SELECT slot.id, slot.day_of_week, slot.sequence
+    let slots = sqlx::query_as::<_, GeneratorSlot>(r#"SELECT slot.id, slot.day_of_week, slot.sequence, slot.starts_at, slot.ends_at
         FROM core.timetable_slots slot JOIN core.timetable_versions version ON version.configuration_id = slot.configuration_id AND version.tenant_id = slot.tenant_id
         WHERE version.id = $1 AND slot.slot_type = 'instructional' ORDER BY slot.day_of_week, slot.sequence"#)
         .bind(version_id).fetch_all(&mut *tx).await?;
@@ -1223,9 +1225,10 @@ async fn generate_version(
         });
     }
 
-    let existing = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Uuid, i16)>(
+    let existing = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Uuid, i16, Uuid, Uuid)>(
         r#"SELECT entry.slot_id, offering.section_id,
-        assignment.faculty_user_id, entry.room_id, slot.day_of_week
+        assignment.faculty_user_id, entry.room_id, slot.day_of_week,
+        entry.subject_offering_id, entry.session_block_id
         FROM core.timetable_entries entry
         JOIN core.subject_offerings offering ON offering.id = entry.subject_offering_id
         JOIN core.teaching_assignments assignment ON assignment.id = entry.teaching_assignment_id
@@ -1238,13 +1241,19 @@ async fn generate_version(
     let mut faculty_busy = HashSet::new();
     let mut room_busy = HashSet::new();
     let mut faculty_daily: HashMap<(Uuid, i16), i16> = HashMap::new();
-    for (slot, section, faculty, room, day) in existing {
+    let mut section_daily: HashMap<(Uuid, i16), i16> = HashMap::new();
+    let mut subject_day_blocks: HashMap<(Uuid, i16), i16> = HashMap::new();
+    let mut known_blocks = HashSet::new();
+    for (slot, section, faculty, room, day, offering, block) in existing {
         section_busy.insert((section, slot));
         faculty_busy.insert((faculty, slot));
         room_busy.insert((room, slot));
         *faculty_daily.entry((faculty, day)).or_default() += 1;
+        *section_daily.entry((section, day)).or_default() += 1;
+        if known_blocks.insert((offering, day, block)) {
+            *subject_day_blocks.entry((offering, day)).or_default() += 1;
+        }
     }
-    let mut subject_day_blocks: HashMap<(Uuid, i16), i16> = HashMap::new();
     let mut scheduled = 0_i32;
     let mut unscheduled = Vec::new();
 
@@ -1252,7 +1261,7 @@ async fn generate_version(
         let mut remaining = workload.periods_per_week;
         while remaining > 0 {
             let length = workload.block_size.min(remaining).max(1);
-            let mut placed = false;
+            let mut best: Option<(i64, i16, Vec<Uuid>, Uuid)> = None;
             for day in 1_i16..=7 {
                 if subject_day_blocks
                     .get(&(workload.subject_offering_id, day))
@@ -1268,9 +1277,10 @@ async fn generate_version(
                     .collect();
                 for window in day_slots.windows(length as usize) {
                     if window.len() != length as usize
-                        || !window
-                            .windows(2)
-                            .all(|pair| pair[1].sequence == pair[0].sequence + 1)
+                        || !window.windows(2).all(|pair| {
+                            pair[1].sequence == pair[0].sequence + 1
+                                && pair[0].ends_at == pair[1].starts_at
+                        })
                     {
                         continue;
                     }
@@ -1298,38 +1308,56 @@ async fn generate_version(
                                 .all(|slot| !room_busy.contains(&(room.id, slot.id)))
                     });
                     let Some(room) = room else { continue };
-                    let block_id = Uuid::new_v4();
-                    for (index, slot) in window.iter().enumerate() {
-                        sqlx::query(r#"INSERT INTO core.timetable_entries
+                    let first_sequence = i64::from(window[0].sequence);
+                    let daily_load = i64::from(
+                        section_daily
+                            .get(&(workload.section_id, day))
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                    let position_score = if length > 1 {
+                        (first_sequence - 5).abs() * 10
+                    } else {
+                        first_sequence * 5
+                    };
+                    let score = daily_load * 1_000 + position_score + i64::from(day);
+                    if best.as_ref().is_none_or(|candidate| score < candidate.0) {
+                        best = Some((
+                            score,
+                            day,
+                            window.iter().map(|slot| slot.id).collect(),
+                            room.id,
+                        ));
+                    }
+                }
+            }
+            if let Some((_, day, slot_ids, room_id)) = best {
+                let block_id = Uuid::new_v4();
+                for (index, slot_id) in slot_ids.iter().enumerate() {
+                    sqlx::query(r#"INSERT INTO core.timetable_entries
                             (tenant_id, version_id, slot_id, subject_offering_id, teaching_assignment_id, room_id,
                              delivery_type, session_block_id, block_sequence, block_length, metadata, created_by)
                             SELECT tenant.id, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                               jsonb_build_object('generatedBy', 'constraint-optimizer', 'creditPriority', $12), $11
                             FROM platform.tenants tenant WHERE tenant.slug = $1"#)
-                            .bind(&principal.student.tenant_id).bind(version_id).bind(slot.id)
-                            .bind(workload.subject_offering_id).bind(workload.teaching_assignment_id).bind(room.id)
+                            .bind(&principal.student.tenant_id).bind(version_id).bind(slot_id)
+                            .bind(workload.subject_offering_id).bind(workload.teaching_assignment_id).bind(room_id)
                             .bind(&workload.delivery_type).bind(block_id).bind(index as i16 + 1).bind(length).bind(actor)
                             .bind(request.prioritize_high_credits).execute(&mut *tx).await?;
-                        section_busy.insert((workload.section_id, slot.id));
-                        faculty_busy.insert((workload.faculty_user_id, slot.id));
-                        room_busy.insert((room.id, slot.id));
-                    }
-                    *faculty_daily
-                        .entry((workload.faculty_user_id, day))
-                        .or_default() += length;
-                    *subject_day_blocks
-                        .entry((workload.subject_offering_id, day))
-                        .or_default() += 1;
-                    scheduled += i32::from(length);
-                    remaining -= length;
-                    placed = true;
-                    break;
+                    section_busy.insert((workload.section_id, *slot_id));
+                    faculty_busy.insert((workload.faculty_user_id, *slot_id));
+                    room_busy.insert((room_id, *slot_id));
                 }
-                if placed {
-                    break;
-                }
-            }
-            if !placed {
+                *faculty_daily
+                    .entry((workload.faculty_user_id, day))
+                    .or_default() += length;
+                *subject_day_blocks
+                    .entry((workload.subject_offering_id, day))
+                    .or_default() += 1;
+                *section_daily.entry((workload.section_id, day)).or_default() += length;
+                scheduled += i32::from(length);
+                remaining -= length;
+            } else {
                 unscheduled.push(json!({"subjectOfferingId": workload.subject_offering_id, "remainingPeriods": remaining}));
                 break;
             }

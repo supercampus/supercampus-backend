@@ -302,7 +302,8 @@ async fn context(
                    LEFT JOIN core.employees employee
                      ON employee.tenant_id = membership.tenant_id
                     AND employee.user_id = membership.user_id
-                   WHERE $6 AND membership.active AND 'faculty' = ANY(membership.roles)
+                   WHERE $6 AND membership.active
+                     AND membership.roles && ARRAY['faculty', 'staff']::text[]
                ), '[]'::jsonb)
            )"#,
     )
@@ -716,7 +717,11 @@ async fn ensure_target_role(
                JOIN identity.tenant_memberships membership
                  ON membership.tenant_id = tenant.id
                 AND membership.user_id = $2 AND membership.active
-               WHERE tenant.slug = $1 AND $3 = ANY(membership.roles)
+               WHERE tenant.slug = $1
+                 AND CASE
+                       WHEN $3 = 'faculty' THEN membership.roles && ARRAY['faculty', 'staff']::text[]
+                       ELSE $3 = ANY(membership.roles)
+                     END
            )"#,
     )
     .bind(tenant_slug)

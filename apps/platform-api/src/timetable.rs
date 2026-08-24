@@ -3,7 +3,7 @@ use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use chrono::{NaiveDate, NaiveTime};
 use serde::Deserialize;
@@ -31,6 +31,10 @@ pub fn router() -> Router<AppState> {
         .route("/rooms", post(create_room))
         .route("/rooms/bulk", post(create_rooms_bulk))
         .route("/workload-requirements", put(upsert_workload_requirement))
+        .route(
+            "/workload-requirements/{subject_offering_id}/{delivery_type}",
+            delete(delete_workload_requirement),
+        )
         .route("/elective-groups", post(create_elective_group))
         .route("/versions", post(create_version))
         .route("/versions/{version_id}/generate", post(generate_version))
@@ -882,6 +886,48 @@ async fn upsert_workload_requirement(
     .await?;
     tx.commit().await?;
     Ok(Json(ApiResponse::new(value)))
+}
+
+async fn delete_workload_requirement(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path((subject_offering_id, delivery_type)): Path<(Uuid, String)>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_timetable_manager(&principal, &access)?;
+    if !valid_delivery_type(&delivery_type) {
+        return Err(ApiError::BadRequest("invalid delivery type".into()));
+    }
+    let actor = principal_user_id(&principal)?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let mut tx = database.pool().begin().await?;
+    let deleted = sqlx::query_scalar::<_, Uuid>(
+        r#"DELETE FROM core.subject_offering_workload_requirements requirement
+        USING platform.tenants tenant WHERE tenant.id = requirement.tenant_id AND tenant.slug = $1
+          AND requirement.subject_offering_id = $2 AND requirement.delivery_type = $3
+        RETURNING requirement.id"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(subject_offering_id)
+    .bind(&delivery_type)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(id) = deleted {
+        emit_event(
+            &mut tx,
+            &principal.student.tenant_id,
+            "workload",
+            id,
+            "timetable.workload.deleted",
+            actor,
+            json!({"subjectOfferingId": subject_offering_id, "deliveryType": delivery_type}),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(
+        json!({"deleted": deleted.is_some()}),
+    )))
 }
 
 async fn create_elective_group(

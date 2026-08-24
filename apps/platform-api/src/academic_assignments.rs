@@ -299,17 +299,11 @@ async fn context(
                    JOIN tenant ON tenant.id = membership.tenant_id
                    JOIN identity.users user_account
                      ON user_account.id = membership.user_id AND user_account.active
-                   JOIN authz.user_roles user_role
-                     ON user_role.tenant_id = membership.tenant_id
-                    AND user_role.user_id = membership.user_id
-                   JOIN authz.roles role
-                     ON role.tenant_id = user_role.tenant_id
-                    AND role.id = user_role.role_id AND role.active
-                   LEFT JOIN core.employees employee
+                   JOIN core.employees employee
                      ON employee.tenant_id = membership.tenant_id
                     AND employee.user_id = membership.user_id
                    WHERE $6 AND membership.active
-                     AND role.role_key IN ('faculty', 'staff')
+                     AND employee.status = 'active'
                ), '[]'::jsonb)
            )"#,
     )
@@ -723,15 +717,12 @@ async fn ensure_target_role(
                JOIN identity.tenant_memberships membership
                  ON membership.tenant_id = tenant.id
                 AND membership.user_id = $2 AND membership.active
-               JOIN authz.user_roles user_role
-                 ON user_role.tenant_id = membership.tenant_id
-                AND user_role.user_id = membership.user_id
-               JOIN authz.roles role
-                 ON role.tenant_id = user_role.tenant_id
-                AND role.id = user_role.role_id AND role.active
+               LEFT JOIN core.employees employee
+                 ON employee.tenant_id = membership.tenant_id
+                AND employee.user_id = membership.user_id
                WHERE tenant.slug = $1 AND (
-                   role.role_key = $3
-                   OR ($3 = 'faculty' AND role.role_key = 'staff')
+                   $3 = ANY(membership.roles)
+                   OR ($3 = 'faculty' AND employee.status = 'active')
                )
            )"#,
     )

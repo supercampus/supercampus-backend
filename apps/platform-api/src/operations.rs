@@ -64,6 +64,7 @@ pub fn router() -> Router<AppState> {
             post(crate::visitors::decide_visitor_pass),
         )
         .route("/attendance/roster", get(attendance_roster))
+        .route("/advisor/students", get(advisor_students))
         .route("/attendance/wards", get(attendance_wards))
         .route("/attendance/summary/{student_id}", get(attendance_summary))
         .route(
@@ -2048,6 +2049,73 @@ struct AttendanceSessionRequest {
 #[serde(rename_all = "camelCase")]
 struct AttendanceRosterQuery {
     section_id: Option<String>,
+}
+
+/// The complete student directory slice owned by the signed-in class advisor.
+/// Department ownership comes from explicit assignments rather than a client
+/// supplied filter, so one advisor can safely cover multiple departments.
+async fn advisor_students(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    if !access.roles.iter().any(|role| role == "class_advisor") {
+        return Err(ApiError::Forbidden);
+    }
+    require(&access, "students.directory.read")?;
+
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let students = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT COALESCE(jsonb_agg(jsonb_build_object(
+          'studentUserId', student.user_account_id::text,
+          'studentId', student.id,
+          'studentNumber', student.student_number,
+          'studentName', student.full_name,
+          'email', student.email,
+          'phone', student.phone,
+          'departmentId', student.department_id,
+          'departmentCode', department.code,
+          'departmentName', department.name,
+          'programmeName', programme.name,
+          'academicYear', student.academic_year,
+          'sectionId', student.section_id,
+          'sectionName', section.name,
+          'campusName', campus.name,
+          'status', student.status,
+          'photoUrl', NULLIF(student.profile ->> 'photoUrl', ''),
+          'profile', student.profile
+        ) ORDER BY department.code, student.student_number, student.full_name), '[]'::jsonb)
+        FROM core.students student
+        JOIN core.class_advisor_assignments assignment
+          ON assignment.tenant_id = student.tenant_id
+         AND assignment.department_id::text = student.department_id
+         AND assignment.advisor_user_id::text = $2
+         AND assignment.active
+        LEFT JOIN core.departments department
+          ON department.tenant_id = student.tenant_id
+         AND department.id::text = student.department_id
+        LEFT JOIN core.programmes programme
+          ON programme.tenant_id = student.tenant_id
+         AND programme.id::text = student.program_id
+        LEFT JOIN core.sections section
+          ON section.tenant_id = student.tenant_id
+         AND section.id::text = student.section_id
+        LEFT JOIN core.campuses campus
+          ON campus.tenant_id = student.tenant_id
+         AND campus.id::text = student.campus_id
+        WHERE student.tenant_id = $1
+          AND student.status IN ('provisional', 'active')
+          AND student.user_account_id IS NOT NULL
+        "#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+
+    Ok(Json(ApiResponse::new(json!({"students": students}))))
 }
 
 async fn attendance_roster(

@@ -299,6 +299,41 @@ pub struct CrmTextAssistantResponse {
     pub content: String,
     pub intent: String,
     pub model: String,
+    pub grounded: bool,
+    pub action: Option<CrmAssistantActionProposal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrmAssistantActionProposal {
+    pub action_type: String,
+    pub lead_id: Uuid,
+    pub lead_name: String,
+    pub description: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CrmAssistantActionRequest {
+    pub action: CrmAssistantActionProposal,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiPlannerResponse {
+    answer: String,
+    #[serde(default)]
+    action: Option<AiPlannedAction>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiPlannedAction {
+    #[serde(rename = "type")]
+    action_type: String,
+    lead_query: String,
+    #[serde(default)]
+    payload: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -371,7 +406,105 @@ fn assistant_instruction(intent: &str) -> Option<&'static str> {
     }
 }
 
+fn pipeline_summary(board: &Value) -> Value {
+    let stages = board["stages"]
+        .as_array()
+        .map(|stages| {
+            stages
+                .iter()
+                .map(|stage| {
+                    let mut substate_counts = serde_json::Map::new();
+                    for lead in stage["leads"].as_array().into_iter().flatten() {
+                        if let Some(substate) = lead["substate_key"].as_str() {
+                            let count = substate_counts
+                                .get(substate)
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default()
+                                + 1;
+                            substate_counts.insert(substate.to_owned(), json!(count));
+                        }
+                    }
+                    json!({
+                        "key": stage["key"],
+                        "count": stage["count"],
+                        "substates": substate_counts,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "source": "live SuperCampus CRM",
+        "scope": board["scope"],
+        "total": board["total"],
+        "stages": stages,
+    })
+}
+
+fn parse_planner_response(content: &str) -> Option<AiPlannerResponse> {
+    let trimmed = content.trim();
+    let json_text = if trimmed.starts_with("```") {
+        trimmed
+            .strip_prefix("```json")
+            .or_else(|| trimmed.strip_prefix("```"))?
+            .strip_suffix("```")?
+            .trim()
+    } else {
+        trimmed
+    };
+    serde_json::from_str(json_text).ok()
+}
+
+async fn resolve_action_proposal(
+    service: &CrmService,
+    context: &RequestContext,
+    planned: AiPlannedAction,
+) -> Result<Option<CrmAssistantActionProposal>, CrmHttpError> {
+    if !context.actor.has("crm.leads.update") {
+        return Ok(None);
+    }
+    if !matches!(
+        planned.action_type.as_str(),
+        "add_lead_note" | "create_lead_task" | "move_lead"
+    ) {
+        return Ok(None);
+    }
+    let query = planned.lead_query.trim();
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let leads = service
+        .list_leads(
+            &context.tenant,
+            &context.actor,
+            &LeadFilters {
+                search: Some(query.to_owned()),
+                limit: Some(5),
+                ..LeadFilters::default()
+            },
+        )
+        .await?;
+    if leads.len() != 1 {
+        return Ok(None);
+    }
+    let lead = &leads[0];
+    let description = match planned.action_type.as_str() {
+        "add_lead_note" => format!("Add a note to {}", lead.full_name),
+        "create_lead_task" => format!("Create a follow-up task for {}", lead.full_name),
+        "move_lead" => format!("Move {} to another pipeline stage", lead.full_name),
+        _ => return Ok(None),
+    };
+    Ok(Some(CrmAssistantActionProposal {
+        action_type: planned.action_type,
+        lead_id: lead.id,
+        lead_name: lead.full_name.clone(),
+        description,
+        payload: planned.payload,
+    }))
+}
+
 pub async fn text_assistant(
+    State(state): State<CrmApiState>,
     headers: HeaderMap,
     Json(request): Json<CrmTextAssistantRequest>,
 ) -> Result<Json<ApiResponse<CrmTextAssistantResponse>>, CrmHttpError> {
@@ -403,6 +536,16 @@ pub async fn text_assistant(
     let intent = request.intent.trim().to_ascii_lowercase();
     let instruction = assistant_instruction(&intent)
         .ok_or_else(|| CrmHttpError(CrmError::Validation("unknown assistant intent".into())))?;
+    let service = state.service(&context.tenant).await?;
+    let portal_context = if context.actor.has("crm.leads.read") {
+        Some(pipeline_summary(
+            &service
+                .board(&context.tenant, &context.actor, LeadFilters::default())
+                .await?,
+        ))
+    } else {
+        None
+    };
     let base_url =
         ai_environment("SUPERCAMPUS_AI_BASE_URL", "TIMETABLE_AI_BASE_URL").ok_or_else(|| {
             CrmHttpError(CrmError::ExternalService(
@@ -425,8 +568,10 @@ pub async fn text_assistant(
     .filter(|value| (5..=90).contains(value))
     .unwrap_or(25);
     let system = format!(
-        "You are the SuperCampus admissions CRM assistant for tenant {}. Help authorized admissions staff with the text they provide. Use only supplied facts, clearly label uncertainty, never invent applicant data, never make final eligibility or admission decisions, and avoid discriminatory recommendations. {}",
-        context.tenant, instruction
+        "You are the SuperCampus admissions CRM copilot for tenant {}. Answer using the live portal context when it is supplied. Never tell the user to manually count data that exists in the context. The context is permission-scoped to the signed-in user. Never invent applicant data, never make final eligibility or admission decisions, and avoid discriminatory recommendations. {} Return ONLY JSON shaped as {{\"answer\":\"plain text answer\",\"action\":null}}. If the user explicitly asks to change a lead, action may instead be {{\"type\":\"add_lead_note|create_lead_task|move_lead\",\"leadQuery\":\"name, email, phone, or id from the user request\",\"payload\":{{}}}}. Use add_lead_note payload {{\"content\":\"...\"}}, create_lead_task payload {{\"title\":\"...\",\"dueAt\":\"RFC3339 timestamp\",\"priority\":\"low|medium|high|urgent\"}}, and move_lead payload {{\"toStage\":\"...\",\"toSubstate\":null,\"reason\":\"...\"}}. Never claim an action was completed; it must be confirmed by the user. Live portal context: {}",
+        context.tenant,
+        instruction,
+        portal_context.as_ref().map(Value::to_string).unwrap_or_else(|| "unavailable for this user's permissions".into())
     );
     let payload = AiChatRequest {
         model: &model,
@@ -463,7 +608,7 @@ pub async fn text_assistant(
         .json()
         .await
         .map_err(|error| CrmHttpError(CrmError::ExternalService(error.to_string())))?;
-    let content = response
+    let raw_content = response
         .choices
         .first()
         .map(|choice| choice.message.content.trim())
@@ -474,11 +619,73 @@ pub async fn text_assistant(
             ))
         })?
         .to_owned();
+    let (content, action) = if let Some(planned) = parse_planner_response(&raw_content) {
+        let action = match planned.action {
+            Some(action) => resolve_action_proposal(&service, &context, action).await?,
+            None => None,
+        };
+        (planned.answer, action)
+    } else {
+        (raw_content, None)
+    };
     Ok(ok(CrmTextAssistantResponse {
         content,
         intent,
         model,
+        grounded: portal_context.is_some(),
+        action,
     }))
+}
+
+pub async fn execute_assistant_action(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CrmAssistantActionRequest>,
+) -> Result<Json<ApiResponse<Value>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    let service = state.service(&context.tenant).await?;
+    let action = request.action;
+    let result = match action.action_type.as_str() {
+        "add_lead_note" => json!(service
+            .add_lead_note(
+                &context.tenant,
+                &context.actor,
+                action.lead_id,
+                serde_json::from_value(action.payload)
+                    .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?,
+            )
+            .await?),
+        "create_lead_task" => service
+            .add_lead_task(
+                &context.tenant,
+                &context.actor,
+                action.lead_id,
+                serde_json::from_value(action.payload)
+                    .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?,
+            )
+            .await?,
+        "move_lead" => json!(service
+            .move_stage(
+                &context.tenant,
+                &context.actor,
+                action.lead_id,
+                serde_json::from_value(action.payload)
+                    .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?,
+            )
+            .await?),
+        _ => {
+            return Err(CrmHttpError(CrmError::Validation(
+                "unsupported assistant action".into(),
+            )));
+        }
+    };
+    Ok(ok(json!({
+        "completed": true,
+        "actionType": action.action_type,
+        "leadId": action.lead_id,
+        "leadName": action.lead_name,
+        "result": result,
+    })))
 }
 
 pub async fn roles(
@@ -874,7 +1081,9 @@ pub async fn approve_move_request(
 mod application_desk_trigger_tests {
     use super::{
         ApplicationDeskHandoff, ai_chat_endpoint, application_desk_handoff, assistant_instruction,
+        parse_planner_response, pipeline_summary,
     };
+    use serde_json::json;
 
     #[test]
     fn admission_desk_opens_only_after_offer_acceptance() {
@@ -930,6 +1139,37 @@ mod application_desk_trigger_tests {
             ai_chat_endpoint("https://ai.example.test/v1/"),
             "https://ai.example.test/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn assistant_parses_grounded_json_plan() {
+        let response = parse_planner_response(
+            r#"```json
+            {"answer":"There are 4 leads.","action":null}
+            ```"#,
+        )
+        .expect("valid planner response");
+        assert_eq!(response.answer, "There are 4 leads.");
+        assert!(response.action.is_none());
+    }
+
+    #[test]
+    fn assistant_counts_pipeline_substates() {
+        let summary = pipeline_summary(&json!({
+            "scope": "tenant",
+            "total": 3,
+            "stages": [{
+                "key": "enquiry",
+                "count": 3,
+                "leads": [
+                    {"substate_key": "contact_attempted"},
+                    {"substate_key": "contact_attempted"},
+                    {"substate_key": "new"}
+                ]
+            }]
+        }));
+        assert_eq!(summary["stages"][0]["substates"]["contact_attempted"], 2);
+        assert_eq!(summary["total"], 3);
     }
 }
 

@@ -299,11 +299,17 @@ async fn context(
                    JOIN tenant ON tenant.id = membership.tenant_id
                    JOIN identity.users user_account
                      ON user_account.id = membership.user_id AND user_account.active
+                   JOIN authz.user_roles user_role
+                     ON user_role.tenant_id = membership.tenant_id
+                    AND user_role.user_id = membership.user_id
+                   JOIN authz.roles role
+                     ON role.tenant_id = user_role.tenant_id
+                    AND role.id = user_role.role_id AND role.active
                    LEFT JOIN core.employees employee
                      ON employee.tenant_id = membership.tenant_id
                     AND employee.user_id = membership.user_id
                    WHERE $6 AND membership.active
-                     AND membership.roles && ARRAY['faculty', 'staff']::text[]
+                     AND role.role_key IN ('faculty', 'staff')
                ), '[]'::jsonb)
            )"#,
     )
@@ -717,11 +723,16 @@ async fn ensure_target_role(
                JOIN identity.tenant_memberships membership
                  ON membership.tenant_id = tenant.id
                 AND membership.user_id = $2 AND membership.active
-               WHERE tenant.slug = $1
-                 AND CASE
-                       WHEN $3 = 'faculty' THEN membership.roles && ARRAY['faculty', 'staff']::text[]
-                       ELSE $3 = ANY(membership.roles)
-                     END
+               JOIN authz.user_roles user_role
+                 ON user_role.tenant_id = membership.tenant_id
+                AND user_role.user_id = membership.user_id
+               JOIN authz.roles role
+                 ON role.tenant_id = user_role.tenant_id
+                AND role.id = user_role.role_id AND role.active
+               WHERE tenant.slug = $1 AND (
+                   role.role_key = $3
+                   OR ($3 = 'faculty' AND role.role_key = 'staff')
+               )
            )"#,
     )
     .bind(tenant_slug)

@@ -25,6 +25,10 @@ pub fn router() -> Router<AppState> {
         .route("/changes", get(changes))
         .route("/configurations", post(create_configuration))
         .route(
+            "/configurations/{configuration_id}",
+            put(update_configuration),
+        )
+        .route(
             "/configurations/{configuration_id}/slots",
             put(replace_slots),
         )
@@ -68,6 +72,18 @@ struct CreateConfigurationRequest {
     #[serde(default = "default_max_periods")]
     max_faculty_periods_per_day: i16,
     #[serde(default = "default_max_consecutive")]
+    max_consecutive_faculty_periods: i16,
+    #[serde(default)]
+    rules: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateConfigurationRequest {
+    name: String,
+    timezone: String,
+    working_days: Vec<i16>,
+    max_faculty_periods_per_day: i16,
     max_consecutive_faculty_periods: i16,
     #[serde(default)]
     rules: Value,
@@ -582,9 +598,8 @@ async fn create_configuration(
                (tenant_id, academic_year_id, term_id, name, timezone, working_days,
                 max_faculty_periods_per_day, max_consecutive_faculty_periods, rules, created_by)
            SELECT tenant.id, year.id, term.id, $4, $5, $6, $7, $8,
-                  jsonb_build_object('preset', 'anna-university-2025',
-                     'enforceRoomCapacity', true, 'allowCrossSectionElectives', true,
-                     'requiredSectionPeriodsPerWeek', 35) || $9, $10
+                  jsonb_build_object('preset', 'principal-defined',
+                     'enforceRoomCapacity', true, 'allowCrossSectionElectives', true) || $9, $10
            FROM platform.tenants tenant
            JOIN core.academic_years year ON year.tenant_id = tenant.id AND year.id = $2
            LEFT JOIN core.terms term ON term.tenant_id = tenant.id AND term.id = $3
@@ -619,6 +634,74 @@ async fn create_configuration(
     .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn update_configuration(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(configuration_id): Path<Uuid>,
+    Json(request): Json<UpdateConfigurationRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_timetable_manager(&principal, &access)?;
+    if request.name.trim().is_empty()
+        || request.timezone.trim().is_empty()
+        || request.working_days.is_empty()
+        || request
+            .working_days
+            .iter()
+            .any(|day| !(1..=7).contains(day))
+        || !(1..=24).contains(&request.max_faculty_periods_per_day)
+        || !(1..=24).contains(&request.max_consecutive_faculty_periods)
+    {
+        return Err(ApiError::BadRequest(
+            "invalid timetable configuration".into(),
+        ));
+    }
+    let actor = principal_user_id(&principal)?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let mut tx = database.pool().begin().await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE core.timetable_configurations configuration
+           SET name = $3, timezone = $4, working_days = $5,
+               max_faculty_periods_per_day = $6,
+               max_consecutive_faculty_periods = $7, rules = $8, updated_at = now()
+           FROM platform.tenants tenant
+           WHERE tenant.id = configuration.tenant_id AND tenant.slug = $1
+             AND configuration.id = $2 AND configuration.active
+             AND NOT EXISTS (
+                 SELECT 1 FROM core.timetable_versions version
+                 WHERE version.configuration_id = configuration.id AND version.status = 'published'
+             )
+           RETURNING to_jsonb(configuration.*)"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(configuration_id)
+    .bind(request.name.trim())
+    .bind(request.timezone.trim())
+    .bind(&request.working_days)
+    .bind(request.max_faculty_periods_per_day)
+    .bind(request.max_consecutive_faculty_periods)
+    .bind(request.rules)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        ApiError::Conflict(
+            "published timetable settings cannot be changed; create a new configuration".into(),
+        )
+    })?;
+    emit_event(
+        &mut tx,
+        &principal.student.tenant_id,
+        "configuration",
+        configuration_id,
+        "timetable.configuration.updated",
+        actor,
+        value.clone(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(value)))
 }
 
 async fn replace_slots(
@@ -1525,7 +1608,12 @@ async fn publication_conflicts(
         GROUP BY block.subject_offering_id, block.delivery_type, block.day_of_week
     ), section_requirement_totals AS (
         SELECT requirement.section_id, sum(requirement.periods_per_week)::integer AS periods,
-               COALESCE((target.rules ->> 'requiredSectionPeriodsPerWeek')::integer, 35) AS expected
+               COALESCE(
+                   (target.rules ->> 'requiredSectionPeriodsPerWeek')::integer,
+                   (SELECT count(*)::integer FROM core.timetable_slots slot
+                    WHERE slot.configuration_id = target.configuration_id
+                      AND slot.slot_type = 'instructional')
+               ) AS expected
         FROM requirements requirement CROSS JOIN target
         GROUP BY requirement.section_id, target.rules
     ), faculty_sequences AS (

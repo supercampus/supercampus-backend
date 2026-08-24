@@ -23,6 +23,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/context", get(context))
         .route("/changes", get(changes))
+        .route("/terms", post(create_term))
         .route("/departments", post(create_department))
         .route("/classes", post(create_class))
         .route("/configurations", post(create_configuration))
@@ -88,6 +89,23 @@ struct CreateConfigurationRequest {
 struct CreateDepartmentRequest {
     code: String,
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateTermRequest {
+    academic_year_id: Uuid,
+    code: String,
+    name: String,
+    sequence: i32,
+    starts_on: Option<NaiveDate>,
+    ends_on: Option<NaiveDate>,
+    #[serde(default = "default_term_status")]
+    status: String,
+}
+
+fn default_term_status() -> String {
+    "draft".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,6 +673,68 @@ async fn create_configuration(
         "configuration",
         id,
         "timetable.configuration.created",
+        actor,
+        value.clone(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn create_term(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(request): Json<CreateTermRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require_timetable_manager(&principal, &access)?;
+    if request.code.trim().is_empty()
+        || request.name.trim().is_empty()
+        || request.sequence < 1
+        || !matches!(request.status.as_str(), "draft" | "active" | "closed")
+        || request
+            .starts_on
+            .zip(request.ends_on)
+            .is_some_and(|(starts_on, ends_on)| ends_on < starts_on)
+    {
+        return Err(ApiError::BadRequest(
+            "term code, name, positive sequence, valid dates, and valid status are required".into(),
+        ));
+    }
+    let actor = principal_user_id(&principal)?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let mut tx = database.pool().begin().await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO core.terms
+               (tenant_id, academic_year_id, code, name, sequence, starts_on, ends_on, status)
+           SELECT tenant.id, year.id, UPPER(BTRIM($3)), BTRIM($4), $5, $6, $7, $8
+           FROM platform.tenants tenant
+           JOIN core.academic_years year ON year.tenant_id = tenant.id AND year.id = $2
+           WHERE tenant.slug = $1
+           ON CONFLICT (tenant_id, academic_year_id, code) DO UPDATE
+           SET name = EXCLUDED.name, sequence = EXCLUDED.sequence,
+               starts_on = EXCLUDED.starts_on, ends_on = EXCLUDED.ends_on,
+               status = EXCLUDED.status, updated_at = now()
+           RETURNING to_jsonb(core.terms.*)"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(request.academic_year_id)
+    .bind(&request.code)
+    .bind(&request.name)
+    .bind(request.sequence)
+    .bind(request.starts_on)
+    .bind(request.ends_on)
+    .bind(&request.status)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("academic year does not belong to this tenant".into()))?;
+    let id = json_uuid(&value, "id")?;
+    emit_event(
+        &mut tx,
+        &principal.student.tenant_id,
+        "term",
+        id,
+        "timetable.term.saved",
         actor,
         value.clone(),
     )

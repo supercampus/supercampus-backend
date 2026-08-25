@@ -247,6 +247,7 @@ struct CreateEntryRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GenerateVersionRequest {
+    section_id: Option<Uuid>,
     #[serde(default = "default_true")]
     preserve_existing: bool,
     #[serde(default = "default_true")]
@@ -2005,10 +2006,22 @@ async fn generate_version(
         .ok_or_else(|| ApiError::Conflict("AI generation requires a draft timetable".into()))?;
 
     if !request.preserve_existing {
-        sqlx::query("DELETE FROM core.timetable_entries WHERE version_id = $1")
-            .bind(version_id)
-            .execute(&mut *tx)
-            .await?;
+        if let Some(section_id) = request.section_id {
+            sqlx::query(r#"DELETE FROM core.timetable_entries entry
+                USING core.subject_offerings offering
+                WHERE entry.version_id = $1
+                  AND offering.id = entry.subject_offering_id
+                  AND offering.section_id = $2"#)
+                .bind(version_id)
+                .bind(section_id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("DELETE FROM core.timetable_entries WHERE version_id = $1")
+                .bind(version_id)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
 
     let slots = sqlx::query_as::<_, GeneratorSlot>(r#"SELECT slot.id, slot.day_of_week, slot.sequence, slot.starts_at, slot.ends_at
@@ -2041,8 +2054,13 @@ async fn generate_version(
           WHERE candidate.tenant_id = offering.tenant_id AND candidate.subject_offering_id = offering.id AND candidate.active
           ORDER BY CASE candidate.assignment_type WHEN 'primary' THEN 0 ELSE 1 END, candidate.created_at LIMIT 1) teaching ON true
         JOIN identity.users faculty_user ON faculty_user.id = teaching.faculty_user_id AND faculty_user.active
-        WHERE version.id = $1"#)
-        .bind(version_id).fetch_all(&mut *tx).await?;
+        WHERE version.id = $1 AND ($2::uuid IS NULL OR offering.section_id = $2)"#)
+        .bind(version_id).bind(request.section_id).fetch_all(&mut *tx).await?;
+    if workloads.is_empty() {
+        return Err(ApiError::Conflict(
+            "the selected class has no active courses with faculty assignments".into(),
+        ));
+    }
     if request.prioritize_high_credits {
         workloads.sort_by(|a, b| {
             b.block_size
@@ -2220,7 +2238,7 @@ async fn generate_version(
             }
         }
     }
-    let payload = json!({"versionId": version_id, "scheduledPeriods": scheduled, "unscheduled": unscheduled,
+    let payload = json!({"versionId": version_id, "sectionId": request.section_id, "scheduledPeriods": scheduled, "unscheduled": unscheduled,
         "preservedExisting": request.preserve_existing,
         "engine": if ai_status == "applied" { "jarvislabs-ai-assisted-v1" } else { "constraint-optimizer-v1" },
         "aiStatus": ai_status});
@@ -2309,6 +2327,8 @@ async fn publication_conflicts(
         JOIN core.teaching_assignments teaching ON teaching.id = entry.teaching_assignment_id
         JOIN core.rooms room ON room.id = entry.room_id
         JOIN core.sections section ON section.id = offering.section_id
+    ), entry_sections AS (
+        SELECT DISTINCT section_id FROM entries
     ), requirements AS (
         SELECT requirement.*, offering.section_id
         FROM core.subject_offering_workload_requirements requirement
@@ -2316,6 +2336,7 @@ async fn publication_conflicts(
         JOIN core.subject_offerings offering ON offering.id = requirement.subject_offering_id
              AND offering.academic_year_id = target.academic_year_id
              AND offering.term_id IS NOT DISTINCT FROM target.term_id
+        JOIN entry_sections included ON included.section_id = offering.section_id
         WHERE offering.active
     ), actual_workloads AS (
         SELECT subject_offering_id, delivery_type, count(*)::integer AS periods
@@ -2355,6 +2376,9 @@ async fn publication_conflicts(
         GROUP BY faculty_user_id, day_of_week, sequence_group, max_consecutive_faculty_periods
         HAVING count(*) > max_consecutive_faculty_periods
     ), conflicts AS (
+        SELECT 'empty_timetable' AS kind, target.version_id::text AS resource, 0 AS day_of_week, 0 AS sequence
+        FROM target WHERE NOT EXISTS (SELECT 1 FROM entries)
+        UNION ALL
         SELECT 'room' AS kind, room_id::text AS resource, day_of_week, sequence FROM entries
         GROUP BY room_id, day_of_week, sequence HAVING count(*) > 1
         UNION ALL

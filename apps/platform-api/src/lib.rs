@@ -149,6 +149,12 @@ fn cors_layer() -> CorsLayer {
 }
 
 fn is_allowed_cors_origin(origin: &str, configured: &[HeaderValue], allow_local: bool) -> bool {
+    // The Flutter web build is deployed as the mobile application test surface.
+    // Keep this exact origin narrow: credentials are enabled, so a wildcard is
+    // intentionally not used here.
+    if origin == "https://supercampusapplication-e0miwj-dcd788-200-141-5-86.sslip.io" {
+        return true;
+    }
     if configured
         .iter()
         .any(|allowed| allowed.to_str().is_ok_and(|value| value == origin))
@@ -398,6 +404,15 @@ mod security_tests {
     fn production_cors_does_not_implicitly_allow_localhost() {
         assert!(!is_allowed_cors_origin("http://localhost:3000", &[], false));
         assert!(is_allowed_cors_origin("http://localhost:3000", &[], true));
+    }
+
+    #[test]
+    fn mobile_application_origin_is_allowed_in_production() {
+        assert!(is_allowed_cors_origin(
+            "https://supercampusapplication-e0miwj-dcd788-200-141-5-86.sslip.io",
+            &[],
+            false,
+        ));
     }
 
     #[test]

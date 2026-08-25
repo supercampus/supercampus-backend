@@ -90,6 +90,10 @@ pub fn router(databases: Option<TenantDatabaseManager>) -> Router {
         .route("/activity", get(handlers::recent_activity))
         .route("/assistant/text", post(handlers::text_assistant))
         .route(
+            "/assistant/history",
+            get(handlers::assistant_history).put(handlers::save_assistant_history),
+        )
+        .route(
             "/assistant/actions/execute",
             post(handlers::execute_assistant_action),
         )

@@ -303,6 +303,15 @@ pub struct CrmTextAssistantResponse {
     pub action: Option<CrmAssistantActionProposal>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CrmAssistantHistoryRequest {
+    pub draft: String,
+    pub intent: String,
+    #[serde(default)]
+    pub messages: Vec<Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CrmAssistantActionProposal {
@@ -368,6 +377,116 @@ struct AiChatMessage {
 
 fn default_assistant_intent() -> String {
     "general".into()
+}
+
+fn require_assistant_access(context: &RequestContext) -> Result<(), CrmHttpError> {
+    if context.actor.has_any(&[
+        "crm.leads.read",
+        "crm.dashboard.read",
+        "admissions.read",
+        "admissions.records.read",
+    ]) {
+        Ok(())
+    } else {
+        Err(CrmHttpError(CrmError::Forbidden(
+            "Admissions or CRM read access is required".into(),
+        )))
+    }
+}
+
+pub async fn assistant_history(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<Value>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    require_assistant_access(&context)?;
+    let databases = state
+        .databases
+        .as_ref()
+        .ok_or(CrmHttpError(CrmError::Unavailable))?;
+    let database = databases
+        .tenant(&context.tenant)
+        .await
+        .map_err(|error| CrmHttpError(CrmError::Storage(error.to_string())))?;
+    let document = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(state -> 'crmAssistant',
+                          '{"draft":"","intent":"general","messages":[]}'::jsonb)
+           FROM identity.ui_states ui
+           JOIN platform.tenants tenant ON tenant.id = ui.tenant_id
+           WHERE tenant.slug = $1 AND ui.user_id = $2"#,
+    )
+    .bind(&context.tenant)
+    .bind(&context.actor.user_id)
+    .fetch_optional(database.pool())
+    .await
+    .map_err(|error| CrmHttpError(CrmError::Storage(error.to_string())))?
+    .unwrap_or_else(|| json!({ "draft": "", "intent": "general", "messages": [] }));
+    Ok(ok(document))
+}
+
+pub async fn save_assistant_history(
+    State(state): State<CrmApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CrmAssistantHistoryRequest>,
+) -> Result<Json<ApiResponse<Value>>, CrmHttpError> {
+    let context = RequestContext::from_headers(&headers)?;
+    require_assistant_access(&context)?;
+    if request.draft.chars().count() > 12_000 {
+        return Err(CrmHttpError(CrmError::Validation(
+            "assistant draft is limited to 12000 characters".into(),
+        )));
+    }
+    if assistant_instruction(request.intent.trim()).is_none() {
+        return Err(CrmHttpError(CrmError::Validation(
+            "unknown assistant intent".into(),
+        )));
+    }
+    if request.messages.len() > 100 {
+        return Err(CrmHttpError(CrmError::Validation(
+            "assistant history is limited to 100 messages".into(),
+        )));
+    }
+    let document = json!({
+        "draft": request.draft,
+        "intent": request.intent,
+        "messages": request.messages,
+    });
+    if serde_json::to_vec(&document)
+        .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?
+        .len()
+        > 1_000_000
+    {
+        return Err(CrmHttpError(CrmError::Validation(
+            "assistant history is too large".into(),
+        )));
+    }
+    let databases = state
+        .databases
+        .as_ref()
+        .ok_or(CrmHttpError(CrmError::Unavailable))?;
+    let database = databases
+        .tenant(&context.tenant)
+        .await
+        .map_err(|error| CrmHttpError(CrmError::Storage(error.to_string())))?;
+    let saved = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO identity.ui_states (tenant_id, user_id, state, version)
+           SELECT tenant.id, $2, jsonb_build_object('crmAssistant', $3::jsonb), 1
+           FROM platform.tenants tenant
+           WHERE tenant.slug = $1
+           ON CONFLICT (tenant_id, user_id) DO UPDATE
+           SET state = jsonb_set(identity.ui_states.state, '{crmAssistant}', $3::jsonb, true),
+               version = identity.ui_states.version + 1,
+               updated_at = now()
+           RETURNING state -> 'crmAssistant'"#,
+    )
+    .bind(&context.tenant)
+    .bind(&context.actor.user_id)
+    .bind(&document)
+    .fetch_optional(database.pool())
+    .await
+    .map_err(|error| CrmHttpError(CrmError::Storage(error.to_string())))?
+    .ok_or_else(|| CrmHttpError(CrmError::Storage("tenant was not found".into())))?;
+    Ok(ok(saved))
 }
 
 fn ai_environment(primary: &str, legacy: &str) -> Option<String> {
@@ -540,19 +659,7 @@ pub async fn text_assistant(
     Json(request): Json<CrmTextAssistantRequest>,
 ) -> Result<Json<ApiResponse<CrmTextAssistantResponse>>, CrmHttpError> {
     let context = RequestContext::from_headers(&headers)?;
-    if !context
-        .actor
-        .has_any(&[
-            "crm.leads.read",
-            "crm.dashboard.read",
-            "admissions.read",
-            "admissions.records.read",
-        ])
-    {
-        return Err(CrmHttpError(CrmError::Forbidden(
-            "Admissions or CRM read access is required".into(),
-        )));
-    }
+    require_assistant_access(&context)?;
     let input = request.input.trim();
     if input.is_empty() {
         return Err(CrmHttpError(CrmError::Validation(

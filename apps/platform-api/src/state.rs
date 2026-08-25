@@ -2541,8 +2541,15 @@ impl AppState {
                 r#"INSERT INTO identity.ui_states (tenant_id, user_id, state, version)
                    VALUES ($1, $2, $3, 1)
                    ON CONFLICT (tenant_id, user_id) DO UPDATE
-                   SET state = EXCLUDED.state,
-                       version = EXCLUDED.version + 1,
+                   SET state = EXCLUDED.state ||
+                       CASE WHEN identity.ui_states.state ? 'crmAssistant'
+                            THEN jsonb_build_object(
+                                'crmAssistant',
+                                identity.ui_states.state -> 'crmAssistant'
+                            )
+                            ELSE '{}'::jsonb
+                       END,
+                       version = identity.ui_states.version + 1,
                        updated_at = now()
                    RETURNING state, version, updated_at"#,
             )

@@ -112,17 +112,17 @@ BEGIN
 
     INSERT INTO core.employees
         (id, tenant_id, user_id, employee_number, department_id, full_name, email, status, profile)
-    SELECT requested.employee_id, mec_id, person.id, requested.employee_number,
+    SELECT addition.employee_id, mec_id, person.id, addition.employee_number,
            department.id, person.display_name, person.email, 'active', person.profile
     FROM (VALUES
         ('202c91e9-fe3c-5659-998f-b2a9811c9668'::uuid, 'MECEMP036', 'ganesh@mec.local', 'CSBS'),
         ('ac70c364-2a32-51b5-98f4-0882b3844a84'::uuid, 'MECEMP037', 'santhosh@mec.local', 'AIDS'),
         ('170ce611-48f1-5983-9c9a-5ae85947a754'::uuid, 'MECEMP038', 'preethi@mec.local', 'CSE')
-    ) requested(employee_id, employee_number, email, department_code)
-    JOIN identity.users person ON person.email = requested.email
+    ) addition(employee_id, employee_number, email, department_code)
+    JOIN identity.users person ON person.email = addition.email
     JOIN core.departments department
       ON department.tenant_id = mec_id
-     AND department.code = requested.department_code
+     AND department.code = addition.department_code
     ON CONFLICT (tenant_id, user_id) DO UPDATE SET
         department_id = EXCLUDED.department_id,
         full_name = EXCLUDED.full_name,
@@ -132,5 +132,4 @@ BEGIN
         updated_at = now();
 END
 $$;
-
 

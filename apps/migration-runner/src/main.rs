@@ -19,6 +19,7 @@ async fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str).unwrap_or("migrate") {
         "migrate" => migrate_registered_databases().await,
         "apply-mec-advisors" => apply_mec_advisors().await,
+        "apply-mec-original-faculty" => apply_mec_original_faculty().await,
         "apply-student-assessments" => apply_student_assessments().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
@@ -43,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
             provision_tenant(tenant_slug, database_name).await
         }
         command => bail!(
-            "unknown command {command}; expected migrate, apply-mec-advisors, apply-student-assessments, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
+            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-student-assessments, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
 }
@@ -128,6 +129,48 @@ async fn apply_mec_advisors() -> anyhow::Result<()> {
     }
     println!(
         "applied MEC advisor assignments to control and {} tenant database(s)",
+        databases.len()
+    );
+    Ok(())
+}
+
+/// Replaces the MEC placeholder faculty identities with the institution's
+/// original faculty roster. The SQL is idempotent and preserves referenced
+/// identity IDs so timetable, attendance, and audit relationships remain valid.
+async fn apply_mec_original_faculty() -> anyhow::Result<()> {
+    const SQL: &str = include_str!("../../../migrations/runtime/0067_mec_original_faculty.sql");
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    sqlx::raw_sql(SQL)
+        .execute(control.pool())
+        .await
+        .context("failed to apply the MEC faculty roster to the control plane")?;
+
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug, registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id = registry.tenant_id
+           WHERE registry.status = 'active' AND tenant.status = 'active'
+           ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await
+    .context("failed to list tenant databases")?;
+
+    let base_options =
+        PgConnectOptions::from_str(&control_url).context("invalid CONTROL_DATABASE_URL")?;
+    for (slug, database_name) in &databases {
+        validate_database_name(database_name)?;
+        let tenant = Database::connect_options(base_options.clone().database(database_name), 2)
+            .await
+            .with_context(|| format!("failed to connect tenant {slug} database"))?;
+        sqlx::raw_sql(SQL)
+            .execute(tenant.pool())
+            .await
+            .with_context(|| format!("failed to apply the MEC faculty roster to {slug}"))?;
+    }
+    println!(
+        "applied the MEC original faculty roster to control and {} tenant database(s)",
         databases.len()
     );
     Ok(())

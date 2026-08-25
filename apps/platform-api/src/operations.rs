@@ -64,6 +64,7 @@ pub fn router() -> Router<AppState> {
             post(crate::visitors::decide_visitor_pass),
         )
         .route("/attendance/roster", get(attendance_roster))
+        .route("/attendance/classes", get(attendance_classes))
         .route("/student/assessments", get(student_assessments))
         .route("/advisor/students", get(advisor_students))
         .route(
@@ -2057,8 +2058,6 @@ async fn scan_gatepass(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AttendanceSessionRequest {
     timetable_entry_id: Option<Uuid>,
-    subject_offering_id: Option<Uuid>,
-    section_id: Option<Uuid>,
     subject_name: String,
     held_on: NaiveDate,
     period_label: String,
@@ -2068,6 +2067,78 @@ struct AttendanceSessionRequest {
 #[serde(rename_all = "camelCase")]
 struct AttendanceRosterQuery {
     section_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttendanceClassesQuery {
+    held_on: Option<NaiveDate>,
+}
+
+/// Published classes the signed-in faculty member is actually responsible for
+/// on a date. Department/advisor reach intentionally does not widen this list:
+/// attendance ownership follows the timetable's teaching matrix.
+async fn attendance_classes(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Query(query): Query<AttendanceClassesQuery>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "attendance.session.create")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let held_on = query.held_on.unwrap_or_else(|| Utc::now().date_naive());
+    let classes = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT COALESCE(jsonb_agg(item ORDER BY (item->>'sequence')::int), '[]'::jsonb)
+        FROM (
+          SELECT jsonb_build_object(
+            'timetableEntryId', entry.id,
+            'subjectOfferingId', offering.id,
+            'sectionId', section.id,
+            'subjectCode', subject.code,
+            'subjectName', subject.name,
+            'sectionName', section.name,
+            'periodLabel', slot.label,
+            'sequence', slot.sequence,
+            'startsAt', slot.starts_at,
+            'endsAt', slot.ends_at,
+            'deliveryType', entry.delivery_type,
+            'combinedClassCode', NULLIF(entry.metadata ->> 'combinedClassCode', ''),
+            'combinedClassName', NULLIF(entry.metadata ->> 'combinedClassName', '')
+          ) AS item
+          FROM core.timetable_entries entry
+          JOIN core.timetable_versions version
+            ON version.id = entry.version_id AND version.status = 'published'
+          JOIN core.timetable_slots slot ON slot.id = entry.slot_id
+          JOIN core.subject_offerings offering ON offering.id = entry.subject_offering_id
+          JOIN core.subjects subject ON subject.id = offering.subject_id
+          JOIN core.sections section ON section.id = offering.section_id
+          JOIN core.teaching_assignments teaching ON teaching.id = entry.teaching_assignment_id
+          LEFT JOIN LATERAL (
+            SELECT substitution.substitute_faculty_user_id
+            FROM core.faculty_substitution_requests substitution
+            WHERE substitution.tenant_id = entry.tenant_id
+              AND substitution.timetable_entry_id = entry.id
+              AND substitution.service_date = $3
+              AND substitution.status = 'approved'
+            ORDER BY substitution.created_at DESC
+            LIMIT 1
+          ) replacement ON true
+          WHERE entry.tenant_id = $1
+            AND slot.day_of_week = EXTRACT(ISODOW FROM $3::date)::int
+            AND COALESCE(replacement.substitute_faculty_user_id, teaching.faculty_user_id)::text = $2
+        ) assigned
+        "#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(held_on)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"classes": classes, "heldOn": held_on}),
+    )))
 }
 
 /// The complete student directory slice owned by the signed-in class advisor.
@@ -2639,64 +2710,42 @@ async fn create_attendance_session(
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let (timetable_entry_id, subject_offering_id, section_id, subject_name) = if let Some(
-        entry_id,
-    ) =
-        input.timetable_entry_id
-    {
-        let scheduled = sqlx::query_as::<_, (Uuid, Uuid, String, bool)>(
-                r#"SELECT offering.id, offering.section_id, subject.name,
-                          (teaching.faculty_user_id::text = $2
-                           OR EXISTS (
-                             SELECT 1 FROM core.class_advisor_assignments advisor
-                             JOIN core.sections advised_section
-                               ON advised_section.tenant_id = advisor.tenant_id
-                              AND advised_section.id = offering.section_id
-                             JOIN core.batches advised_batch ON advised_batch.id = advised_section.batch_id
-                             JOIN core.programmes advised_programme ON advised_programme.id = advised_batch.programme_id
-                             WHERE advisor.tenant_id = entry.tenant_id
-                               AND advisor.advisor_user_id::text = $2
-                               AND advisor.department_id = advised_programme.department_id
-                               AND advisor.active
-                           )
-                           OR EXISTS (
-                             SELECT 1 FROM core.faculty_substitution_requests substitution
-                             WHERE substitution.tenant_id = entry.tenant_id
-                               AND substitution.timetable_entry_id = entry.id
-                               AND substitution.substitute_faculty_user_id::text = $2
-                               AND substitution.status = 'approved'
-                           )) AS allowed
-                   FROM core.timetable_entries entry
-                   JOIN core.timetable_versions version ON version.id = entry.version_id
-                   JOIN core.subject_offerings offering ON offering.id = entry.subject_offering_id
-                   JOIN core.subjects subject ON subject.id = offering.subject_id
-                   JOIN core.teaching_assignments teaching ON teaching.id = entry.teaching_assignment_id
-                   WHERE entry.tenant_id = $1 AND entry.id = $3 AND version.status = 'published'"#,
-            )
-            .bind(tenant)
-            .bind(&principal.student.id)
-            .bind(entry_id)
-            .fetch_optional(db.pool())
-            .await?
-            .ok_or_else(|| ApiError::BadRequest("Select a published scheduled class".into()))?;
-        if !scheduled.3 {
-            return Err(ApiError::Forbidden);
-        }
-        (
-            Some(entry_id),
-            Some(scheduled.0),
-            Some(scheduled.1),
-            scheduled.2,
+    let entry_id = input.timetable_entry_id.ok_or_else(|| {
+        ApiError::BadRequest("Select a class from today's published timetable".into())
+    })?;
+    let (subject_offering_id, section_id, subject_name, period_label) =
+        sqlx::query_as::<_, (Uuid, Uuid, String, String)>(
+            r#"SELECT offering.id, offering.section_id, subject.name, slot.label
+               FROM core.timetable_entries entry
+               JOIN core.timetable_versions version ON version.id = entry.version_id
+               JOIN core.timetable_slots slot ON slot.id = entry.slot_id
+               JOIN core.subject_offerings offering ON offering.id = entry.subject_offering_id
+               JOIN core.subjects subject ON subject.id = offering.subject_id
+               JOIN core.teaching_assignments teaching ON teaching.id = entry.teaching_assignment_id
+               LEFT JOIN LATERAL (
+                 SELECT substitution.substitute_faculty_user_id
+                 FROM core.faculty_substitution_requests substitution
+                 WHERE substitution.tenant_id = entry.tenant_id
+                   AND substitution.timetable_entry_id = entry.id
+                   AND substitution.service_date = $4
+                   AND substitution.status = 'approved'
+                 ORDER BY substitution.created_at DESC
+                 LIMIT 1
+               ) replacement ON true
+               WHERE entry.tenant_id = $1
+                 AND entry.id = $3
+                 AND version.status = 'published'
+                 AND slot.day_of_week = EXTRACT(ISODOW FROM $4::date)::int
+                 AND COALESCE(replacement.substitute_faculty_user_id, teaching.faculty_user_id)::text = $2"#,
         )
-    } else {
-        (
-            None,
-            input.subject_offering_id,
-            input.section_id,
-            input.subject_name.trim().to_owned(),
-        )
-    };
-    let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.attendance_sessions(tenant_id,timetable_entry_id,subject_offering_id,section_id,subject_name,faculty_user_id,held_on,period_label) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING jsonb_build_object('id',id,'timetableEntryId',timetable_entry_id,'subjectOfferingId',subject_offering_id,'sectionId',section_id,'subjectName',subject_name,'heldOn',held_on,'periodLabel',period_label,'status',status)").bind(tenant).bind(timetable_entry_id).bind(subject_offering_id).bind(section_id).bind(subject_name).bind(&principal.student.id).bind(input.held_on).bind(input.period_label.trim()).fetch_one(db.pool()).await?;
+        .bind(tenant)
+        .bind(&principal.student.id)
+        .bind(entry_id)
+        .bind(input.held_on)
+        .fetch_optional(db.pool())
+        .await?
+        .ok_or(ApiError::Forbidden)?;
+    let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.attendance_sessions(tenant_id,timetable_entry_id,subject_offering_id,section_id,subject_name,faculty_user_id,held_on,period_label) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING jsonb_build_object('id',id,'timetableEntryId',timetable_entry_id,'subjectOfferingId',subject_offering_id,'sectionId',section_id,'subjectName',subject_name,'heldOn',held_on,'periodLabel',period_label,'status',status)").bind(tenant).bind(entry_id).bind(subject_offering_id).bind(section_id).bind(subject_name).bind(&principal.student.id).bind(input.held_on).bind(period_label).fetch_one(db.pool()).await?;
     emit(
         &state,
         &principal.student.tenant_id,

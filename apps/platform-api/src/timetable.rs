@@ -425,6 +425,12 @@ async fn context(
                SELECT department_id FROM core.employees employee, tenant
                WHERE employee.tenant_id = tenant.id AND employee.user_id = $2
                  AND employee.status = 'active' AND department_id IS NOT NULL
+               UNION
+               SELECT assignment.department_id
+               FROM core.class_advisor_assignments assignment, tenant
+               WHERE assignment.tenant_id = tenant.id
+                 AND assignment.advisor_user_id = $2
+                 AND assignment.active
            ), member_sections AS (
                SELECT enrollment.section_id
                FROM core.students student
@@ -434,6 +440,14 @@ async fn context(
                 AND enrollment.student_id = student.id
                 AND enrollment.status IN ('provisional', 'active')
                WHERE student.user_account_id = $2 AND student.status IN ('provisional', 'active')
+               UNION
+               SELECT student.section_id::uuid
+               FROM core.students student
+               JOIN tenant ON tenant.id = student.tenant_id
+               WHERE student.user_account_id = $2
+                 AND student.status IN ('provisional', 'active')
+                 AND student.section_id IS NOT NULL
+                 AND student.section_id ~* '^[0-9a-f-]{36}$'
            ), visible_entries AS (
                SELECT DISTINCT entry.id
                FROM core.timetable_entries entry
@@ -2624,7 +2638,10 @@ async fn changes(
 }
 
 fn require_read(access: &EffectiveAccess) -> ApiResult<()> {
-    if access.allows("academics.timetable.read") || access.allows("academics.timetable.manage") {
+    if access.allows("academics.timetable.read")
+        || access.allows("academics.timetable.manage")
+        || access.allows("timetable.schedule.read")
+    {
         Ok(())
     } else {
         Err(ApiError::Forbidden)
@@ -2661,6 +2678,7 @@ fn read_scope(access: &EffectiveAccess) -> &str {
     access
         .scope_for("academics.timetable.read")
         .or_else(|| access.scope_for("academics.timetable.manage"))
+        .or_else(|| access.scope_for("timetable.schedule.read"))
         .unwrap_or("assigned")
 }
 

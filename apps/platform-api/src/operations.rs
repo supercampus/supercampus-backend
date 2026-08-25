@@ -2056,6 +2056,7 @@ async fn scan_gatepass(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AttendanceSessionRequest {
+    timetable_entry_id: Option<Uuid>,
     subject_offering_id: Option<Uuid>,
     section_id: Option<Uuid>,
     subject_name: String,
@@ -2459,6 +2460,7 @@ async fn attendance_roster(
         .or_else(|| access.scope_for("attendance.roster.update"))
         .unwrap_or("own");
     let institution_wide = matches!(scope, "institution" | "all");
+    let department_wide = scope == "department";
 
     // Anything narrower than the whole institution has to say which section it
     // wants. A caller who cannot name one has nothing to be shown.
@@ -2515,11 +2517,47 @@ async fn attendance_roster(
           AND ($2::text IS NULL OR student.section_id = $2)
           AND (
             $4
-            OR student.department_id IN (
+            OR EXISTS (
+              SELECT 1 FROM core.class_advisor_assignments advisor
+              WHERE advisor.tenant_id = student.tenant_id
+                AND advisor.advisor_user_id::text = $3
+                AND advisor.department_id::text = student.department_id
+                AND advisor.active
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM core.timetable_entries timetable_entry
+              JOIN core.timetable_versions timetable_version
+                ON timetable_version.id = timetable_entry.version_id
+               AND timetable_version.status = 'published'
+              JOIN core.subject_offerings timetable_offering
+                ON timetable_offering.id = timetable_entry.subject_offering_id
+              JOIN core.teaching_assignments timetable_teaching
+                ON timetable_teaching.id = timetable_entry.teaching_assignment_id
+              WHERE timetable_entry.tenant_id = student.tenant_id
+                AND timetable_offering.section_id::text = student.section_id
+                AND timetable_teaching.faculty_user_id::text = $3
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM core.faculty_substitution_requests substitution
+              JOIN core.timetable_entries timetable_entry
+                ON timetable_entry.id = substitution.timetable_entry_id
+              JOIN core.timetable_versions timetable_version
+                ON timetable_version.id = timetable_entry.version_id
+               AND timetable_version.status = 'published'
+              JOIN core.subject_offerings timetable_offering
+                ON timetable_offering.id = timetable_entry.subject_offering_id
+              WHERE substitution.tenant_id = student.tenant_id
+                AND substitution.substitute_faculty_user_id::text = $3
+                AND substitution.status = 'approved'
+                AND timetable_offering.section_id::text = student.section_id
+            )
+            OR ($5 AND student.department_id IN (
               -- core.students.department_id is text where the authority tables
               -- hold uuid; compare on one side rather than trusting a cast.
               SELECT department_id::text FROM member_departments
-            )
+            ))
           )
         "#,
     )
@@ -2527,6 +2565,7 @@ async fn attendance_roster(
     .bind(query.section_id.as_deref())
     .bind(&principal.student.id)
     .bind(institution_wide)
+    .bind(department_wide)
     .fetch_one(db.pool())
     .await?;
     Ok(Json(ApiResponse::new(json!({"students": students}))))
@@ -2583,7 +2622,7 @@ async fn attendance_sessions(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let manage = access.allows("attendance.reports.create");
-    let rows=sqlx::query_scalar::<_,Value>("SELECT COALESCE(jsonb_agg(jsonb_build_object('id',id,'subjectOfferingId',subject_offering_id,'sectionId',section_id,'subjectName',subject_name,'facultyUserId',faculty_user_id,'heldOn',held_on,'periodLabel',period_label,'status',status,'updatedAt',updated_at) ORDER BY held_on DESC,created_at DESC),'[]'::jsonb) FROM campus_ops.attendance_sessions WHERE tenant_id=$1 AND ($3 OR faculty_user_id=$2)").bind(tenant).bind(&principal.student.id).bind(manage).fetch_one(db.pool()).await?;
+    let rows=sqlx::query_scalar::<_,Value>("SELECT COALESCE(jsonb_agg(jsonb_build_object('id',id,'timetableEntryId',timetable_entry_id,'subjectOfferingId',subject_offering_id,'sectionId',section_id,'subjectName',subject_name,'facultyUserId',faculty_user_id,'heldOn',held_on,'periodLabel',period_label,'status',status,'updatedAt',updated_at) ORDER BY held_on DESC,created_at DESC),'[]'::jsonb) FROM campus_ops.attendance_sessions WHERE tenant_id=$1 AND ($3 OR faculty_user_id=$2)").bind(tenant).bind(&principal.student.id).bind(manage).fetch_one(db.pool()).await?;
     Ok(Json(ApiResponse::new(json!({"sessions":rows}))))
 }
 async fn create_attendance_session(
@@ -2600,7 +2639,64 @@ async fn create_attendance_session(
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.attendance_sessions(tenant_id,subject_offering_id,section_id,subject_name,faculty_user_id,held_on,period_label) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING jsonb_build_object('id',id,'subjectName',subject_name,'heldOn',held_on,'periodLabel',period_label,'status',status)").bind(tenant).bind(input.subject_offering_id).bind(input.section_id).bind(input.subject_name.trim()).bind(&principal.student.id).bind(input.held_on).bind(input.period_label.trim()).fetch_one(db.pool()).await?;
+    let (timetable_entry_id, subject_offering_id, section_id, subject_name) = if let Some(
+        entry_id,
+    ) =
+        input.timetable_entry_id
+    {
+        let scheduled = sqlx::query_as::<_, (Uuid, Uuid, String, bool)>(
+                r#"SELECT offering.id, offering.section_id, subject.name,
+                          (teaching.faculty_user_id::text = $2
+                           OR EXISTS (
+                             SELECT 1 FROM core.class_advisor_assignments advisor
+                             JOIN core.sections advised_section
+                               ON advised_section.tenant_id = advisor.tenant_id
+                              AND advised_section.id = offering.section_id
+                             JOIN core.batches advised_batch ON advised_batch.id = advised_section.batch_id
+                             JOIN core.programmes advised_programme ON advised_programme.id = advised_batch.programme_id
+                             WHERE advisor.tenant_id = entry.tenant_id
+                               AND advisor.advisor_user_id::text = $2
+                               AND advisor.department_id = advised_programme.department_id
+                               AND advisor.active
+                           )
+                           OR EXISTS (
+                             SELECT 1 FROM core.faculty_substitution_requests substitution
+                             WHERE substitution.tenant_id = entry.tenant_id
+                               AND substitution.timetable_entry_id = entry.id
+                               AND substitution.substitute_faculty_user_id::text = $2
+                               AND substitution.status = 'approved'
+                           )) AS allowed
+                   FROM core.timetable_entries entry
+                   JOIN core.timetable_versions version ON version.id = entry.version_id
+                   JOIN core.subject_offerings offering ON offering.id = entry.subject_offering_id
+                   JOIN core.subjects subject ON subject.id = offering.subject_id
+                   JOIN core.teaching_assignments teaching ON teaching.id = entry.teaching_assignment_id
+                   WHERE entry.tenant_id = $1 AND entry.id = $3 AND version.status = 'published'"#,
+            )
+            .bind(tenant)
+            .bind(&principal.student.id)
+            .bind(entry_id)
+            .fetch_optional(db.pool())
+            .await?
+            .ok_or_else(|| ApiError::BadRequest("Select a published scheduled class".into()))?;
+        if !scheduled.3 {
+            return Err(ApiError::Forbidden);
+        }
+        (
+            Some(entry_id),
+            Some(scheduled.0),
+            Some(scheduled.1),
+            scheduled.2,
+        )
+    } else {
+        (
+            None,
+            input.subject_offering_id,
+            input.section_id,
+            input.subject_name.trim().to_owned(),
+        )
+    };
+    let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.attendance_sessions(tenant_id,timetable_entry_id,subject_offering_id,section_id,subject_name,faculty_user_id,held_on,period_label) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING jsonb_build_object('id',id,'timetableEntryId',timetable_entry_id,'subjectOfferingId',subject_offering_id,'sectionId',section_id,'subjectName',subject_name,'heldOn',held_on,'periodLabel',period_label,'status',status)").bind(tenant).bind(timetable_entry_id).bind(subject_offering_id).bind(section_id).bind(subject_name).bind(&principal.student.id).bind(input.held_on).bind(input.period_label.trim()).fetch_one(db.pool()).await?;
     emit(
         &state,
         &principal.student.tenant_id,

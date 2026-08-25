@@ -266,6 +266,7 @@ struct GeneratorSlot {
 #[derive(Debug, sqlx::FromRow)]
 struct GeneratorRoom {
     id: Uuid,
+    department_id: Option<Uuid>,
     room_type: String,
     capacity: i32,
 }
@@ -276,6 +277,7 @@ struct GeneratorWorkload {
     subject_code: String,
     subject_name: String,
     section_id: Uuid,
+    department_id: Uuid,
     section_name: String,
     section_capacity: i32,
     credits: f64,
@@ -2028,13 +2030,13 @@ async fn generate_version(
         FROM core.timetable_slots slot JOIN core.timetable_versions version ON version.configuration_id = slot.configuration_id AND version.tenant_id = slot.tenant_id
         WHERE version.id = $1 AND slot.slot_type = 'instructional' ORDER BY slot.day_of_week, slot.sequence"#)
         .bind(version_id).fetch_all(&mut *tx).await?;
-    let rooms = sqlx::query_as::<_, GeneratorRoom>(r#"SELECT room.id, room.room_type, room.capacity
+    let rooms = sqlx::query_as::<_, GeneratorRoom>(r#"SELECT room.id, room.department_id, room.room_type, room.capacity
         FROM core.rooms room JOIN core.timetable_versions version ON version.tenant_id = room.tenant_id
         WHERE version.id = $1 AND room.active ORDER BY room.capacity, room.code"#)
         .bind(version_id).fetch_all(&mut *tx).await?;
     let mut workloads = sqlx::query_as::<_, GeneratorWorkload>(r#"SELECT offering.id AS subject_offering_id,
         subject.code AS subject_code, subject.name AS subject_name,
-        offering.section_id, section.name AS section_name, COALESCE(section.capacity, 0) AS section_capacity,
+        offering.section_id, programme.department_id, section.name AS section_name, COALESCE(section.capacity, 0) AS section_capacity,
         COALESCE(subject.credits, 0)::float8 AS credits,
         COALESCE(requirement.delivery_type, 'class') AS delivery_type,
         COALESCE(requirement.periods_per_week, GREATEST(2, CEIL(COALESCE(subject.credits, 3))::smallint))::smallint AS periods_per_week,
@@ -2049,6 +2051,8 @@ async fn generate_version(
           AND offering.term_id IS NOT DISTINCT FROM configuration.term_id AND offering.active
         JOIN core.subjects subject ON subject.id = offering.subject_id AND subject.tenant_id = offering.tenant_id AND subject.active
         JOIN core.sections section ON section.id = offering.section_id AND section.tenant_id = offering.tenant_id AND section.active
+        JOIN core.batches batch ON batch.id = section.batch_id AND batch.tenant_id = section.tenant_id
+        JOIN core.programmes programme ON programme.id = batch.programme_id AND programme.tenant_id = batch.tenant_id
         LEFT JOIN core.subject_offering_workload_requirements requirement ON requirement.tenant_id = offering.tenant_id AND requirement.subject_offering_id = offering.id
         JOIN LATERAL (SELECT candidate.id, candidate.faculty_user_id FROM core.teaching_assignments candidate
           WHERE candidate.tenant_id = offering.tenant_id AND candidate.subject_offering_id = offering.id AND candidate.active
@@ -2165,13 +2169,17 @@ async fn generate_version(
                     {
                         continue;
                     }
-                    let room = rooms.iter().find(|room| {
+                    let room = rooms.iter().filter(|room| {
                         room.capacity >= workload.section_capacity
                             && (workload.required_room_types.is_empty()
                                 || workload.required_room_types.contains(&room.room_type))
                             && window
                                 .iter()
                                 .all(|slot| !room_busy.contains(&(room.id, slot.id)))
+                    }).min_by_key(|room| {
+                        if room.department_id == Some(workload.department_id) { 0 }
+                        else if room.department_id.is_none() { 1 }
+                        else { 2 }
                     });
                     let Some(room) = room else { continue };
                     let first_sequence = i64::from(window[0].sequence);

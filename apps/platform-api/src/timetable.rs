@@ -2040,7 +2040,7 @@ async fn generate_version(
         JOIN LATERAL (SELECT candidate.id, candidate.faculty_user_id FROM core.teaching_assignments candidate
           WHERE candidate.tenant_id = offering.tenant_id AND candidate.subject_offering_id = offering.id AND candidate.active
           ORDER BY CASE candidate.assignment_type WHEN 'primary' THEN 0 ELSE 1 END, candidate.created_at LIMIT 1) teaching ON true
-        JOIN identity.users faculty_user ON faculty_user.id = teaching.faculty_user_id AND faculty_user.tenant_id = offering.tenant_id
+        JOIN identity.users faculty_user ON faculty_user.id = teaching.faculty_user_id AND faculty_user.active
         WHERE version.id = $1"#)
         .bind(version_id).fetch_all(&mut *tx).await?;
     if request.prioritize_high_credits {

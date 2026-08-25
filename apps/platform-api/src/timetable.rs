@@ -2045,9 +2045,13 @@ async fn generate_version(
         .bind(version_id).fetch_all(&mut *tx).await?;
     if request.prioritize_high_credits {
         workloads.sort_by(|a, b| {
-            b.credits
-                .total_cmp(&a.credits)
-                .then_with(|| b.periods_per_week.cmp(&a.periods_per_week))
+            b.block_size
+                .cmp(&a.block_size)
+                .then_with(|| {
+                    b.credits
+                        .total_cmp(&a.credits)
+                        .then_with(|| b.periods_per_week.cmp(&a.periods_per_week))
+                })
         });
     }
 

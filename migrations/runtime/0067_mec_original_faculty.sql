@@ -85,6 +85,62 @@ BEGIN
         RAISE EXCEPTION 'principal identity is required before adding MEC faculty';
     END IF;
 
+    -- Some legacy MEC installations were seeded without the fourth placeholder
+    -- faculty identity. Ensure Deepika exists even when there is no old account
+    -- to rename, and align this staff login with the shared MEC test password.
+    INSERT INTO identity.users
+        (id, email, password_hash, display_name, initials, account_type, active, profile)
+    SELECT
+        '8b6c5b47-d23b-5f75-aece-99e36189d9c2'::uuid,
+        'deepika@mec.local', principal_hash, 'Dr. T. Deepika', 'TD', 'staff', true,
+        '{"designation":"Assistant Professor","team":"Academics","dept":"CSE"}'::jsonb
+    WHERE NOT EXISTS (
+        SELECT 1 FROM identity.users WHERE email = 'deepika@mec.local'
+    )
+    ON CONFLICT (id) DO UPDATE SET
+        email = EXCLUDED.email,
+        password_hash = EXCLUDED.password_hash,
+        display_name = EXCLUDED.display_name,
+        initials = EXCLUDED.initials,
+        account_type = EXCLUDED.account_type,
+        active = true,
+        profile = EXCLUDED.profile,
+        updated_at = now();
+
+    UPDATE identity.users
+    SET password_hash = principal_hash,
+        active = true,
+        updated_at = now()
+    WHERE email = 'deepika@mec.local';
+
+    INSERT INTO identity.tenant_memberships
+        (tenant_id, user_id, roles, active, is_primary, profile)
+    SELECT mec_id, person.id, ARRAY['staff']::text[], true, true, person.profile
+    FROM identity.users person
+    WHERE person.email = 'deepika@mec.local'
+    ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+        roles = EXCLUDED.roles,
+        active = true,
+        profile = EXCLUDED.profile,
+        updated_at = now();
+
+    INSERT INTO core.employees
+        (id, tenant_id, user_id, employee_number, department_id, full_name, email, status, profile)
+    SELECT 'cf26012a-dc4f-5609-b1ec-35b98d5d35d3'::uuid, mec_id, person.id,
+           'MECEMP017', department.id, person.display_name, person.email, 'active', person.profile
+    FROM identity.users person
+    JOIN core.departments department
+      ON department.tenant_id = mec_id
+     AND department.code = 'CSE'
+    WHERE person.email = 'deepika@mec.local'
+    ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+        department_id = EXCLUDED.department_id,
+        full_name = EXCLUDED.full_name,
+        email = EXCLUDED.email,
+        status = 'active',
+        profile = EXCLUDED.profile,
+        updated_at = now();
+
     INSERT INTO identity.users
         (id, email, password_hash, display_name, initials, account_type, active, profile)
     VALUES
@@ -132,4 +188,3 @@ BEGIN
         updated_at = now();
 END
 $$;
-

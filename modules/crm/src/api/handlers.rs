@@ -481,7 +481,7 @@ async fn resolve_action_proposal(
     }
     if !matches!(
         planned.action_type.as_str(),
-        "add_lead_note" | "create_lead_task" | "move_lead"
+        "add_lead_note" | "create_lead_task" | "move_lead" | "start_application"
     ) {
         return Ok(None);
     }
@@ -505,18 +505,32 @@ async fn resolve_action_proposal(
         return Ok(None);
     }
     let lead = &leads[0];
-    let description = match planned.action_type.as_str() {
+    let mut action_type = planned.action_type;
+    let mut payload = planned.payload;
+    if action_type == "move_lead"
+        && payload["toStage"]
+            .as_str()
+            .is_some_and(|stage| stage.eq_ignore_ascii_case("application"))
+    {
+        action_type = "start_application".into();
+        payload = json!({ "channel": "whatsapp" });
+    }
+    let description = match action_type.as_str() {
         "add_lead_note" => format!("Add a note to {}", lead.full_name),
         "create_lead_task" => format!("Create a follow-up task for {}", lead.full_name),
         "move_lead" => format!("Move {} to another pipeline stage", lead.full_name),
+        "start_application" => format!(
+            "Advance {} through the valid qualification path and issue the application invitation",
+            lead.full_name
+        ),
         _ => return Ok(None),
     };
     Ok(Some(CrmAssistantActionProposal {
-        action_type: planned.action_type,
+        action_type,
         lead_id: lead.id,
         lead_name: lead.full_name.clone(),
         description,
-        payload: planned.payload,
+        payload,
     }))
 }
 
@@ -585,7 +599,7 @@ pub async fn text_assistant(
     .filter(|value| (5..=90).contains(value))
     .unwrap_or(25);
     let system = format!(
-        "You are the SuperCampus admissions CRM copilot for tenant {}. Answer using the live portal context when it is supplied. Never tell the user to manually count data that exists in the context. The context is permission-scoped to the signed-in user. Never invent applicant data, never make final eligibility or admission decisions, and avoid discriminatory recommendations. {} Return ONLY JSON shaped as {{\"answer\":\"plain text answer\",\"action\":null}}. If the user explicitly asks to change a lead, action may instead be {{\"type\":\"add_lead_note|create_lead_task|move_lead\",\"leadQuery\":\"name, email, phone, or id from the user request\",\"payload\":{{}}}}. Use add_lead_note payload {{\"content\":\"...\"}}, create_lead_task payload {{\"title\":\"...\",\"dueAt\":\"RFC3339 timestamp\",\"priority\":\"low|medium|high|urgent\"}}, and move_lead payload {{\"toStage\":\"...\",\"toSubstate\":null,\"reason\":\"...\"}}. Never claim an action was completed; it must be confirmed by the user. Live portal context: {}",
+        "You are the SuperCampus admissions CRM copilot for tenant {}. Answer using the live portal context when it is supplied. Never tell the user to manually count data that exists in the context. The context is permission-scoped to the signed-in user. Never invent applicant data, never make final eligibility or admission decisions, and avoid discriminatory recommendations. {} Return ONLY JSON shaped as {{\"answer\":\"plain text answer\",\"action\":null}}. If the user explicitly asks to change a lead, action may instead be {{\"type\":\"add_lead_note|create_lead_task|move_lead|start_application\",\"leadQuery\":\"name, email, phone, or id from the user request\",\"payload\":{{}}}}. Use add_lead_note payload {{\"content\":\"...\"}}, create_lead_task payload {{\"title\":\"...\",\"dueAt\":\"RFC3339 timestamp\",\"priority\":\"low|medium|high|urgent\"}}, move_lead payload {{\"toStage\":\"...\",\"toSubstate\":null,\"reason\":\"...\"}}, and start_application payload {{\"channel\":\"whatsapp\"}}. A request to move a lead to Application MUST use start_application because the application stage is entered only after the invited applicant submits the published form. Never claim an action was completed; it must be confirmed by the user. Live portal context: {}",
         context.tenant,
         instruction,
         portal_context.as_ref().map(Value::to_string).unwrap_or_else(|| "unavailable for this user's permissions".into())
@@ -706,12 +720,65 @@ pub async fn execute_assistant_action(
                     .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?,
             )
             .await?),
+        "start_application" => {
+            let mut lead = service
+                .get_lead(&context.tenant, &context.actor, action.lead_id)
+                .await?;
+            if matches!(lead.stage_key.as_str(), "enquiry" | "contact_attempted" | "contacted") {
+                lead = service
+                    .move_stage(
+                        &context.tenant,
+                        &context.actor,
+                        action.lead_id,
+                        MoveStageRequest {
+                            to_stage: "nurture".into(),
+                            to_substate: None,
+                            reason: Some("Application requested through the CRM copilot".into()),
+                            notes: None,
+                        },
+                    )
+                    .await?;
+            }
+            if lead.stage_key == "nurture" {
+                lead = service
+                    .move_stage(
+                        &context.tenant,
+                        &context.actor,
+                        action.lead_id,
+                        MoveStageRequest {
+                            to_stage: "qualified".into(),
+                            to_substate: None,
+                            reason: Some("Application requested through the CRM copilot".into()),
+                            notes: None,
+                        },
+                    )
+                    .await?;
+            }
+            if lead.stage_key != "qualified" {
+                return Err(CrmHttpError(CrmError::Validation(format!(
+                    "application cannot be started from the {} stage",
+                    lead.stage_key
+                ))));
+            }
+            let channel = action.payload["channel"]
+                .as_str()
+                .map(str::to_owned);
+            service
+                .create_application_invitation(
+                    &context.tenant,
+                    &context.actor,
+                    action.lead_id,
+                    CreateApplicationInvitationRequest { channel },
+                )
+                .await?
+        }
         _ => {
             return Err(CrmHttpError(CrmError::Validation(
                 "unsupported assistant action".into(),
             )));
         }
     };
+    let _ = state.realtime_wake.send(());
     Ok(ok(json!({
         "completed": true,
         "actionType": action.action_type,

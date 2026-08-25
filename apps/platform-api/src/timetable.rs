@@ -2341,7 +2341,7 @@ async fn publication_conflicts(
                       AND slot.slot_type = 'instructional')
                ) AS expected
         FROM requirements requirement CROSS JOIN target
-        GROUP BY requirement.section_id, target.rules
+        GROUP BY requirement.section_id, target.rules, target.configuration_id
     ), faculty_sequences AS (
         SELECT faculty_user_id, day_of_week, sequence, max_consecutive_faculty_periods,
                sequence - row_number() OVER (

@@ -123,7 +123,10 @@ async fn list_campuses(
     Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    require(&access, "platform.configuration.read")?;
+    require_any(
+        &access,
+        &["platform.configuration.read", "timetable.config.read"],
+    )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let rows = sqlx::query_scalar::<_, Value>(
@@ -155,7 +158,10 @@ async fn create_campus(
     Extension(access): Extension<EffectiveAccess>,
     Json(input): Json<CreateCampusRequest>,
 ) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
-    require(&access, "platform.configuration.update")?;
+    require_any(
+        &access,
+        &["platform.configuration.update", "timetable.config.update"],
+    )?;
     let name = input.name.trim();
     if name.is_empty() {
         return Err(ApiError::BadRequest("A campus name is required".into()));
@@ -216,7 +222,10 @@ async fn set_campus_geofence(
     Path(campus_id): Path<Uuid>,
     Json(input): Json<CampusGeofenceRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    require(&access, "platform.configuration.update")?;
+    require_any(
+        &access,
+        &["platform.configuration.update", "timetable.config.update"],
+    )?;
 
     let patch = match input.geofence {
         None => Value::Null,

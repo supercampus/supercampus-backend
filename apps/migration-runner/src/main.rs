@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
         "migrate" => migrate_registered_databases().await,
         "apply-mec-advisors" => apply_mec_advisors().await,
         "apply-mec-original-faculty" => apply_mec_original_faculty().await,
+        "apply-mec-faculty-matrix" => apply_mec_faculty_matrix().await,
         "apply-student-assessments" => apply_student_assessments().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
@@ -44,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
             provision_tenant(tenant_slug, database_name).await
         }
         command => bail!(
-            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-student-assessments, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
+            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
 }
@@ -131,6 +132,22 @@ async fn apply_mec_advisors() -> anyhow::Result<()> {
         "applied MEC advisor assignments to control and {} tenant database(s)",
         databases.len()
     );
+    Ok(())
+}
+
+/// Corrects the MEC timetable faculty matrix without running the full legacy
+/// migration chain. The SQL is tenant-scoped and idempotent.
+async fn apply_mec_faculty_matrix() -> anyhow::Result<()> {
+    const SQL: &str = include_str!("../../../migrations/runtime/0068_mec_timetable_faculty_matrix.sql");
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    let manager = TenantDatabaseManager::clustered(control, &control_url)?;
+    let mec = manager.tenant("mec").await?;
+    sqlx::raw_sql(SQL)
+        .execute(mec.pool())
+        .await
+        .context("failed to apply the MEC timetable faculty matrix")?;
+    println!("applied the MEC timetable faculty matrix");
     Ok(())
 }
 

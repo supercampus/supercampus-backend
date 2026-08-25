@@ -2334,14 +2334,11 @@ async fn publication_conflicts(
         GROUP BY block.subject_offering_id, block.delivery_type, block.day_of_week
     ), section_requirement_totals AS (
         SELECT requirement.section_id, sum(requirement.periods_per_week)::integer AS periods,
-               COALESCE(
-                   (target.rules ->> 'requiredSectionPeriodsPerWeek')::integer,
-                   (SELECT count(*)::integer FROM core.timetable_slots slot
-                    WHERE slot.configuration_id = target.configuration_id
-                      AND slot.slot_type = 'instructional')
-               ) AS expected
+               (SELECT count(*)::integer FROM core.timetable_slots slot
+                WHERE slot.configuration_id = target.configuration_id
+                  AND slot.slot_type = 'instructional') AS expected
         FROM requirements requirement CROSS JOIN target
-        GROUP BY requirement.section_id, target.rules, target.configuration_id
+        GROUP BY requirement.section_id, target.configuration_id
     ), faculty_sequences AS (
         SELECT faculty_user_id, day_of_week, sequence, max_consecutive_faculty_periods,
                sequence - row_number() OVER (

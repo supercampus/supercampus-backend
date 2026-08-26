@@ -1,13 +1,13 @@
 use anyhow::Context;
 use axum::{
-    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     routing::{delete, get, post, put},
+    Extension, Json, Router,
 };
 use chrono::{NaiveDate, NaiveTime};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{ApiError, ApiResult},
-    governance::{GovernedCapability, any_role_may_perform},
+    governance::{any_role_may_perform, GovernedCapability},
     models::ApiResponse,
     state::{AppState, AuthPrincipal, EffectiveAccess},
 };
@@ -224,6 +224,7 @@ struct CreateElectiveGroupRequest {
 struct CreateVersionRequest {
     configuration_id: Uuid,
     label: String,
+    source_version_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1669,6 +1670,50 @@ async fn create_version(
         .fetch_optional(&mut *tx).await?
         .ok_or_else(|| ApiError::BadRequest("configuration does not belong to this tenant".into()))?;
     let id = json_uuid(&value, "id")?;
+    if let Some(source_version_id) = request.source_version_id {
+        let source_is_valid = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS (
+            SELECT 1 FROM core.timetable_versions source
+            JOIN core.timetable_versions target
+              ON target.tenant_id = source.tenant_id
+             AND target.configuration_id = source.configuration_id
+            JOIN platform.tenants tenant ON tenant.id = source.tenant_id
+            WHERE tenant.slug = $1 AND source.id = $2 AND target.id = $3
+        )"#,
+        )
+        .bind(&principal.student.tenant_id)
+        .bind(source_version_id)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !source_is_valid {
+            return Err(ApiError::BadRequest(
+                "source timetable version does not belong to this plan".into(),
+            ));
+        }
+        sqlx::query(
+            r#"INSERT INTO core.timetable_entries
+            (tenant_id, version_id, slot_id, subject_offering_id, teaching_assignment_id,
+             room_id, elective_group_id, delivery_type, metadata, created_by,
+             session_block_id, block_sequence, block_length)
+            SELECT entry.tenant_id, $3, entry.slot_id, entry.subject_offering_id,
+                   entry.teaching_assignment_id, entry.room_id, entry.elective_group_id,
+                   entry.delivery_type,
+                   entry.metadata || jsonb_build_object('copiedFromVersionId', $2::uuid),
+                   $4, entry.session_block_id, entry.block_sequence, entry.block_length
+            FROM core.timetable_entries entry
+            JOIN core.timetable_versions source
+              ON source.tenant_id = entry.tenant_id AND source.id = entry.version_id
+            JOIN platform.tenants tenant ON tenant.id = entry.tenant_id
+            WHERE tenant.slug = $1 AND source.id = $2"#,
+        )
+        .bind(&principal.student.tenant_id)
+        .bind(source_version_id)
+        .bind(id)
+        .bind(actor)
+        .execute(&mut *tx)
+        .await?;
+    }
     emit_event(
         &mut tx,
         &principal.student.tenant_id,
@@ -2009,15 +2054,17 @@ async fn generate_version(
 
     if !request.preserve_existing {
         if let Some(section_id) = request.section_id {
-            sqlx::query(r#"DELETE FROM core.timetable_entries entry
+            sqlx::query(
+                r#"DELETE FROM core.timetable_entries entry
                 USING core.subject_offerings offering
                 WHERE entry.version_id = $1
                   AND offering.id = entry.subject_offering_id
-                  AND offering.section_id = $2"#)
-                .bind(version_id)
-                .bind(section_id)
-                .execute(&mut *tx)
-                .await?;
+                  AND offering.section_id = $2"#,
+            )
+            .bind(version_id)
+            .bind(section_id)
+            .execute(&mut *tx)
+            .await?;
         } else {
             sqlx::query("DELETE FROM core.timetable_entries WHERE version_id = $1")
                 .bind(version_id)
@@ -2067,13 +2114,11 @@ async fn generate_version(
     }
     if request.prioritize_high_credits {
         workloads.sort_by(|a, b| {
-            b.block_size
-                .cmp(&a.block_size)
-                .then_with(|| {
-                    b.credits
-                        .total_cmp(&a.credits)
-                        .then_with(|| b.periods_per_week.cmp(&a.periods_per_week))
-                })
+            b.block_size.cmp(&a.block_size).then_with(|| {
+                b.credits
+                    .total_cmp(&a.credits)
+                    .then_with(|| b.periods_per_week.cmp(&a.periods_per_week))
+            })
         });
     }
 
@@ -2169,18 +2214,25 @@ async fn generate_version(
                     {
                         continue;
                     }
-                    let room = rooms.iter().filter(|room| {
-                        room.capacity >= workload.section_capacity
-                            && (workload.required_room_types.is_empty()
-                                || workload.required_room_types.contains(&room.room_type))
-                            && window
-                                .iter()
-                                .all(|slot| !room_busy.contains(&(room.id, slot.id)))
-                    }).min_by_key(|room| {
-                        if room.department_id == Some(workload.department_id) { 0 }
-                        else if room.department_id.is_none() { 1 }
-                        else { 2 }
-                    });
+                    let room = rooms
+                        .iter()
+                        .filter(|room| {
+                            room.capacity >= workload.section_capacity
+                                && (workload.required_room_types.is_empty()
+                                    || workload.required_room_types.contains(&room.room_type))
+                                && window
+                                    .iter()
+                                    .all(|slot| !room_busy.contains(&(room.id, slot.id)))
+                        })
+                        .min_by_key(|room| {
+                            if room.department_id == Some(workload.department_id) {
+                                0
+                            } else if room.department_id.is_none() {
+                                1
+                            } else {
+                                2
+                            }
+                        });
                     let Some(room) = room else { continue };
                     let first_sequence = i64::from(window[0].sequence);
                     let daily_load = i64::from(
@@ -2821,13 +2873,11 @@ mod tests {
         assert!(require_timetable_manager(&principal("principal"), &allowed).is_ok());
         assert!(require_timetable_manager(&principal("academic_administrator"), &allowed).is_err());
         assert!(require_timetable_manager(&principal("hod"), &allowed).is_err());
-        assert!(
-            require_timetable_manager(
-                &principal("principal"),
-                &access("academics.timetable.manage", "department")
-            )
-            .is_err()
-        );
+        assert!(require_timetable_manager(
+            &principal("principal"),
+            &access("academics.timetable.manage", "department")
+        )
+        .is_err());
     }
 
     #[test]

@@ -2369,7 +2369,14 @@ async fn fill_missing_workload_requirements(
            GREATEST(summary.max_blocks_per_day, 1), ARRAY[]::text[],
            jsonb_build_object('derivedFromTimetable', true, 'versionId', $2::uuid), $3
     FROM summaries summary
-    ON CONFLICT (tenant_id, subject_offering_id, delivery_type) DO NOTHING"#,
+    ON CONFLICT (tenant_id, subject_offering_id, delivery_type) DO UPDATE
+       SET periods_per_week = EXCLUDED.periods_per_week,
+           block_size = EXCLUDED.block_size,
+           max_blocks_per_day = EXCLUDED.max_blocks_per_day,
+           metadata = EXCLUDED.metadata,
+           updated_at = now()
+     WHERE core.subject_offering_workload_requirements.metadata
+               ->> 'derivedFromTimetable' = 'true'"#,
     )
     .bind(tenant_slug)
     .bind(version_id)

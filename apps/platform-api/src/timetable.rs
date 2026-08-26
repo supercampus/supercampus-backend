@@ -2316,6 +2316,59 @@ async fn generate_version(
     Ok(Json(ApiResponse::new(payload)))
 }
 
+async fn fill_missing_workload_requirements(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_slug: &str,
+    version_id: Uuid,
+    actor: Uuid,
+) -> ApiResult<()> {
+    sqlx::query(
+        r#"WITH entry_rows AS (
+        SELECT entry.tenant_id, entry.subject_offering_id, entry.delivery_type,
+               entry.session_block_id, entry.block_length, slot.day_of_week
+        FROM core.timetable_entries entry
+        JOIN core.timetable_versions version
+          ON version.tenant_id = entry.tenant_id
+         AND version.id = entry.version_id
+         AND version.status = 'draft'
+        JOIN core.timetable_slots slot ON slot.id = entry.slot_id
+        JOIN platform.tenants tenant ON tenant.id = entry.tenant_id
+        WHERE tenant.slug = $1 AND version.id = $2
+    ), daily_blocks AS (
+        SELECT tenant_id, subject_offering_id, delivery_type, day_of_week,
+               count(DISTINCT session_block_id)::smallint AS block_count
+        FROM entry_rows
+        GROUP BY tenant_id, subject_offering_id, delivery_type, day_of_week
+    ), summaries AS (
+        SELECT row.tenant_id, row.subject_offering_id, row.delivery_type,
+               count(*)::smallint AS periods_per_week,
+               max(row.block_length)::smallint AS block_size,
+               max(daily.block_count)::smallint AS max_blocks_per_day
+        FROM entry_rows row
+        JOIN daily_blocks daily
+          ON daily.tenant_id = row.tenant_id
+         AND daily.subject_offering_id = row.subject_offering_id
+         AND daily.delivery_type = row.delivery_type
+         AND daily.day_of_week = row.day_of_week
+        GROUP BY row.tenant_id, row.subject_offering_id, row.delivery_type
+    ) INSERT INTO core.subject_offering_workload_requirements
+        (tenant_id, subject_offering_id, delivery_type, periods_per_week,
+         block_size, max_blocks_per_day, required_room_types, metadata, created_by)
+    SELECT summary.tenant_id, summary.subject_offering_id, summary.delivery_type,
+           summary.periods_per_week, summary.block_size,
+           GREATEST(summary.max_blocks_per_day, 1), ARRAY[]::text[],
+           jsonb_build_object('derivedFromTimetable', true, 'versionId', $2::uuid), $3
+    FROM summaries summary
+    ON CONFLICT (tenant_id, subject_offering_id, delivery_type) DO NOTHING"#,
+    )
+    .bind(tenant_slug)
+    .bind(version_id)
+    .bind(actor)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn publish_version(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -2326,6 +2379,8 @@ async fn publish_version(
     let actor = principal_user_id(&principal)?;
     let database = state.tenant_database(&principal.student.tenant_id).await?;
     let mut tx = database.pool().begin().await?;
+    fill_missing_workload_requirements(&mut tx, &principal.student.tenant_id, version_id, actor)
+        .await?;
     let conflicts =
         publication_conflicts(&mut tx, &principal.student.tenant_id, version_id).await?;
     if conflicts.as_array().is_some_and(|items| !items.is_empty()) {

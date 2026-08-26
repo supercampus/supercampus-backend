@@ -2369,6 +2369,58 @@ async fn fill_missing_workload_requirements(
     Ok(())
 }
 
+async fn normalize_derived_session_blocks(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_slug: &str,
+    version_id: Uuid,
+) -> ApiResult<()> {
+    sqlx::query(
+        r#"WITH ranked AS (
+        SELECT entry.id, entry.subject_offering_id, entry.delivery_type,
+               slot.day_of_week, requirement.block_size,
+               row_number() OVER (
+                   PARTITION BY entry.subject_offering_id, entry.delivery_type, slot.day_of_week
+                   ORDER BY slot.sequence, entry.id
+               )::integer AS position
+        FROM core.timetable_entries entry
+        JOIN core.timetable_versions version
+          ON version.tenant_id = entry.tenant_id
+         AND version.id = entry.version_id
+         AND version.status = 'draft'
+        JOIN core.timetable_slots slot ON slot.id = entry.slot_id
+        JOIN core.subject_offering_workload_requirements requirement
+          ON requirement.tenant_id = entry.tenant_id
+         AND requirement.subject_offering_id = entry.subject_offering_id
+         AND requirement.delivery_type = entry.delivery_type
+         AND requirement.metadata ->> 'derivedFromTimetable' = 'true'
+        JOIN platform.tenants tenant ON tenant.id = entry.tenant_id
+        WHERE tenant.slug = $1 AND version.id = $2
+    ), grouped AS (
+        SELECT ranked.*,
+               ((ranked.position - 1) / ranked.block_size)::integer AS block_number,
+               ((ranked.position - 1) % ranked.block_size + 1)::smallint AS block_sequence
+        FROM ranked
+    ), block_ids AS (
+        SELECT grouped.id, grouped.block_size, grouped.block_sequence,
+               min(grouped.id::text) OVER (
+                   PARTITION BY grouped.subject_offering_id, grouped.delivery_type,
+                                grouped.day_of_week, grouped.block_number
+               )::uuid AS session_block_id
+        FROM grouped
+    ) UPDATE core.timetable_entries entry
+       SET session_block_id = block.session_block_id,
+           block_sequence = block.block_sequence,
+           block_length = block.block_size
+      FROM block_ids block
+     WHERE entry.id = block.id"#,
+    )
+    .bind(tenant_slug)
+    .bind(version_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn publish_version(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -2381,6 +2433,7 @@ async fn publish_version(
     let mut tx = database.pool().begin().await?;
     fill_missing_workload_requirements(&mut tx, &principal.student.tenant_id, version_id, actor)
         .await?;
+    normalize_derived_session_blocks(&mut tx, &principal.student.tenant_id, version_id).await?;
     let conflicts =
         publication_conflicts(&mut tx, &principal.student.tenant_id, version_id).await?;
     if conflicts.as_array().is_some_and(|items| !items.is_empty()) {

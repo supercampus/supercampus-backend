@@ -2325,7 +2325,7 @@ async fn fill_missing_workload_requirements(
     sqlx::query(
         r#"WITH entry_rows AS (
         SELECT entry.tenant_id, entry.subject_offering_id, entry.delivery_type,
-               entry.session_block_id, entry.block_length, slot.day_of_week
+               entry.session_block_id, slot.day_of_week
         FROM core.timetable_entries entry
         JOIN core.timetable_versions version
           ON version.tenant_id = entry.tenant_id
@@ -2339,12 +2339,22 @@ async fn fill_missing_workload_requirements(
                count(DISTINCT session_block_id)::smallint AS block_count
         FROM entry_rows
         GROUP BY tenant_id, subject_offering_id, delivery_type, day_of_week
+    ), session_blocks AS (
+        SELECT tenant_id, subject_offering_id, delivery_type, session_block_id,
+               count(*)::smallint AS actual_length
+        FROM entry_rows
+        GROUP BY tenant_id, subject_offering_id, delivery_type, session_block_id
     ), summaries AS (
         SELECT row.tenant_id, row.subject_offering_id, row.delivery_type,
                count(*)::smallint AS periods_per_week,
-               max(row.block_length)::smallint AS block_size,
+               max(block.actual_length)::smallint AS block_size,
                max(daily.block_count)::smallint AS max_blocks_per_day
         FROM entry_rows row
+        JOIN session_blocks block
+          ON block.tenant_id = row.tenant_id
+         AND block.subject_offering_id = row.subject_offering_id
+         AND block.delivery_type = row.delivery_type
+         AND block.session_block_id = row.session_block_id
         JOIN daily_blocks daily
           ON daily.tenant_id = row.tenant_id
          AND daily.subject_offering_id = row.subject_offering_id

@@ -190,6 +190,15 @@ pub async fn run() -> anyhow::Result<()> {
         tracing::warn!(
             "control database migration check skipped; migrations must be managed by the release job"
         );
+        // Dokploy currently starts the API without a separate release job. Keep
+        // this one identity rollout available as an idempotent compatibility
+        // patch so the deployed accountant credentials and UI cannot diverge.
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0073_abhinaya_accountant_portal.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the Abhinaya accountant release patch")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");

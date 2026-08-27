@@ -1382,6 +1382,9 @@ async fn wallet_directory(
             )
           ) AS row
           FROM core.students student
+          JOIN identity.users user_account
+            ON user_account.id=student.user_account_id
+           AND user_account.active
           LEFT JOIN core.departments department
             ON department.tenant_id=student.tenant_id
            AND department.id::text=student.department_id
@@ -1466,14 +1469,18 @@ async fn top_up_wallet(
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let target_user_id = Uuid::parse_str(&user_id)
         .map_err(|_| ApiError::BadRequest("Wallet user id is invalid".into()))?;
-    let active_tenant_member = sqlx::query_scalar::<_, bool>(
+    // The recharge directory is sourced from active/provisional student
+    // records. Validate against that same source so an accountant can credit
+    // every student the UI actually lists; a stale/inactive membership row
+    // must not make a visible wallet impossible to recharge.
+    let active_student = sqlx::query_scalar::<_, bool>(
         r#"SELECT EXISTS (
                SELECT 1
-               FROM identity.tenant_memberships membership
-               JOIN identity.users user_account ON user_account.id = membership.user_id
-               WHERE membership.tenant_id = $1
-                 AND membership.user_id = $2
-                 AND membership.active
+               FROM core.students student
+               JOIN identity.users user_account ON user_account.id = student.user_account_id
+               WHERE student.tenant_id = $1
+                 AND student.user_account_id = $2
+                 AND student.status IN ('provisional', 'active')
                  AND user_account.active
            )"#,
     )
@@ -1481,9 +1488,9 @@ async fn top_up_wallet(
     .bind(target_user_id)
     .fetch_one(db.pool())
     .await?;
-    if !active_tenant_member {
+    if !active_student {
         return Err(ApiError::NotFound(
-            "Active tenant wallet user was not found".into(),
+            "Active student wallet was not found".into(),
         ));
     }
     let target_user_id = target_user_id.to_string();

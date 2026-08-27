@@ -407,8 +407,11 @@ async fn canteen_store(
             FROM campus_ops.shops shop
             WHERE shop.tenant_id=item.tenant_id AND shop.is_active
               AND (shop.shop_key=item.store
-                OR (item.store IN ('classic','bites') AND lower(shop.category)='canteen')
-                OR (item.store='stationery' AND lower(shop.category)='stationery'))
+                OR lower(shop.category)=CASE
+                  WHEN lower(item.store) LIKE '%laundry%' THEN 'laundry'
+                  WHEN lower(item.store) LIKE '%station%' THEN 'stationery'
+                  ELSE 'canteen'
+                END)
             ORDER BY CASE WHEN shop.shop_key=item.store THEN 0 ELSE 1 END,
               shop.created_at, shop.shop_key
             LIMIT 1

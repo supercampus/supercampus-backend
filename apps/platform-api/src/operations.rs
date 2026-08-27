@@ -394,15 +394,26 @@ async fn canteen_store(
         'user', jsonb_build_object('id',$2::text,'name',$3::text,'email',$4::text,
           'rollNumber',$5::text,'department',$6::text),
         'walletBalance', COALESCE((SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2),0),
-        'menu', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'name',name,
-          'description',description,'store',store,'category',category,'price',price::float8,
-          'prepMinutes',prep_minutes,'isVegetarian',is_vegetarian,'isPopular',is_popular,
-          'isAvailable',is_available,'isInstant',is_instant,'imageUrl',image_url)
-          ORDER BY store,category,name)
-          FROM campus_ops.canteen_menu_items item WHERE tenant_id=$1
-            AND (NOT $9 OR item.store = ANY($10))
-            AND EXISTS (SELECT 1 FROM campus_ops.shops shop
-              WHERE shop.tenant_id=item.tenant_id AND shop.shop_key=item.store AND shop.is_active)), '[]'::jsonb),
+        'menu', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',item.id,'name',item.name,
+          'description',item.description,'store',resolved_shop.shop_key,'category',item.category,
+          'price',item.price::float8,'prepMinutes',item.prep_minutes,
+          'isVegetarian',item.is_vegetarian,'isPopular',item.is_popular,
+          'isAvailable',item.is_available,'isInstant',item.is_instant,'imageUrl',item.image_url)
+          ORDER BY resolved_shop.shop_key,item.category,item.name)
+          FROM campus_ops.canteen_menu_items item
+          JOIN LATERAL (
+            SELECT shop.shop_key
+            FROM campus_ops.shops shop
+            WHERE shop.tenant_id=item.tenant_id AND shop.is_active
+              AND (shop.shop_key=item.store
+                OR (item.store IN ('classic','bites') AND lower(shop.category)='canteen')
+                OR (item.store='stationery' AND lower(shop.category)='stationery'))
+            ORDER BY CASE WHEN shop.shop_key=item.store THEN 0 ELSE 1 END,
+              shop.created_at, shop.shop_key
+            LIMIT 1
+          ) resolved_shop ON true
+          WHERE item.tenant_id=$1
+            AND (NOT $9 OR resolved_shop.shop_key = ANY($10))), '[]'::jsonb),
         'orders', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'orderNumber',order_number,
           'customerUserId',customer_user_id,'customerName',customer_name,'lines',lines,
           'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,

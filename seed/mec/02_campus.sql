@@ -14741,7 +14741,7 @@ ON CONFLICT (tenant_id, session_id, student_user_id) DO UPDATE SET status = EXCL
 -- Campus shops ----------------------------------------------------------------
 INSERT INTO campus_ops.shops (id, tenant_id, shop_key, name, category, description,
         is_active, meal_compliance, qr_payments, created_by)
-VALUES ('b45d6074-701f-5612-ad14-bfec858e6d6b'::uuid, (SELECT id FROM platform.tenants WHERE slug = 'mec'), 'mec-canteen', 'Campus Canteen', 'canteen', 'Campus Canteen at Madras Engineering College', true, true, true, 'mec-seed')
+VALUES ('b45d6074-701f-5612-ad14-bfec858e6d6b'::uuid, (SELECT id FROM platform.tenants WHERE slug = 'mec'), 'mec-canteen', 'Canteen', 'canteen', 'Canteen at Madras Engineering College', true, true, true, 'mec-seed')
 ON CONFLICT (id) DO UPDATE SET
     name = EXCLUDED.name, category = EXCLUDED.category, is_active = true, updated_at = now();
 INSERT INTO campus_ops.shops (id, tenant_id, shop_key, name, category, description,
@@ -14751,7 +14751,7 @@ ON CONFLICT (id) DO UPDATE SET
     name = EXCLUDED.name, category = EXCLUDED.category, is_active = true, updated_at = now();
 INSERT INTO campus_ops.shops (id, tenant_id, shop_key, name, category, description,
         is_active, meal_compliance, qr_payments, created_by)
-VALUES ('fa3b0805-3255-58b2-8639-45aa78b97f62'::uuid, (SELECT id FROM platform.tenants WHERE slug = 'mec'), 'mec-laundry', 'Campus Laundry', 'laundry', 'Campus Laundry at Madras Engineering College', true, false, true, 'mec-seed')
+VALUES ('fa3b0805-3255-58b2-8639-45aa78b97f62'::uuid, (SELECT id FROM platform.tenants WHERE slug = 'mec'), 'mec-laundry', 'Laundry', 'laundry', 'Laundry at Madras Engineering College', true, false, true, 'mec-seed')
 ON CONFLICT (id) DO UPDATE SET
     name = EXCLUDED.name, category = EXCLUDED.category, is_active = true, updated_at = now();
 

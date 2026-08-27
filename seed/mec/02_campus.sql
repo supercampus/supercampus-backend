@@ -1771,7 +1771,7 @@ ON CONFLICT (email) DO UPDATE SET
     account_type = EXCLUDED.account_type, active = true, profile = EXCLUDED.profile;
 INSERT INTO identity.users (id, email, password_hash, display_name, initials,
         account_type, active, profile)
-VALUES ('4b273ab2-0a54-571d-b53d-904fecb013d4'::uuid, 'accountant@mec.local', 'seeded-in-control-plane', 'Vignesh Pillai', 'VP', 'staff', true, '{"designation": "Accountant", "team": "Finance", "dept": ""}'::jsonb)
+VALUES ('4b273ab2-0a54-571d-b53d-904fecb013d4'::uuid, 'abhinaya@mec.local', 'seeded-in-control-plane', 'Abhinaya', 'A', 'staff', true, '{"designation": "Accountant", "team": "Finance", "dept": ""}'::jsonb)
 ON CONFLICT (email) DO UPDATE SET
     display_name = EXCLUDED.display_name, initials = EXCLUDED.initials,
     account_type = EXCLUDED.account_type, active = true, profile = EXCLUDED.profile;
@@ -6262,7 +6262,7 @@ ON CONFLICT (id) DO UPDATE SET
     status = 'active', profile = EXCLUDED.profile, updated_at = now();
 INSERT INTO core.employees (id, tenant_id, user_id, employee_number, department_id,
         full_name, email, status, profile)
-VALUES ('8d4d0dc5-c7e9-525e-bd4b-2423b2e19655'::uuid, (SELECT id FROM platform.tenants WHERE slug = 'mec'), '4b273ab2-0a54-571d-b53d-904fecb013d4'::uuid, 'MECEMP029', NULL, 'Vignesh Pillai', 'accountant@mec.local', 'active', '{"designation": "Accountant", "team": "Finance", "dept": ""}'::jsonb)
+VALUES ('8d4d0dc5-c7e9-525e-bd4b-2423b2e19655'::uuid, (SELECT id FROM platform.tenants WHERE slug = 'mec'), '4b273ab2-0a54-571d-b53d-904fecb013d4'::uuid, 'MECEMP029', NULL, 'Abhinaya', 'abhinaya@mec.local', 'active', '{"designation": "Accountant", "team": "Finance", "dept": ""}'::jsonb)
 ON CONFLICT (id) DO UPDATE SET
     full_name = EXCLUDED.full_name, department_id = EXCLUDED.department_id,
     status = 'active', profile = EXCLUDED.profile, updated_at = now();

@@ -2179,7 +2179,7 @@ ON CONFLICT (email) DO UPDATE SET
     profile = EXCLUDED.profile, updated_at = now();
 INSERT INTO identity.users (id, email, password_hash, display_name, initials,
         account_type, active, profile)
-VALUES ('4b273ab2-0a54-571d-b53d-904fecb013d4'::uuid, 'accountant@mec.local', (SELECT hash FROM mec_secret), 'Vignesh Pillai', 'VP', 'staff', true, '{"designation": "Accountant", "team": "Finance", "dept": ""}'::jsonb)
+VALUES ('4b273ab2-0a54-571d-b53d-904fecb013d4'::uuid, 'abhinaya@mec.local', (SELECT hash FROM mec_secret), 'Abhinaya', 'A', 'staff', true, '{"designation": "Accountant", "team": "Finance", "dept": ""}'::jsonb)
 ON CONFLICT (email) DO UPDATE SET
     display_name = EXCLUDED.display_name, initials = EXCLUDED.initials,
     account_type = EXCLUDED.account_type, active = true,

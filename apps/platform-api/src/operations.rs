@@ -40,6 +40,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/canteen/orders/scan", post(scan_order))
         .route("/canteen/wallets", get(wallet_directory))
+        .route("/canteen/wallet-transactions", get(wallet_transactions))
         .route("/canteen/wallets/{user_id}/top-ups", post(top_up_wallet))
         .route("/canteen/staff-state", put(update_canteen_staff_state))
         .route("/gatepass/overview", get(gatepass_overview))
@@ -1341,6 +1342,12 @@ struct WalletDirectoryQuery {
     limit: Option<i64>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WalletTransactionQuery {
+    limit: Option<i64>,
+}
+
 async fn wallet_directory(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -1397,6 +1404,49 @@ async fn wallet_directory(
     .fetch_one(db.pool())
     .await?;
     Ok(Json(ApiResponse::new(json!({"wallets": wallets}))))
+}
+
+async fn wallet_transactions(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Query(query): Query<WalletTransactionQuery>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "canteen.wallet.top_up")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let transactions = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT COALESCE(jsonb_agg(row ORDER BY row->>'createdAt' DESC), '[]'::jsonb)
+        FROM (
+          SELECT jsonb_build_object(
+            'id', transaction.id,
+            'userId', transaction.user_id,
+            'studentName', COALESCE(student.full_name, 'Campus user'),
+            'studentNumber', COALESCE(student.student_number, ''),
+            'amount', transaction.amount::float8,
+            'transactionType', transaction.transaction_type,
+            'description', transaction.description,
+            'referenceId', transaction.reference_id,
+            'createdAt', transaction.created_at
+          ) AS row
+          FROM campus_ops.canteen_wallet_transactions transaction
+          LEFT JOIN core.students student
+            ON student.tenant_id=transaction.tenant_id
+           AND student.user_account_id::text=transaction.user_id
+          WHERE transaction.tenant_id=$1
+          ORDER BY transaction.created_at DESC
+          LIMIT $2
+        ) activity"#,
+    )
+    .bind(tenant)
+    .bind(limit)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"transactions": transactions}),
+    )))
 }
 
 async fn top_up_wallet(

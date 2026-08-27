@@ -9,6 +9,7 @@
 //! - [`LogMailer`] writes the message to the tracing log and is the development default.
 //! - [`DisabledMailer`] discards messages when email is explicitly disabled.
 
+pub mod sms;
 pub mod whatsapp;
 
 use std::sync::Arc;

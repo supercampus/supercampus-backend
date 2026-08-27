@@ -91,8 +91,12 @@ async fn login_session(app: &Router, tenant_id: &str) -> TestSession {
         .clone();
     let body: Value =
         serde_json::from_slice(&to_bytes(login.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body["data"].get("accessToken").is_none());
     TestSession {
-        access_token: body["data"]["accessToken"].as_str().unwrap().to_owned(),
+        access_token: access_cookie
+            .strip_prefix("sc_access=")
+            .expect("access cookie value")
+            .to_owned(),
         access_cookie,
         refresh_cookie,
     }
@@ -420,14 +424,16 @@ async fn refresh_rotation_and_logout_revoke_the_server_session() {
         .find(|cookie| cookie.starts_with("sc_session="))
         .unwrap()
         .clone();
+    let new_access_token = refreshed_cookies
+        .iter()
+        .find_map(|cookie| cookie.strip_prefix("sc_access="))
+        .expect("rotated access cookie")
+        .to_owned();
     assert_ne!(new_refresh_cookie, session.refresh_cookie);
     let refreshed_body: Value =
         serde_json::from_slice(&to_bytes(refreshed.into_body(), usize::MAX).await.unwrap())
             .unwrap();
-    let new_access_token = refreshed_body["data"]["accessToken"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    assert!(refreshed_body["data"].get("accessToken").is_none());
 
     let reused = app
         .clone()
@@ -609,7 +615,7 @@ async fn jwt_claims_override_spoofed_crm_identity_headers() {
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}"}}"#,
+                    r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}","sessionMode":"token"}}"#,
                 )))
                 .unwrap(),
         )

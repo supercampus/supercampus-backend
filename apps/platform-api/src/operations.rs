@@ -2067,6 +2067,7 @@ struct AttendanceSessionRequest {
 #[serde(rename_all = "camelCase")]
 struct AttendanceRosterQuery {
     section_id: Option<String>,
+    section_ids: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2090,27 +2091,31 @@ async fn attendance_classes(
     let held_on = query.held_on.unwrap_or_else(|| Utc::now().date_naive());
     let classes = sqlx::query_scalar::<_, Value>(
         r#"
-        SELECT COALESCE(jsonb_agg(item ORDER BY (item->>'sequence')::int), '[]'::jsonb)
-        FROM (
-          SELECT jsonb_build_object(
-            'timetableEntryId', entry.id,
-            'subjectOfferingId', offering.id,
-            'sectionId', section.id,
-            'subjectCode', subject.code,
-            'subjectName', subject.name,
-            'sectionName', section.name,
-            'periodLabel', slot.label,
-            'sequence', slot.sequence,
-            'startsAt', slot.starts_at,
-            'endsAt', slot.ends_at,
-            'deliveryType', entry.delivery_type,
-            'combinedClassCode', NULLIF(entry.metadata ->> 'combinedClassCode', ''),
-            'combinedClassName', NULLIF(entry.metadata ->> 'combinedClassName', '')
-          ) AS item
+        WITH assigned AS (
+          SELECT entry.id AS timetable_entry_id,
+                 offering.id AS subject_offering_id,
+                 section.id AS section_id,
+                 subject.code AS subject_code,
+                 subject.name AS subject_name,
+                 section.name AS section_name,
+                 slot.label AS starts_label,
+                 ending_slot.label AS ends_label,
+                 slot.sequence,
+                 slot.starts_at,
+                 ending_slot.ends_at,
+                 entry.delivery_type,
+                 entry.block_length,
+                 NULLIF(entry.metadata ->> 'combinedClassCode', '') AS combined_class_code,
+                 NULLIF(entry.metadata ->> 'combinedClassName', '') AS combined_class_name
           FROM core.timetable_entries entry
           JOIN core.timetable_versions version
             ON version.id = entry.version_id AND version.status = 'published'
           JOIN core.timetable_slots slot ON slot.id = entry.slot_id
+          JOIN core.timetable_entries ending_entry
+            ON ending_entry.version_id = entry.version_id
+           AND ending_entry.session_block_id = entry.session_block_id
+           AND ending_entry.block_sequence = entry.block_length
+          JOIN core.timetable_slots ending_slot ON ending_slot.id = ending_entry.slot_id
           JOIN core.subject_offerings offering ON offering.id = entry.subject_offering_id
           JOIN core.subjects subject ON subject.id = offering.subject_id
           JOIN core.sections section ON section.id = offering.section_id
@@ -2128,7 +2133,41 @@ async fn attendance_classes(
           WHERE entry.tenant_id = $1
             AND slot.day_of_week = EXTRACT(ISODOW FROM $3::date)::int
             AND COALESCE(replacement.substitute_faculty_user_id, teaching.faculty_user_id)::text = $2
-        ) assigned
+            AND entry.block_sequence = 1
+        ), collapsed AS (
+          SELECT min(timetable_entry_id::text)::uuid AS timetable_entry_id,
+                 min(subject_offering_id::text)::uuid AS subject_offering_id,
+                 min(section_id::text)::uuid AS section_id,
+                 jsonb_agg(DISTINCT section_id::text) AS section_ids,
+                 subject_code, subject_name,
+                 COALESCE(max(combined_class_name), min(section_name)) AS section_name,
+                 starts_label, ends_label, sequence, starts_at, max(ends_at) AS ends_at,
+                 delivery_type, block_length,
+                 max(combined_class_code) AS combined_class_code,
+                 max(combined_class_name) AS combined_class_name
+            FROM assigned
+           GROUP BY COALESCE(combined_class_code, timetable_entry_id::text),
+                    subject_code, subject_name, starts_label, ends_label,
+                    sequence, starts_at, delivery_type, block_length
+        )
+        SELECT COALESCE(jsonb_agg(jsonb_build_object(
+          'timetableEntryId', timetable_entry_id,
+          'subjectOfferingId', subject_offering_id,
+          'sectionId', section_id,
+          'sectionIds', section_ids,
+          'subjectCode', subject_code,
+          'subjectName', subject_name,
+          'sectionName', section_name,
+          'periodLabel', CASE WHEN block_length > 1
+                              THEN starts_label || '-' || ends_label ELSE starts_label END,
+          'sequence', sequence,
+          'startsAt', starts_at,
+          'endsAt', ends_at,
+          'deliveryType', delivery_type,
+          'combinedClassCode', combined_class_code,
+          'combinedClassName', combined_class_name
+        ) ORDER BY sequence), '[]'::jsonb)
+        FROM collapsed
         "#,
     )
     .bind(tenant)
@@ -2535,11 +2574,23 @@ async fn attendance_roster(
 
     // Anything narrower than the whole institution has to say which section it
     // wants. A caller who cannot name one has nothing to be shown.
-    if !institution_wide && query.section_id.is_none() {
+    let requested_section_ids = query
+        .section_ids
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .chain(query.section_id.iter().cloned())
+        .collect::<Vec<_>>();
+    if !institution_wide && requested_section_ids.is_empty() {
         return Err(ApiError::BadRequest(
-            "sectionId is required at this access level".into(),
+            "sectionId or sectionIds is required at this access level".into(),
         ));
     }
+    let requested_section_ids =
+        (!requested_section_ids.is_empty()).then_some(requested_section_ids);
 
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
@@ -2585,7 +2636,7 @@ async fn attendance_roster(
         WHERE student.tenant_id = $1
           AND student.status = 'active'
           AND student.user_account_id IS NOT NULL
-          AND ($2::text IS NULL OR student.section_id = $2)
+          AND ($2::text[] IS NULL OR student.section_id = ANY($2))
           AND (
             $4
             OR EXISTS (
@@ -2633,7 +2684,7 @@ async fn attendance_roster(
         "#,
     )
     .bind(tenant)
-    .bind(query.section_id.as_deref())
+    .bind(requested_section_ids)
     .bind(&principal.student.id)
     .bind(institution_wide)
     .bind(department_wide)
@@ -2715,10 +2766,22 @@ async fn create_attendance_session(
     })?;
     let (subject_offering_id, section_id, subject_name, period_label) =
         sqlx::query_as::<_, (Uuid, Uuid, String, String)>(
-            r#"SELECT offering.id, offering.section_id, subject.name, slot.label
+            r#"SELECT offering.id,
+                      offering.section_id,
+                      subject.name,
+                      CASE WHEN entry.block_length > 1
+                           THEN slot.label || '-' || ending_slot.label
+                           ELSE slot.label
+                      END AS period_label
                FROM core.timetable_entries entry
                JOIN core.timetable_versions version ON version.id = entry.version_id
                JOIN core.timetable_slots slot ON slot.id = entry.slot_id
+               JOIN core.timetable_entries ending_entry
+                 ON ending_entry.tenant_id = entry.tenant_id
+                AND ending_entry.version_id = entry.version_id
+                AND ending_entry.session_block_id = entry.session_block_id
+                AND ending_entry.block_sequence = entry.block_length
+               JOIN core.timetable_slots ending_slot ON ending_slot.id = ending_entry.slot_id
                JOIN core.subject_offerings offering ON offering.id = entry.subject_offering_id
                JOIN core.subjects subject ON subject.id = offering.subject_id
                JOIN core.teaching_assignments teaching ON teaching.id = entry.teaching_assignment_id
@@ -2735,6 +2798,7 @@ async fn create_attendance_session(
                WHERE entry.tenant_id = $1
                  AND entry.id = $3
                  AND version.status = 'published'
+                 AND entry.block_sequence = 1
                  AND slot.day_of_week = EXTRACT(ISODOW FROM $4::date)::int
                  AND COALESCE(replacement.substitute_faculty_user_id, teaching.faculty_user_id)::text = $2"#,
         )
@@ -2836,7 +2900,7 @@ async fn publish_attendance_session(
     let mut tx = db.pool().begin().await?;
     let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.attendance_sessions SET status='published_to_hod',updated_at=now() WHERE tenant_id=$1 AND id=$2 AND faculty_user_id=$3 AND status IN('draft','returned') RETURNING jsonb_build_object('id',id,'subjectName',subject_name,'heldOn',held_on,'status',status)").bind(tenant).bind(session_id).bind(&principal.student.id).fetch_optional(&mut *tx).await?.ok_or_else(||ApiError::Conflict("Attendance session cannot be published".into()))?;
     let students=sqlx::query_as::<_,(String,String)>("SELECT student_user_id,status FROM campus_ops.attendance_entries WHERE tenant_id=$1 AND session_id=$2").bind(tenant).bind(session_id).fetch_all(&mut *tx).await?;
-    for (student, status) in students {
+    for (student, status) in &students {
         let body = format!(
             "You were marked {} for {}",
             status,
@@ -2845,7 +2909,7 @@ async fn publish_attendance_session(
         notify_tx(
             &mut tx,
             tenant,
-            Some(&student),
+            Some(student),
             None,
             "attendance",
             "Attendance marked",
@@ -2877,6 +2941,20 @@ async fn publish_attendance_session(
     )
     .await?;
     tx.commit().await?;
+    for (student, _) in students {
+        state.publish_realtime(
+            RealtimePublication::tenant(
+                &principal.student.tenant_id,
+                "attendance.record.published",
+                json!({
+                    "module": "attendance",
+                    "sessionId": session_id,
+                    "invalidate": true,
+                }),
+            )
+            .for_user(student),
+        );
+    }
     publish_operation_change(
         &state,
         &principal.student.tenant_id,
@@ -2914,7 +2992,95 @@ async fn attendance_summary(
             return Err(ApiError::Forbidden);
         }
     }
-    let value=sqlx::query_scalar::<_,Value>(r#"SELECT jsonb_build_object('studentUserId',$2::text,'totalClasses',count(*),'attendedClasses',count(*) FILTER(WHERE e.status='present'),'absences',count(*) FILTER(WHERE e.status='absent'),'percentage',CASE WHEN count(*)=0 THEN 0 ELSE round((count(*) FILTER(WHERE e.status='present'))::numeric*100/count(*),2)::float8 END,'records',COALESCE(jsonb_agg(jsonb_build_object('sessionId',s.id,'subjectName',s.subject_name,'heldOn',s.held_on,'periodLabel',s.period_label,'status',e.status) ORDER BY s.held_on DESC) FILTER(WHERE s.id IS NOT NULL),'[]'::jsonb)) FROM campus_ops.attendance_entries e JOIN campus_ops.attendance_sessions s ON s.tenant_id=e.tenant_id AND s.id=e.session_id WHERE e.tenant_id=$1 AND e.student_user_id=$2 AND s.status IN('published_to_hod','submitted_to_principal')"#).bind(tenant).bind(&target).fetch_one(db.pool()).await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"
+        WITH student_records AS (
+          SELECT
+            s.id AS session_id,
+            s.subject_offering_id,
+            s.subject_name,
+            subject.code AS subject_code,
+            s.held_on,
+            s.period_label,
+            s.created_at,
+            e.status
+          FROM campus_ops.attendance_entries e
+          JOIN campus_ops.attendance_sessions s
+            ON s.tenant_id = e.tenant_id AND s.id = e.session_id
+          LEFT JOIN core.subject_offerings offering
+            ON offering.tenant_id = s.tenant_id
+           AND offering.id = s.subject_offering_id
+          LEFT JOIN core.subjects subject
+            ON subject.tenant_id = offering.tenant_id
+           AND subject.id = offering.subject_id
+          WHERE e.tenant_id = $1
+            AND e.student_user_id = $2
+            AND s.status IN ('published_to_hod', 'submitted_to_principal')
+        ),
+        subject_totals AS (
+          SELECT
+            subject_offering_id,
+            subject_name,
+            max(subject_code) AS subject_code,
+            count(*) AS total_classes,
+            count(*) FILTER (WHERE status = 'present') AS present_classes,
+            count(*) FILTER (WHERE status = 'absent') AS absent_classes,
+            count(*) FILTER (WHERE status = 'od') AS on_duty_classes,
+            count(*) FILTER (WHERE status = 'leave') AS leave_classes
+          FROM student_records
+          GROUP BY subject_offering_id, subject_name
+        )
+        SELECT jsonb_build_object(
+          'studentUserId', $2::text,
+          'totalClasses', (SELECT count(*) FROM student_records),
+          'attendedClasses', (SELECT count(*) FROM student_records WHERE status IN ('present', 'od')),
+          'presentClasses', (SELECT count(*) FROM student_records WHERE status = 'present'),
+          'absences', (SELECT count(*) FROM student_records WHERE status = 'absent'),
+          'onDutyClasses', (SELECT count(*) FROM student_records WHERE status = 'od'),
+          'leaveClasses', (SELECT count(*) FROM student_records WHERE status = 'leave'),
+          'percentage', CASE
+            WHEN (SELECT count(*) FROM student_records) = 0 THEN 0
+            ELSE round(
+              (SELECT count(*) FROM student_records WHERE status IN ('present', 'od'))::numeric
+              * 100 / (SELECT count(*) FROM student_records), 2
+            )::float8
+          END,
+          'records', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'sessionId', session_id,
+              'subjectOfferingId', subject_offering_id,
+              'subjectCode', subject_code,
+              'subjectName', subject_name,
+              'heldOn', held_on,
+              'periodLabel', period_label,
+              'status', status
+            ) ORDER BY held_on DESC, created_at DESC)
+            FROM student_records
+          ), '[]'::jsonb),
+          'bySubject', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'subjectOfferingId', subject_offering_id,
+              'subjectCode', subject_code,
+              'subjectName', subject_name,
+              'totalClasses', total_classes,
+              'attendedClasses', present_classes + on_duty_classes,
+              'presentClasses', present_classes,
+              'absentClasses', absent_classes,
+              'onDutyClasses', on_duty_classes,
+              'leaveClasses', leave_classes,
+              'percentage', CASE WHEN total_classes = 0 THEN 0 ELSE
+                round((present_classes + on_duty_classes)::numeric * 100 / total_classes, 2)::float8
+              END
+            ) ORDER BY subject_name)
+            FROM subject_totals
+          ), '[]'::jsonb)
+        )
+        "#,
+    )
+    .bind(tenant)
+    .bind(&target)
+    .fetch_one(db.pool())
+    .await?;
     Ok(Json(ApiResponse::new(value)))
 }
 

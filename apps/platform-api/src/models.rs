@@ -370,7 +370,8 @@ pub struct AuthStudent {
 #[serde(rename_all = "camelCase")]
 pub struct LoginData {
     pub student: AuthStudent,
-    pub access_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
     pub token_type: &'static str,
     pub expires_at: DateTime<Utc>,
     pub session_id: Uuid,

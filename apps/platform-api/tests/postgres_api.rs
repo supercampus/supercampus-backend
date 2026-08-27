@@ -74,7 +74,7 @@ async fn postgres_state_survives_app_state_recreation() {
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"email":"{email}","password":"{password}"}}"#,
+                    r#"{{"email":"{email}","password":"{password}","sessionMode":"token"}}"#,
                 )))
                 .unwrap(),
         )
@@ -234,7 +234,7 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"email":"{admin_email}","password":"{admin_password}"}}"#,
+                    r#"{{"email":"{admin_email}","password":"{admin_password}","sessionMode":"token"}}"#,
                 )))
                 .unwrap(),
         )
@@ -412,7 +412,7 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"email":"{reader_email}","password":"{refreshed_password}"}}"#,
+                    r#"{{"email":"{reader_email}","password":"{refreshed_password}","sessionMode":"token"}}"#,
                 )))
                 .unwrap(),
         )
@@ -435,6 +435,7 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
         .oneshot(
             Request::get("/api/v1/crm/leads")
                 .header(header::AUTHORIZATION, &reader_authorization)
+                .header("x-client-surface", "website")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -462,6 +463,7 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
         .oneshot(
             Request::get("/api/v1/crm/leads")
                 .header(header::AUTHORIZATION, &reader_authorization)
+                .header("x-client-surface", "website")
                 .body(Body::empty())
                 .unwrap(),
         )

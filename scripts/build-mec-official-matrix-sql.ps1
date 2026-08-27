@@ -344,16 +344,64 @@ BEGIN
        AND timetable_slot.day_of_week = matrix_slot.day_no
        AND timetable_slot.sequence = matrix_slot.period_no;
 
-    -- CSE and Cyber share the identical faculty/subject matrix at identical
-    -- hours. Mark those rows as one combined class so the faculty app collapses
-    -- the two section records into a single teaching card.
+    -- Consecutive laboratory periods are one teaching session. Preserve each
+    -- physical timetable cell, but give the run one session block so staff see
+    -- a single attendance card such as "Periods 5-7" rather than three cards.
+    WITH ordered AS (
+        SELECT entry.id, entry.metadata ->> 'departmentCode' AS department_code,
+               entry.metadata ->> 'officialActivity' AS activity,
+               timetable_slot.day_of_week, timetable_slot.sequence,
+               lag(timetable_slot.sequence) OVER (
+                   PARTITION BY entry.metadata ->> 'departmentCode', timetable_slot.day_of_week
+                   ORDER BY timetable_slot.sequence
+               ) AS prior_sequence,
+               lag(entry.metadata ->> 'officialActivity') OVER (
+                   PARTITION BY entry.metadata ->> 'departmentCode', timetable_slot.day_of_week
+                   ORDER BY timetable_slot.sequence
+               ) AS prior_activity,
+               entry.delivery_type
+          FROM core.timetable_entries entry
+          JOIN core.timetable_slots timetable_slot ON timetable_slot.id = entry.slot_id
+         WHERE entry.version_id = official_version
+    ), runs AS (
+        SELECT ordered.*,
+               sum(CASE
+                   WHEN delivery_type = 'laboratory'
+                    AND prior_sequence = sequence - 1
+                    AND prior_activity = activity THEN 0 ELSE 1 END
+               ) OVER (PARTITION BY department_code, day_of_week ORDER BY sequence) AS run_no
+          FROM ordered
+    ), blocks AS (
+        SELECT id,
+               min(id::text) OVER (PARTITION BY department_code, day_of_week, run_no)::uuid AS block_id,
+               row_number() OVER (PARTITION BY department_code, day_of_week, run_no ORDER BY sequence)::smallint AS block_sequence,
+               count(*) OVER (PARTITION BY department_code, day_of_week, run_no)::smallint AS block_length
+          FROM runs
+    )
+    UPDATE core.timetable_entries entry
+       SET session_block_id = block.block_id,
+           block_sequence = block.block_sequence,
+           block_length = block.block_length,
+           updated_at = now()
+      FROM blocks block
+     WHERE entry.id = block.id;
+
+    -- Mark matching CSE/Cyber and AIML/CSBS rows as combined classes. Matching
+    -- requires the same slot, subject, and faculty, so unrelated overlaps are
+    -- never merged.
     UPDATE core.timetable_entries entry
        SET metadata = entry.metadata || jsonb_build_object(
-           'combinedClassCode','CSE-CYBER',
-           'combinedClassName','CSE + CYBER - Section A'),
+           'combinedClassCode', CASE
+               WHEN entry.metadata ->> 'departmentCode' IN ('CSE','CYBER') THEN 'CSE-CYBER'
+               ELSE 'AIML-CSBS'
+           END,
+           'combinedClassName', CASE
+               WHEN entry.metadata ->> 'departmentCode' IN ('CSE','CYBER') THEN 'CSE + CYBER - Section A'
+               ELSE 'AIML + CSBS - Section A'
+           END),
            updated_at = now()
      WHERE entry.version_id = official_version
-       AND entry.metadata ->> 'departmentCode' IN ('CSE','CYBER')
+       AND entry.metadata ->> 'departmentCode' IN ('CSE','CYBER','AIML','CSBS')
        AND EXISTS (
            SELECT 1
              FROM core.timetable_entries counterpart
@@ -372,7 +420,13 @@ BEGIN
               AND counterpart.slot_id = entry.slot_id
               AND counterpart_assignment.faculty_user_id = own_assignment.faculty_user_id
               AND counterpart_subject.code = own_subject.code
-              AND counterpart.metadata ->> 'departmentCode' IN ('CSE','CYBER')
+              AND (
+                  (entry.metadata ->> 'departmentCode' IN ('CSE','CYBER')
+                   AND counterpart.metadata ->> 'departmentCode' IN ('CSE','CYBER'))
+                  OR
+                  (entry.metadata ->> 'departmentCode' IN ('AIML','CSBS')
+                   AND counterpart.metadata ->> 'departmentCode' IN ('AIML','CSBS'))
+              )
               AND counterpart.metadata ->> 'departmentCode'
                     <> entry.metadata ->> 'departmentCode'
        );

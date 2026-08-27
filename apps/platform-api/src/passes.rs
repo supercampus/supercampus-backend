@@ -109,10 +109,8 @@ fn draw_qr(canvas: &mut RgbaImage, payload: &str, width: u32, height: u32) -> Re
     let drawn = module_px * modules as u32;
 
     // Re-centre on the reference position after rounding down.
-    let left = (QR_LEFT * width as f32).round() as i64
-        + ((target as i64 - drawn as i64) / 2);
-    let top = (QR_TOP * height as f32).round() as i64
-        + ((target as i64 - drawn as i64) / 2);
+    let left = (QR_LEFT * width as f32).round() as i64 + ((target as i64 - drawn as i64) / 2);
+    let top = (QR_TOP * height as f32).round() as i64 + ((target as i64 - drawn as i64) / 2);
 
     let dark = Rgba([0, 0, 0, 255]);
     for y in 0..modules {

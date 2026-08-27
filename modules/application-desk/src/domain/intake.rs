@@ -326,13 +326,15 @@ pub fn apply_application_document_mapping(
     documents: &mut Vec<DocumentRecord>,
     attributes: &serde_json::Map<String, Value>,
 ) {
-    // A case may pre-date dynamic Application-form document mapping and still
-    // contain the old workflow checklist. Take the old records out up front so
-    // only fields declared by the submitted Application form can be returned.
-    let previous_documents = std::mem::take(documents);
     let Some(application) = attributes.get("applicationForm").and_then(Value::as_object) else {
+        // Cases without an Application-form snapshot still use the workflow
+        // checklist. Do not erase facts already recorded against that checklist.
         return;
     };
+    // Once an Application-form snapshot exists it is authoritative. Records
+    // are rebuilt only from a valid submitted Application form below; a
+    // similarly shaped enquiry or draft must not leak into the checklist.
+    let previous_documents = std::mem::take(documents);
     // Older immutable Application snapshots did not persist `formType`. They
     // are still safe to hydrate because CRM stores them under `applicationForm`.
     // If a type is explicitly present, however, it must be Application.
@@ -359,6 +361,7 @@ pub fn apply_application_document_mapping(
     let Some(values) = values.as_object() else {
         return;
     };
+
     let submission_id = application
         .get("submissionId")
         .and_then(Value::as_str)
@@ -634,6 +637,28 @@ mod application_document_mapping_tests {
 
         assert_eq!(case.documents.len(), 1);
         assert_eq!(case.documents[0].document_type, "certificate-10");
+    }
+
+    #[test]
+    fn workflow_document_facts_survive_without_an_application_form_snapshot() {
+        let definition = default_workflow("tenant-local");
+        let trigger = mapped_trigger("application");
+        let mut case = create_case(
+            &trigger,
+            &definition,
+            CreateCaseOptions {
+                id: "case-1".into(),
+                now: Utc::now(),
+                assigned_to: None,
+            },
+        );
+        case.attributes.remove("applicationForm");
+        case.documents[0].state = DocumentState::Verified;
+
+        apply_application_document_mapping(&mut case.documents, &case.attributes);
+
+        assert_eq!(case.documents.len(), 1);
+        assert_eq!(case.documents[0].state, DocumentState::Verified);
     }
 }
 

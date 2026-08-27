@@ -24,4 +24,3 @@ CREATE TABLE IF NOT EXISTS core.student_assessment_marks (
 CREATE INDEX IF NOT EXISTS student_assessment_marks_student_idx
     ON core.student_assessment_marks
        (tenant_id, student_id, semester, assessed_on DESC, created_at DESC);
-

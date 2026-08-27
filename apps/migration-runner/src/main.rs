@@ -138,7 +138,8 @@ async fn apply_mec_advisors() -> anyhow::Result<()> {
 /// Corrects the MEC timetable faculty matrix without running the full legacy
 /// migration chain. The SQL is tenant-scoped and idempotent.
 async fn apply_mec_faculty_matrix() -> anyhow::Result<()> {
-    const SQL: &str = include_str!("../../../migrations/runtime/0068_mec_timetable_faculty_matrix.sql");
+    const SQL: &str =
+        include_str!("../../../migrations/runtime/0068_mec_timetable_faculty_matrix.sql");
     let control_url = required_environment("CONTROL_DATABASE_URL")?;
     let control = Database::connect(&control_url).await?;
     let manager = TenantDatabaseManager::clustered(control, &control_url)?;

@@ -1,13 +1,13 @@
 use anyhow::Context;
 use axum::{
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     routing::{delete, get, post, put},
-    Extension, Json, Router,
 };
 use chrono::{NaiveDate, NaiveTime};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{ApiError, ApiResult},
-    governance::{any_role_may_perform, GovernedCapability},
+    governance::{GovernedCapability, any_role_may_perform},
     models::ApiResponse,
     state::{AppState, AuthPrincipal, EffectiveAccess},
 };
@@ -2998,11 +2998,13 @@ mod tests {
         assert!(require_timetable_manager(&principal("principal"), &allowed).is_ok());
         assert!(require_timetable_manager(&principal("academic_administrator"), &allowed).is_err());
         assert!(require_timetable_manager(&principal("hod"), &allowed).is_err());
-        assert!(require_timetable_manager(
-            &principal("principal"),
-            &access("academics.timetable.manage", "department")
-        )
-        .is_err());
+        assert!(
+            require_timetable_manager(
+                &principal("principal"),
+                &access("academics.timetable.manage", "department")
+            )
+            .is_err()
+        );
     }
 
     #[test]

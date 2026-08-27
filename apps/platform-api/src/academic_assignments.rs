@@ -3,7 +3,7 @@ use axum::{
     Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use chrono::NaiveDate;
 use serde::Deserialize;
@@ -22,6 +22,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/context", get(context))
         .route("/subjects", post(create_subject))
+        .route("/subjects/{subject_id}", put(update_subject))
         .route("/offerings", post(create_offering))
         .route("/hod", post(assign_hod))
         .route("/hod/{assignment_id}", delete(remove_hod))
@@ -295,19 +296,37 @@ async fn context(
                        'id', user_account.id, 'name', user_account.display_name,
                        'email', user_account.email, 'departmentId', employee.department_id
                    ) ORDER BY user_account.display_name)
-                   FROM identity.tenant_memberships membership
-                   JOIN tenant ON tenant.id = membership.tenant_id
-                   JOIN identity.users user_account
-                     ON user_account.id = membership.user_id AND user_account.active
+                   FROM identity.users user_account
+                   JOIN tenant ON true
+                   LEFT JOIN identity.tenant_memberships membership
+                     ON membership.tenant_id = tenant.id
+                    AND membership.user_id = user_account.id
+                    AND membership.active
                    LEFT JOIN core.employees employee
-                     ON employee.tenant_id = membership.tenant_id
-                    AND employee.user_id = membership.user_id
-                   WHERE $6 AND membership.active
-                     AND EXISTS (
-                         SELECT 1 FROM core.teaching_assignments teaching
-                         WHERE teaching.tenant_id = membership.tenant_id
-                           AND teaching.faculty_user_id = membership.user_id
-                           AND teaching.active
+                     ON employee.tenant_id = tenant.id
+                    AND employee.user_id = user_account.id
+                   WHERE $6 AND user_account.active
+                     AND (
+                         COALESCE(membership.roles, ARRAY[]::text[])
+                             && ARRAY['staff', 'class_advisor', 'faculty']::text[]
+                         OR EXISTS (
+                             SELECT 1
+                             FROM authz.user_roles user_role
+                             JOIN authz.roles role
+                               ON role.tenant_id = user_role.tenant_id
+                              AND role.id = user_role.role_id
+                              AND role.active
+                             WHERE user_role.tenant_id = tenant.id
+                               AND user_role.user_id = user_account.id
+                               AND role.role_key IN ('staff', 'class_advisor', 'faculty')
+                         )
+                         OR employee.status = 'active'
+                         OR EXISTS (
+                             SELECT 1 FROM core.teaching_assignments teaching
+                             WHERE teaching.tenant_id = tenant.id
+                               AND teaching.faculty_user_id = user_account.id
+                               AND teaching.active
+                         )
                      )
                ), '[]'::jsonb)
            )"#,
@@ -367,6 +386,61 @@ async fn create_subject(
         "credits": row.try_get::<Option<f64>, _>("credits")?,
     });
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn update_subject(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(subject_id): Path<Uuid>,
+    Json(request): Json<CreateSubjectRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_assignment_manager(&principal, &access)?;
+    if request.code.trim().is_empty()
+        || request.name.trim().is_empty()
+        || request.credits.is_some_and(|credits| credits < 0.0)
+    {
+        return Err(ApiError::BadRequest(
+            "subject code and name are required, and credits cannot be negative".into(),
+        ));
+    }
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let row = sqlx::query(
+        r#"UPDATE core.subjects subject
+           SET department_id = department.id,
+               code = $4,
+               name = $5,
+               credits = $6,
+               updated_at = now()
+           FROM platform.tenants tenant
+           JOIN core.departments department
+             ON department.tenant_id = tenant.id AND department.id = $3 AND department.active
+           WHERE tenant.slug = $1
+             AND subject.tenant_id = tenant.id
+             AND subject.id = $2
+             AND subject.active
+           RETURNING subject.id, subject.department_id, subject.code,
+                     subject.name, subject.credits::float8 AS credits"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(subject_id)
+    .bind(request.department_id)
+    .bind(request.code.trim())
+    .bind(request.name.trim())
+    .bind(request.credits)
+    .fetch_optional(database.pool())
+    .await
+    .context("failed to update subject")?
+    .ok_or_else(|| {
+        ApiError::BadRequest("subject or department does not belong to this tenant".into())
+    })?;
+    Ok(Json(ApiResponse::new(json!({
+        "id": row.try_get::<Uuid, _>("id")?,
+        "departmentId": row.try_get::<Uuid, _>("department_id")?,
+        "code": row.try_get::<String, _>("code")?,
+        "name": row.try_get::<String, _>("name")?,
+        "credits": row.try_get::<Option<f64>, _>("credits")?,
+    }))))
 }
 
 async fn create_offering(

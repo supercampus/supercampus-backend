@@ -709,7 +709,10 @@ pub async fn text_assistant(
         "You are the SuperCampus admissions CRM copilot for tenant {}. Answer using the live portal context when it is supplied. Never tell the user to manually count data that exists in the context. The context is permission-scoped to the signed-in user. Never invent applicant data, never make final eligibility or admission decisions, and avoid discriminatory recommendations. {} Return ONLY JSON shaped as {{\"answer\":\"plain text answer\",\"action\":null}}. If the user explicitly asks to change a lead, action may instead be {{\"type\":\"add_lead_note|create_lead_task|move_lead|start_application\",\"leadQuery\":\"name, email, phone, or id from the user request\",\"payload\":{{}}}}. Use add_lead_note payload {{\"content\":\"...\"}}, create_lead_task payload {{\"title\":\"...\",\"dueAt\":\"RFC3339 timestamp\",\"priority\":\"low|medium|high|urgent\"}}, move_lead payload {{\"toStage\":\"...\",\"toSubstate\":null,\"reason\":\"...\"}}, and start_application payload {{\"channel\":\"whatsapp\"}}. A request to move a lead to Application MUST use start_application because the application stage is entered only after the invited applicant submits the published form. Never claim an action was completed; it must be confirmed by the user. Live portal context: {}",
         context.tenant,
         instruction,
-        portal_context.as_ref().map(Value::to_string).unwrap_or_else(|| "unavailable for this user's permissions".into())
+        portal_context
+            .as_ref()
+            .map(Value::to_string)
+            .unwrap_or_else(|| "unavailable for this user's permissions".into())
     );
     let payload = AiChatRequest {
         model: &model,
@@ -800,38 +803,47 @@ pub async fn execute_assistant_action(
     let service = state.service(&context.tenant).await?;
     let action = request.action;
     let result = match action.action_type.as_str() {
-        "add_lead_note" => json!(service
-            .add_lead_note(
-                &context.tenant,
-                &context.actor,
-                action.lead_id,
-                serde_json::from_value(action.payload)
-                    .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?,
-            )
-            .await?),
-        "create_lead_task" => service
-            .add_lead_task(
-                &context.tenant,
-                &context.actor,
-                action.lead_id,
-                serde_json::from_value(action.payload)
-                    .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?,
-            )
-            .await?,
-        "move_lead" => json!(service
-            .move_stage(
-                &context.tenant,
-                &context.actor,
-                action.lead_id,
-                serde_json::from_value(action.payload)
-                    .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?,
-            )
-            .await?),
+        "add_lead_note" => json!(
+            service
+                .add_lead_note(
+                    &context.tenant,
+                    &context.actor,
+                    action.lead_id,
+                    serde_json::from_value(action.payload)
+                        .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?,
+                )
+                .await?
+        ),
+        "create_lead_task" => {
+            service
+                .add_lead_task(
+                    &context.tenant,
+                    &context.actor,
+                    action.lead_id,
+                    serde_json::from_value(action.payload)
+                        .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?,
+                )
+                .await?
+        }
+        "move_lead" => json!(
+            service
+                .move_stage(
+                    &context.tenant,
+                    &context.actor,
+                    action.lead_id,
+                    serde_json::from_value(action.payload)
+                        .map_err(|error| CrmHttpError(CrmError::Validation(error.to_string())))?,
+                )
+                .await?
+        ),
         "start_application" => {
             let mut lead = service
                 .get_lead(&context.tenant, &context.actor, action.lead_id)
                 .await?;
-            if matches!(lead.stage_key.as_str(), "enquiry" | "contact_attempted" | "contacted") {
+            if matches!(
+                lead.stage_key.as_str(),
+                "enquiry" | "contact_attempted" | "contacted"
+            ) {
                 lead = service
                     .move_stage(
                         &context.tenant,
@@ -867,9 +879,7 @@ pub async fn execute_assistant_action(
                     lead.stage_key
                 ))));
             }
-            let channel = action.payload["channel"]
-                .as_str()
-                .map(str::to_owned);
+            let channel = action.payload["channel"].as_str().map(str::to_owned);
             service
                 .create_application_invitation(
                     &context.tenant,

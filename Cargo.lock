@@ -2527,7 +2527,16 @@ dependencies = [
 name = "supercampus-notification-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "dotenvy",
+ "serde_json",
+ "sqlx",
+ "supercampus-database",
+ "supercampus-notifications",
  "supercampus-observability",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

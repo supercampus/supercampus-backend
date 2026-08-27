@@ -2,10 +2,10 @@ pub mod academic_assignments;
 pub mod dashboard;
 pub mod error;
 pub mod governance;
+pub mod guardian_link;
 pub mod media;
 pub mod models;
 pub mod operations;
-pub mod guardian_link;
 pub mod passes;
 pub mod visitors;
 

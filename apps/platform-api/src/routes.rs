@@ -17,13 +17,12 @@ use crate::{
     error::{ApiError, ApiResult},
     models::{
         ApiResponse, AssignUserRolesRequest, BootstrapDocument, BulkStudentImportRequest,
-        StudentPhotoRequest,
         CreateAuthorizationRoleRequest, CreateRecordRequest, CreateTenantUserRequest,
         ForgotPasswordRequest, HealthDocument, LoginData, LoginRequest, LogoutRequest,
         NavigationItem, PutConfigurationRequest, RefreshRequest, ResetPasswordRequest,
         SaveAppStateRequest, SessionData, SessionMode, SetRolePermissionsRequest,
-        SetUserAccessRequest, UpdateAuthorizationRoleRequest, UpdateRecordRequest,
-        ValidateWorkflowTransitionRequest,
+        SetUserAccessRequest, StudentPhotoRequest, UpdateAuthorizationRoleRequest,
+        UpdateRecordRequest, ValidateWorkflowTransitionRequest,
     },
     realtime::RealtimePublication,
     state::{
@@ -651,7 +650,11 @@ async fn set_student_photo(
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require_effective_permission(&access, "students.directory.create")?;
 
-    let photo_url = request.photo_url.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let photo_url = request
+        .photo_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if let Some(url) = photo_url {
         // Anything that is not an https URL has no business being rendered as a
         // student's face in the app.
@@ -661,7 +664,9 @@ async fn set_student_photo(
             ));
         }
         if url.len() > 2048 {
-            return Err(ApiError::BadRequest("That photograph URL is too long".into()));
+            return Err(ApiError::BadRequest(
+                "That photograph URL is too long".into(),
+            ));
         }
     }
 
@@ -1428,7 +1433,7 @@ fn login_response(
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     let data = LoginData {
         student: session.student,
-        access_token: session.access_token,
+        access_token: expose_refresh_token.then_some(session.access_token),
         token_type: "Bearer",
         expires_at: session.access_expires_at,
         session_id: session.session_id,

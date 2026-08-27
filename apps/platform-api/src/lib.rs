@@ -191,8 +191,14 @@ pub async fn run() -> anyhow::Result<()> {
             "control database migration check skipped; migrations must be managed by the release job"
         );
         // Dokploy currently starts the API without a separate release job. Keep
-        // this one identity rollout available as an idempotent compatibility
-        // patch so the deployed accountant credentials and UI cannot diverge.
+        // these accountant rollouts available as idempotent compatibility
+        // patches so the deployed credentials, permissions, and UI cannot diverge.
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0071_accountant_wallet_access.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the accountant wallet access release patch")?;
         sqlx::raw_sql(include_str!(
             "../../../migrations/runtime/0073_abhinaya_accountant_portal.sql"
         ))

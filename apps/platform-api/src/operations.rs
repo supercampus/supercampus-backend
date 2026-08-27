@@ -39,6 +39,7 @@ pub fn router() -> Router<AppState> {
             put(update_order_status),
         )
         .route("/canteen/orders/scan", post(scan_order))
+        .route("/canteen/wallets", get(wallet_directory))
         .route("/canteen/wallets/{user_id}/top-ups", post(top_up_wallet))
         .route("/canteen/staff-state", put(update_canteen_staff_state))
         .route("/gatepass/overview", get(gatepass_overview))
@@ -405,7 +406,7 @@ async fn canteen_store(
         'orders', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'orderNumber',order_number,
           'customerUserId',customer_user_id,'customerName',customer_name,'lines',lines,
           'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,
-          'tokenNumber',token_number,'createdAt',created_at,'updatedAt',updated_at)
+          'tokenNumber',token_number,'qrPayload',id::text,'createdAt',created_at,'updatedAt',updated_at)
           ORDER BY created_at DESC) FROM campus_ops.canteen_orders
           WHERE tenant_id=$1 AND (($7 AND (NOT $9 OR store = ANY($10))) OR customer_user_id=$2)), '[]'::jsonb),
         'walletTransactions', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,
@@ -1252,11 +1253,13 @@ async fn scan_order(
         return Err(ApiError::BadRequest("Invalid scan action".into()));
     }
     let mut tx = db.pool().begin().await?;
+    let order_id = Uuid::parse_str(input.qr_payload.trim()).ok();
     let current = sqlx::query_as::<_, (Uuid, String, String, f64, String)>(
-        "SELECT id,status,customer_user_id,total::float8,store FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND qr_token_hash=$2 FOR UPDATE",
+        "SELECT id,status,customer_user_id,total::float8,store FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (qr_token_hash=$2 OR id=$3) FOR UPDATE",
     )
     .bind(tenant)
     .bind(token_hash(&input.qr_payload))
+    .bind(order_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::NotFound("Order QR is invalid".into()))?;
@@ -1319,6 +1322,72 @@ struct TopUpRequest {
     reference: Option<String>,
     idempotency_key: Option<String>,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WalletDirectoryQuery {
+    search: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn wallet_directory(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Query(query): Query<WalletDirectoryQuery>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "canteen.wallet.top_up")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let search = query.search.unwrap_or_default().trim().to_lowercase();
+    let pattern = format!("%{search}%");
+    let limit = query.limit.unwrap_or(100).clamp(1, 250);
+    let wallets = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT COALESCE(jsonb_agg(row ORDER BY row->>'studentNumber'), '[]'::jsonb)
+        FROM (
+          SELECT jsonb_build_object(
+            'userId', student.user_account_id::text,
+            'studentId', student.id,
+            'studentNumber', student.student_number,
+            'studentName', student.full_name,
+            'email', student.email,
+            'department', COALESCE(department.code, student.department_id, ''),
+            'balance', COALESCE(wallet.balance, 0)::float8,
+            'updatedAt', wallet.updated_at,
+            'lastTransactionAt', (
+              SELECT transaction.created_at
+              FROM campus_ops.canteen_wallet_transactions transaction
+              WHERE transaction.tenant_id=student.tenant_id
+                AND transaction.user_id=student.user_account_id::text
+              ORDER BY transaction.created_at DESC LIMIT 1
+            )
+          ) AS row
+          FROM core.students student
+          LEFT JOIN core.departments department
+            ON department.tenant_id=student.tenant_id
+           AND department.id::text=student.department_id
+          LEFT JOIN campus_ops.canteen_wallets wallet
+            ON wallet.tenant_id=student.tenant_id
+           AND wallet.user_id=student.user_account_id::text
+          WHERE student.tenant_id=$1
+            AND student.user_account_id IS NOT NULL
+            AND student.status IN ('provisional','active')
+            AND ($2='' OR lower(concat_ws(' ', student.student_number,
+              student.full_name, student.email, department.code)) LIKE $3)
+          ORDER BY student.student_number, student.full_name
+          LIMIT $4
+        ) directory"#,
+    )
+    .bind(tenant)
+    .bind(&search)
+    .bind(pattern)
+    .bind(limit)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({"wallets": wallets}))))
+}
+
 async fn top_up_wallet(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,

@@ -2154,18 +2154,33 @@ async fn scan_gatepass(
     // geofenced daily gate-in, or a visitor's card. A visitor has no account, so
     // their pass id stands in for the user id — gate_movements.user_id is NOT
     // NULL and every "movements for this person" query already keys on it.
-    let match_row = sqlx::query_as::<_, (String, Option<Uuid>, Option<Uuid>)>(
-        r#"SELECT user_id,request_id,visitor_pass_id FROM (
-          SELECT requester_user_id user_id,id request_id,NULL::uuid visitor_pass_id
+    let match_row = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<Uuid>,
+            Option<Uuid>,
+            String,
+            String,
+            DateTime<Utc>,
+        ),
+    >(
+        r#"SELECT user_id,request_id,visitor_pass_id,holder_name,pass_type,valid_until FROM (
+          SELECT requester_user_id user_id,id request_id,NULL::uuid visitor_pass_id,
+                 requester_name holder_name,pass_type,return_at valid_until
             FROM campus_ops.gatepass_requests
            WHERE tenant_id=$1 AND state='approved' AND qr_token_hash=$2
           UNION ALL
-          SELECT user_id,NULL::uuid,NULL::uuid
-            FROM campus_ops.daily_access_passes
-           WHERE tenant_id=$1 AND valid_on=CURRENT_DATE AND qr_token_hash=$2
+          SELECT pass.user_id,NULL::uuid,NULL::uuid,
+                 COALESCE(member.display_name,pass.user_id) holder_name,
+                 'daily_access' pass_type,(pass.valid_on+1)::timestamptz valid_until
+            FROM campus_ops.daily_access_passes pass
+            LEFT JOIN identity.users member ON member.id::text=pass.user_id
+           WHERE pass.tenant_id=$1 AND pass.valid_on=CURRENT_DATE AND pass.qr_token_hash=$2
           UNION ALL
           -- A visitor pass is only good inside the window it was approved for.
-          SELECT id::text,NULL::uuid,id
+          SELECT id::text,NULL::uuid,id,visitor_name,'visitor' pass_type,
+                 visit_until valid_until
             FROM campus_ops.visitor_passes
            WHERE tenant_id=$1 AND state='approved' AND qr_token_hash=$2
              AND now() BETWEEN visit_from AND visit_until
@@ -2176,8 +2191,13 @@ async fn scan_gatepass(
     .fetch_optional(db.pool())
     .await?
     .ok_or_else(|| ApiError::NotFound("QR is invalid or expired".into()))?;
-    let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.gate_movements(tenant_id,user_id,request_id,visitor_pass_id,direction,checkpoint,scanned_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING jsonb_build_object('id',id,'userId',user_id,'requestId',request_id,'visitorPassId',visitor_pass_id,'direction',direction,'checkpoint',checkpoint,'createdAt',created_at)")
+    let mut value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.gate_movements(tenant_id,user_id,request_id,visitor_pass_id,direction,checkpoint,scanned_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING jsonb_build_object('id',id,'userId',user_id,'requestId',request_id,'visitorPassId',visitor_pass_id,'direction',direction,'checkpoint',checkpoint,'createdAt',created_at)")
  .bind(tenant).bind(&match_row.0).bind(match_row.1).bind(match_row.2).bind(&input.direction).bind(input.checkpoint.trim()).bind(&principal.student.id).fetch_one(db.pool()).await?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("holderName".into(), json!(match_row.3));
+        object.insert("passType".into(), json!(match_row.4));
+        object.insert("validUntil".into(), json!(match_row.5));
+    }
     emit(
         &state,
         &principal.student.tenant_id,

@@ -104,15 +104,13 @@ BEGIN
          AND item.store = shop.shop_key) DESC,
      shop.created_at
      LIMIT 1;
-    IF canteen_shop_id IS NULL THEN
-        RAISE EXCEPTION 'MEC needs an active canteen shop before adding captains';
+    IF canteen_shop_id IS NOT NULL THEN
+        UPDATE campus_ops.shops
+           SET is_active = true,
+               updated_at = now()
+         WHERE tenant_id = mec_tenant_id
+           AND id = canteen_shop_id;
     END IF;
-
-    UPDATE campus_ops.shops
-       SET is_active = true,
-           updated_at = now()
-     WHERE tenant_id = mec_tenant_id
-       AND id = canteen_shop_id;
 
     FOR captain IN
         SELECT * FROM (VALUES
@@ -184,22 +182,27 @@ BEGIN
             profile = EXCLUDED.profile,
             updated_at = now();
 
-        INSERT INTO campus_ops.shop_user_assignments
-            (tenant_id, shop_id, user_id, assignment_role, is_active,
-             assigned_by)
-        VALUES
-            (mec_tenant_id, canteen_shop_id, captain.user_id::text,
-             'captain', true, 'runtime-migration-0075')
-        ON CONFLICT (tenant_id, shop_id, user_id) DO UPDATE SET
-            assignment_role = 'captain',
-            is_active = true,
-            assigned_by = 'runtime-migration-0075',
-            updated_at = now();
+        -- In split-database deployments the identity/RBAC records above live
+        -- in control, while the shop assignment lives in the MEC tenant
+        -- database and is applied by runtime migration 0076.
+        IF canteen_shop_id IS NOT NULL THEN
+            INSERT INTO campus_ops.shop_user_assignments
+                (tenant_id, shop_id, user_id, assignment_role, is_active,
+                 assigned_by)
+            VALUES
+                (mec_tenant_id, canteen_shop_id, captain.user_id::text,
+                 'captain', true, 'runtime-migration-0075')
+            ON CONFLICT (tenant_id, shop_id, user_id) DO UPDATE SET
+                assignment_role = 'captain',
+                is_active = true,
+                assigned_by = 'runtime-migration-0075',
+                updated_at = now();
 
-        INSERT INTO campus_ops.canteen_staff_state
-            (tenant_id, user_id, mode, shop_open)
-        VALUES (mec_tenant_id, captain.user_id::text, 'work', NULL)
-        ON CONFLICT (tenant_id, user_id) DO NOTHING;
+            INSERT INTO campus_ops.canteen_staff_state
+                (tenant_id, user_id, mode, shop_open)
+            VALUES (mec_tenant_id, captain.user_id::text, 'work', NULL)
+            ON CONFLICT (tenant_id, user_id) DO NOTHING;
+        END IF;
 
         UPDATE identity.auth_sessions
            SET revoked_at = COALESCE(revoked_at, now())

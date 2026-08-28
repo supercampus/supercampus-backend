@@ -205,6 +205,18 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to apply the Abhinaya accountant release patch")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0074_gate_security_portal.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the gate security portal release patch")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0075_mec_canteen_captains.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the canteen captain release patch")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");

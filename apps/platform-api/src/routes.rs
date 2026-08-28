@@ -82,6 +82,7 @@ pub fn router(state: AppState) -> Router {
         .route("/navigation", get(get_navigation))
         .route("/dashboard/effective", get(get_effective_dashboard))
         .route("/student-master", get(list_student_master))
+        .route("/student/fees", get(list_own_student_fee_records))
         .route("/student-master/import", post(import_student_master))
         .route("/student-master/{student_id}/photo", put(set_student_photo))
         // Reached by a guardian holding a WhatsApp link and nothing else.
@@ -740,6 +741,44 @@ async fn list_records(
     let records = state
         .list_records(&tenant_id(&headers), &module_key)
         .await?;
+    Ok(Json(ApiResponse::new(json!(records))))
+}
+
+/// Read-only student fee projection. Unlike the administrative generic-record
+/// endpoint, this route never accepts a tenant or student selector from the
+/// client and returns only records carrying the signed-in student's stable
+/// identity.
+async fn list_own_student_fee_records(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    if !principal
+        .student
+        .portal_families
+        .iter()
+        .any(|family| family == "student")
+    {
+        return Err(ApiError::Forbidden);
+    }
+    ensure_module(&state, "fees")?;
+    let student = &principal.student;
+    let mut records = state.list_records(&student.tenant_id, "fees").await?;
+    records.retain(|record| {
+        let matches = |key: &str, expected: &str| {
+            record
+                .data
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected.trim()))
+        };
+        matches("studentId", &student.id)
+            || matches("userId", &student.id)
+            || matches("studentNumber", &student.roll)
+            || matches("roll", &student.roll)
+            || matches("registrationNumber", &student.roll)
+            || matches("studentEmail", &student.email)
+            || matches("email", &student.email)
+    });
     Ok(Json(ApiResponse::new(json!(records))))
 }
 

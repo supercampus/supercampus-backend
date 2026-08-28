@@ -74,23 +74,45 @@ BEGIN
        AND active
      LIMIT 1;
 
-    -- Prefer the explicitly configured MEC canteen, while remaining compatible
-    -- with installations whose original shop still uses the classic key.
-    SELECT id INTO canteen_shop_id
-      FROM campus_ops.shops
-     WHERE tenant_id = mec_tenant_id
-       AND is_active
-       AND lower(category) = 'canteen'
+    -- Prefer the explicitly configured MEC canteen. Older production data can
+    -- identify the same food counter through its menu store key while carrying
+    -- a legacy category or inactive shop flag, so use its linked menu items as
+    -- the final source of truth instead of rejecting the rollout.
+    SELECT shop.id INTO canteen_shop_id
+      FROM campus_ops.shops shop
+     WHERE shop.tenant_id = mec_tenant_id
+       AND (
+         shop.shop_key IN ('mec-canteen', 'classic')
+         OR lower(shop.category) = 'canteen'
+         OR EXISTS (
+           SELECT 1
+             FROM campus_ops.canteen_menu_items item
+            WHERE item.tenant_id = shop.tenant_id
+              AND item.store = shop.shop_key
+         )
+       )
      ORDER BY CASE
-       WHEN shop_key = 'mec-canteen' THEN 0
-       WHEN lower(name) = 'canteen' THEN 1
-       WHEN shop_key = 'classic' THEN 2
-       ELSE 3
-     END, created_at
+       WHEN shop.shop_key = 'mec-canteen' THEN 0
+       WHEN lower(shop.name) = 'canteen' THEN 1
+       WHEN shop.shop_key = 'classic' THEN 2
+       WHEN lower(shop.category) = 'canteen' THEN 3
+       ELSE 4
+     END,
+     (SELECT count(*)
+        FROM campus_ops.canteen_menu_items item
+       WHERE item.tenant_id = shop.tenant_id
+         AND item.store = shop.shop_key) DESC,
+     shop.created_at
      LIMIT 1;
     IF canteen_shop_id IS NULL THEN
         RAISE EXCEPTION 'MEC needs an active canteen shop before adding captains';
     END IF;
+
+    UPDATE campus_ops.shops
+       SET is_active = true,
+           updated_at = now()
+     WHERE tenant_id = mec_tenant_id
+       AND id = canteen_shop_id;
 
     FOR captain IN
         SELECT * FROM (VALUES

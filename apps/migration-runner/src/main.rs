@@ -22,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
         "apply-mec-original-faculty" => apply_mec_original_faculty().await,
         "apply-mec-faculty-matrix" => apply_mec_faculty_matrix().await,
         "apply-student-assessments" => apply_student_assessments().await,
+        "apply-push-notification-foundation" => apply_push_notification_foundation().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
@@ -45,9 +46,52 @@ async fn main() -> anyhow::Result<()> {
             provision_tenant(tenant_slug, database_name).await
         }
         command => bail!(
-            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
+            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
+}
+
+/// Applies only the idempotent push-notification foundation when a legacy
+/// installation cannot use the checksum-validated full migration chain.
+async fn apply_push_notification_foundation() -> anyhow::Result<()> {
+    const SQL: &str =
+        include_str!("../../../migrations/runtime/0077_push_notification_foundation.sql");
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    sqlx::raw_sql(SQL)
+        .execute(control.pool())
+        .await
+        .context("failed to apply push notifications to the control plane")?;
+
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug, registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id = registry.tenant_id
+           WHERE registry.status = 'active' AND tenant.status = 'active'
+           ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await
+    .context("failed to list tenant databases")?;
+
+    let base_options =
+        PgConnectOptions::from_str(&control_url).context("invalid CONTROL_DATABASE_URL")?;
+    for (slug, database_name) in &databases {
+        validate_database_name(database_name)?;
+        let tenant = Database::connect_options(base_options.clone().database(database_name), 2)
+            .await
+            .with_context(|| format!("failed to connect tenant {slug} database"))?;
+        sqlx::raw_sql(SQL)
+            .execute(tenant.pool())
+            .await
+            .with_context(|| format!("failed to apply push notifications to {slug}"))?;
+    }
+
+    println!(
+        "applied push notification foundation to control and {} tenant database(s)",
+        databases.len()
+    );
+    Ok(())
 }
 
 /// Applies the isolated student-assessment table to the control plane and all

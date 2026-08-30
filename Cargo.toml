@@ -28,6 +28,7 @@ ab_glyph = "0.2"
 hmac = "0.12"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "pool", "tokio1", "tokio1-rustls-tls"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "native-tls"] }
+jsonwebtoken = "9.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1 = "0.10"

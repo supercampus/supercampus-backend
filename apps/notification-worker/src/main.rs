@@ -8,6 +8,7 @@ use sqlx::{Postgres, Row, Transaction};
 use supercampus_database::{Database, TenantDatabaseManager};
 use supercampus_notifications::{
     EmailMessage, Mailer,
+    push::{DeliveryOutcome as PushOutcome, PushMessage, PushSender},
     sms::{DeliveryOutcome as SmsOutcome, SmsMessage, SmsSender},
     whatsapp::{DeliveryOutcome as WhatsAppOutcome, WhatsAppMessage, WhatsAppSender},
 };
@@ -27,10 +28,28 @@ struct DeliveryJob {
     attempt_count: i32,
 }
 
+#[derive(Debug)]
+struct PushDeliveryJob {
+    id: Uuid,
+    tenant_id: Uuid,
+    notification_id: Uuid,
+    device_id: Uuid,
+    token: String,
+    title: String,
+    body: String,
+    category: String,
+    event_type: String,
+    priority: String,
+    deep_link: Option<String>,
+    data: Value,
+    attempt_count: i32,
+}
+
 struct Transports {
     mailer: Arc<dyn Mailer>,
     sms: Arc<dyn SmsSender>,
     whatsapp: Arc<dyn WhatsAppSender>,
+    push: Option<Arc<dyn PushSender>>,
 }
 
 #[tokio::main]
@@ -47,11 +66,16 @@ async fn main() -> anyhow::Result<()> {
         mailer: supercampus_notifications::mailer_from_environment()?,
         sms: supercampus_notifications::sms::sms_from_environment()?,
         whatsapp: supercampus_notifications::whatsapp::whatsapp_from_environment()?,
+        push: supercampus_notifications::push::push_from_environment()?,
     };
     tracing::info!(
         email = transports.mailer.transport(),
         sms = transports.sms.transport(),
         whatsapp = transports.whatsapp.transport(),
+        push = transports
+            .push
+            .as_ref()
+            .map_or("disabled", |sender| sender.transport()),
         "notification delivery worker started"
     );
 
@@ -118,7 +142,177 @@ async fn process_tenant(
         let result = deliver(database, &job, transports).await;
         record_result(database, &job, result).await?;
     }
+    if let Some(sender) = transports.push.as_ref() {
+        enqueue_push_deliveries(database, tenant_id).await?;
+        let jobs = claim_push_batch(database, tenant_id).await?;
+        for job in jobs {
+            let result = sender
+                .send(PushMessage {
+                    token: job.token.clone(),
+                    title: job.title.clone(),
+                    body: job.body.clone(),
+                    deep_link: job.deep_link.clone(),
+                    category: job.category.clone(),
+                    event_type: job.event_type.clone(),
+                    priority: job.priority.clone(),
+                    data: job.data.clone(),
+                })
+                .await;
+            record_push_result(database, &job, result).await?;
+        }
+    }
     Ok(())
+}
+
+async fn enqueue_push_deliveries(database: &Database, tenant_id: Uuid) -> anyhow::Result<()> {
+    let mut transaction = database.pool().begin().await?;
+    set_tenant(&mut transaction, tenant_id).await?;
+    sqlx::query(
+        r#"INSERT INTO campus_ops.notification_push_deliveries
+             (tenant_id, notification_id, device_id)
+           SELECT notification.tenant_id, notification.id, device.id
+           FROM campus_ops.notifications notification
+           JOIN campus_ops.push_devices device
+             ON device.tenant_id=notification.tenant_id
+            AND device.enabled AND device.provider='fcm'
+           LEFT JOIN campus_ops.notification_preferences preference
+             ON preference.tenant_id=notification.tenant_id
+            AND preference.user_id=device.user_id
+            AND preference.category=notification.category
+           WHERE notification.tenant_id=$1
+             AND notification.push_status IN ('queued','retrying')
+             AND (notification.expires_at IS NULL OR notification.expires_at > now())
+             AND COALESCE(preference.push_enabled, true)
+             AND (
+               notification.priority='urgent'
+               OR preference.quiet_hours_start IS NULL
+               OR NOT CASE
+                 WHEN preference.quiet_hours_start < preference.quiet_hours_end THEN
+                   (now() AT TIME ZONE COALESCE((
+                     SELECT configuration.timezone
+                     FROM core.timetable_configurations configuration
+                     WHERE configuration.tenant_id=notification.tenant_id
+                       AND configuration.active
+                     ORDER BY configuration.updated_at DESC LIMIT 1
+                   ), 'Asia/Kolkata'))::time
+                     >= preference.quiet_hours_start
+                   AND (now() AT TIME ZONE COALESCE((
+                     SELECT configuration.timezone
+                     FROM core.timetable_configurations configuration
+                     WHERE configuration.tenant_id=notification.tenant_id
+                       AND configuration.active
+                     ORDER BY configuration.updated_at DESC LIMIT 1
+                   ), 'Asia/Kolkata'))::time
+                     < preference.quiet_hours_end
+                 ELSE
+                   (now() AT TIME ZONE COALESCE((
+                     SELECT configuration.timezone
+                     FROM core.timetable_configurations configuration
+                     WHERE configuration.tenant_id=notification.tenant_id
+                       AND configuration.active
+                     ORDER BY configuration.updated_at DESC LIMIT 1
+                   ), 'Asia/Kolkata'))::time
+                     >= preference.quiet_hours_start
+                   OR (now() AT TIME ZONE COALESCE((
+                     SELECT configuration.timezone
+                     FROM core.timetable_configurations configuration
+                     WHERE configuration.tenant_id=notification.tenant_id
+                       AND configuration.active
+                     ORDER BY configuration.updated_at DESC LIMIT 1
+                   ), 'Asia/Kolkata'))::time
+                     < preference.quiet_hours_end
+               END
+             )
+             AND (
+               notification.recipient_user_id=device.user_id
+               OR (
+                 notification.recipient_user_id IS NULL
+                 AND notification.recipient_role IS NOT NULL
+                 AND EXISTS (
+                   SELECT 1 FROM authz.user_roles user_role
+                   JOIN authz.roles role
+                     ON role.tenant_id=user_role.tenant_id
+                    AND role.id=user_role.role_id AND role.active
+                   WHERE user_role.tenant_id=notification.tenant_id
+                     AND user_role.user_id::text=device.user_id
+                     AND role.role_key=notification.recipient_role
+                 )
+               )
+             )
+           ON CONFLICT(tenant_id,notification_id,device_id) DO NOTHING"#,
+    )
+    .bind(tenant_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn claim_push_batch(
+    database: &Database,
+    tenant_id: Uuid,
+) -> anyhow::Result<Vec<PushDeliveryJob>> {
+    let mut transaction = database.pool().begin().await?;
+    set_tenant(&mut transaction, tenant_id).await?;
+    sqlx::query(
+        r#"UPDATE campus_ops.notification_push_deliveries
+           SET status='retrying', locked_at=NULL, next_attempt_at=now(),
+               last_error=COALESCE(last_error,'delivery lease expired'), updated_at=now()
+           WHERE tenant_id=$1 AND status='processing'
+             AND locked_at < now() - interval '10 minutes'"#,
+    )
+    .bind(tenant_id)
+    .execute(&mut *transaction)
+    .await?;
+    let rows = sqlx::query(
+        r#"WITH candidates AS (
+             SELECT delivery.id
+             FROM campus_ops.notification_push_deliveries delivery
+             WHERE delivery.tenant_id=$1
+               AND delivery.status IN ('queued','retrying')
+               AND delivery.next_attempt_at <= now()
+             ORDER BY delivery.next_attempt_at,delivery.created_at
+             FOR UPDATE SKIP LOCKED LIMIT $2
+           ), claimed AS (
+             UPDATE campus_ops.notification_push_deliveries delivery
+             SET status='processing',locked_at=now(),
+                 attempt_count=delivery.attempt_count+1,updated_at=now()
+             FROM candidates WHERE delivery.id=candidates.id
+             RETURNING delivery.*
+           )
+           SELECT claimed.id,claimed.tenant_id,claimed.notification_id,claimed.device_id,
+             claimed.attempt_count,device.token,notification.title,notification.body,
+             notification.category,notification.event_type,notification.priority,
+             notification.deep_link,notification.data
+           FROM claimed
+           JOIN campus_ops.push_devices device ON device.id=claimed.device_id
+           JOIN campus_ops.notifications notification ON notification.id=claimed.notification_id"#,
+    )
+    .bind(tenant_id)
+    .bind(BATCH_SIZE)
+    .fetch_all(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(PushDeliveryJob {
+                id: row.try_get("id")?,
+                tenant_id: row.try_get("tenant_id")?,
+                notification_id: row.try_get("notification_id")?,
+                device_id: row.try_get("device_id")?,
+                token: row.try_get("token")?,
+                title: row.try_get("title")?,
+                body: row.try_get("body")?,
+                category: row.try_get("category")?,
+                event_type: row.try_get("event_type")?,
+                priority: row.try_get("priority")?,
+                deep_link: row.try_get("deep_link")?,
+                data: row.try_get("data")?,
+                attempt_count: row.try_get("attempt_count")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(Into::into)
 }
 
 async fn claim_batch(database: &Database, tenant_id: Uuid) -> anyhow::Result<Vec<DeliveryJob>> {
@@ -301,6 +495,107 @@ async fn record_result(
             tracing::warn!(communication_id = %job.id, channel = %job.channel, attempt = job.attempt_count, terminal, "communication delivery failed");
         }
     }
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn record_push_result(
+    database: &Database,
+    job: &PushDeliveryJob,
+    result: anyhow::Result<PushOutcome>,
+) -> anyhow::Result<()> {
+    let mut transaction = database.pool().begin().await?;
+    set_tenant(&mut transaction, job.tenant_id).await?;
+    match result {
+        Ok(PushOutcome::Sent { message_id }) => {
+            sqlx::query(
+                r#"UPDATE campus_ops.notification_push_deliveries
+                   SET status='sent',provider_message_id=$3,sent_at=now(),
+                       locked_at=NULL,last_error=NULL,updated_at=now()
+                   WHERE tenant_id=$1 AND id=$2 AND status='processing'"#,
+            )
+            .bind(job.tenant_id)
+            .bind(job.id)
+            .bind(message_id)
+            .execute(&mut *transaction)
+            .await?;
+            tracing::info!(notification_id=%job.notification_id, device_id=%job.device_id, "push accepted by FCM");
+        }
+        Ok(PushOutcome::InvalidToken) => {
+            sqlx::query(
+                r#"UPDATE campus_ops.notification_push_deliveries
+                   SET status='invalid',locked_at=NULL,last_error='FCM token is no longer registered',
+                       updated_at=now() WHERE tenant_id=$1 AND id=$2 AND status='processing'"#,
+            )
+            .bind(job.tenant_id)
+            .bind(job.id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                r#"UPDATE campus_ops.push_devices
+                   SET enabled=false,updated_at=now()
+                   WHERE tenant_id=$1 AND id=$2"#,
+            )
+            .bind(job.tenant_id)
+            .bind(job.device_id)
+            .execute(&mut *transaction)
+            .await?;
+            tracing::info!(notification_id=%job.notification_id, device_id=%job.device_id, "disabled an invalid FCM token");
+        }
+        Err(error) => {
+            let terminal = job.attempt_count >= MAX_ATTEMPTS;
+            sqlx::query(
+                r#"UPDATE campus_ops.notification_push_deliveries
+                   SET status=$3,locked_at=NULL,last_error=$4,
+                       next_attempt_at=now()+make_interval(secs=>$5),updated_at=now()
+                   WHERE tenant_id=$1 AND id=$2 AND status='processing'"#,
+            )
+            .bind(job.tenant_id)
+            .bind(job.id)
+            .bind(if terminal { "failed" } else { "retrying" })
+            .bind(safe_error(&error))
+            .bind(retry_delay_seconds(job.attempt_count))
+            .execute(&mut *transaction)
+            .await?;
+            tracing::warn!(notification_id=%job.notification_id, device_id=%job.device_id, attempt=job.attempt_count, terminal, "push delivery failed");
+        }
+    }
+
+    sqlx::query(
+        r#"UPDATE campus_ops.notifications notification
+           SET push_status=CASE
+                 WHEN EXISTS (
+                   SELECT 1 FROM campus_ops.notification_push_deliveries delivery
+                   WHERE delivery.notification_id=notification.id
+                     AND delivery.status IN ('queued','processing','retrying')
+                 ) THEN 'retrying'
+                 WHEN EXISTS (
+                   SELECT 1 FROM campus_ops.notification_push_deliveries delivery
+                   WHERE delivery.notification_id=notification.id AND delivery.status='sent'
+                 ) THEN 'sent'
+                 ELSE 'failed'
+               END,
+               push_sent_at=CASE WHEN EXISTS (
+                 SELECT 1 FROM campus_ops.notification_push_deliveries delivery
+                 WHERE delivery.notification_id=notification.id AND delivery.status='sent'
+               ) THEN COALESCE(notification.push_sent_at,now()) ELSE notification.push_sent_at END,
+               push_attempt_count=(
+                 SELECT COALESCE(MAX(delivery.attempt_count),0)
+                 FROM campus_ops.notification_push_deliveries delivery
+                 WHERE delivery.notification_id=notification.id
+               ),
+               push_last_error=(
+                 SELECT delivery.last_error
+                 FROM campus_ops.notification_push_deliveries delivery
+                 WHERE delivery.notification_id=notification.id AND delivery.last_error IS NOT NULL
+                 ORDER BY delivery.updated_at DESC LIMIT 1
+               )
+           WHERE notification.tenant_id=$1 AND notification.id=$2"#,
+    )
+    .bind(job.tenant_id)
+    .bind(job.notification_id)
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
     Ok(())
 }

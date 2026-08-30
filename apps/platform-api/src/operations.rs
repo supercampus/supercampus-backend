@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post, put},
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -22,6 +22,19 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/changes", get(changes))
         .route("/notifications", get(notifications))
+        .route("/notifications/read-all", post(read_all_notifications))
+        .route(
+            "/notifications/{notification_id}/read",
+            post(read_notification),
+        )
+        .route(
+            "/notifications/preferences",
+            get(notification_preferences).put(update_notification_preferences),
+        )
+        .route(
+            "/notifications/devices",
+            post(register_push_device).delete(unregister_push_device),
+        )
         .route("/canteen/store", get(canteen_store))
         .route("/canteen/shops", get(list_shops).post(create_shop))
         .route(
@@ -345,19 +358,297 @@ async fn notifications(
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let rows = sqlx::query_scalar::<_, Value>(
         r#"
-      SELECT COALESCE(jsonb_agg(jsonb_build_object('id', id, 'category', category,
-        'title', title, 'body', body, 'data', data, 'readAt', read_at,
-        'createdAt', created_at) ORDER BY created_at DESC), '[]'::jsonb)
-      FROM campus_ops.notifications
-      WHERE tenant_id=$1 AND (recipient_user_id=$2 OR recipient_role = ANY($3))
-      LIMIT 100"#,
+      WITH accessible AS (
+        SELECT notification.*,
+          CASE WHEN notification.recipient_user_id=$2
+            THEN notification.read_at ELSE receipt.read_at END AS viewer_read_at
+        FROM campus_ops.notifications notification
+        LEFT JOIN campus_ops.notification_receipts receipt
+          ON receipt.tenant_id=notification.tenant_id
+         AND receipt.notification_id=notification.id AND receipt.user_id=$2
+        WHERE notification.tenant_id=$1
+          AND (notification.recipient_user_id=$2 OR notification.recipient_role = ANY($3))
+          AND (notification.expires_at IS NULL OR notification.expires_at > now())
+      ), visible AS (
+        SELECT jsonb_build_object(
+          'id', id, 'category', category, 'eventType', event_type,
+          'title', title, 'body', body, 'data', data, 'priority', priority,
+          'requiresAction', requires_action, 'deepLink', deep_link,
+          'readAt', viewer_read_at, 'createdAt', created_at
+        ) AS item, created_at
+        FROM accessible
+        ORDER BY created_at DESC
+        LIMIT 100
+      )
+      SELECT jsonb_build_object(
+        'notifications', COALESCE(
+          (SELECT jsonb_agg(item ORDER BY created_at DESC) FROM visible),
+          '[]'::jsonb
+        ),
+        'unreadCount', (SELECT count(*) FROM accessible WHERE viewer_read_at IS NULL)
+      )"#,
     )
     .bind(tenant)
     .bind(&principal.student.id)
     .bind(&principal.roles)
     .fetch_one(db.pool())
     .await?;
-    Ok(Json(ApiResponse::new(json!({"notifications": rows}))))
+    Ok(Json(ApiResponse::new(rows)))
+}
+
+async fn read_notification(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(notification_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let changed = sqlx::query_scalar::<_, Uuid>(
+        r#"WITH accessible AS (
+             SELECT id,recipient_user_id FROM campus_ops.notifications
+             WHERE id=$1 AND tenant_id=$2
+               AND (recipient_user_id=$3 OR recipient_role = ANY($4))
+           ), direct AS (
+             UPDATE campus_ops.notifications SET read_at=COALESCE(read_at,now())
+             WHERE id IN (SELECT id FROM accessible WHERE recipient_user_id=$3)
+           ), role_receipt AS (
+             INSERT INTO campus_ops.notification_receipts
+               (tenant_id,notification_id,user_id)
+             SELECT $2,id,$3 FROM accessible WHERE recipient_user_id IS NULL
+             ON CONFLICT(tenant_id,notification_id,user_id)
+             DO UPDATE SET read_at=EXCLUDED.read_at
+           )
+           SELECT id FROM accessible"#,
+    )
+    .bind(notification_id)
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&principal.roles)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Notification not found".into()))?;
+    Ok(Json(ApiResponse::new(json!({"id": changed, "read": true}))))
+}
+
+async fn read_all_notifications(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let direct = sqlx::query(
+        r#"UPDATE campus_ops.notifications SET read_at=now()
+           WHERE tenant_id=$1 AND recipient_user_id=$2 AND read_at IS NULL"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .execute(&mut *tx)
+    .await?;
+    let role = sqlx::query(
+        r#"INSERT INTO campus_ops.notification_receipts
+             (tenant_id,notification_id,user_id)
+           SELECT $1,id,$2 FROM campus_ops.notifications
+           WHERE tenant_id=$1 AND recipient_user_id IS NULL
+             AND recipient_role = ANY($3)
+           ON CONFLICT(tenant_id,notification_id,user_id) DO NOTHING"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&principal.roles)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(
+        json!({"updated": direct.rows_affected() + role.rows_affected()}),
+    )))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationPreferenceInput {
+    category: String,
+    push_enabled: bool,
+    #[serde(default)]
+    digest_enabled: bool,
+    quiet_hours_start: Option<String>,
+    quiet_hours_end: Option<String>,
+}
+
+async fn notification_preferences(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'category', category, 'pushEnabled', push_enabled,
+             'digestEnabled', digest_enabled,
+             'quietHoursStart', quiet_hours_start,
+             'quietHoursEnd', quiet_hours_end
+           ) ORDER BY category), '[]'::jsonb)
+           FROM campus_ops.notification_preferences
+           WHERE tenant_id=$1 AND user_id=$2"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({"preferences": rows}))))
+}
+
+async fn update_notification_preferences(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(input): Json<Vec<NotificationPreferenceInput>>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    for item in &input {
+        let category = item.category.trim().to_ascii_lowercase();
+        if category.is_empty() || category.len() > 64 {
+            return Err(ApiError::BadRequest("Invalid notification category".into()));
+        }
+        validate_quiet_hours(
+            item.quiet_hours_start.as_deref(),
+            item.quiet_hours_end.as_deref(),
+        )?;
+        sqlx::query(
+            r#"INSERT INTO campus_ops.notification_preferences
+                 (tenant_id,user_id,category,push_enabled,digest_enabled,
+                  quiet_hours_start,quiet_hours_end)
+               VALUES($1,$2,$3,$4,$5,$6::time,$7::time)
+               ON CONFLICT(tenant_id,user_id,category) DO UPDATE SET
+                 push_enabled=EXCLUDED.push_enabled,
+                 digest_enabled=EXCLUDED.digest_enabled,
+                 quiet_hours_start=EXCLUDED.quiet_hours_start,
+                 quiet_hours_end=EXCLUDED.quiet_hours_end,
+                 updated_at=now()"#,
+        )
+        .bind(tenant)
+        .bind(&principal.student.id)
+        .bind(category)
+        .bind(item.push_enabled)
+        .bind(item.digest_enabled)
+        .bind(item.quiet_hours_start.as_deref())
+        .bind(item.quiet_hours_end.as_deref())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(json!({"updated": input.len()}))))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PushDeviceInput {
+    token: String,
+    platform: String,
+    #[serde(default = "default_push_provider")]
+    provider: String,
+    device_name: Option<String>,
+    locale: Option<String>,
+}
+
+fn default_push_provider() -> String {
+    "fcm".into()
+}
+
+async fn register_push_device(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(input): Json<PushDeviceInput>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let platform = input.platform.trim().to_ascii_lowercase();
+    let provider = input.provider.trim().to_ascii_lowercase();
+    let token = input.token.trim();
+    validate_push_device(token, &platform, &provider)?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let id = sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO campus_ops.push_devices
+             (tenant_id,user_id,provider,platform,token,device_name,locale)
+           VALUES($1,$2,$3,$4,$5,$6,$7)
+           ON CONFLICT(tenant_id,token) DO UPDATE SET
+             user_id=EXCLUDED.user_id, provider=EXCLUDED.provider,
+             platform=EXCLUDED.platform, device_name=EXCLUDED.device_name,
+             locale=EXCLUDED.locale, enabled=true, last_seen_at=now(), updated_at=now()
+           RETURNING id"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(provider)
+    .bind(platform)
+    .bind(token)
+    .bind(input.device_name.as_deref())
+    .bind(input.locale.as_deref())
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"id": id, "registered": true}),
+    )))
+}
+
+fn validate_quiet_hours(start: Option<&str>, end: Option<&str>) -> ApiResult<()> {
+    match (start, end) {
+        (None, None) => Ok(()),
+        (Some(start), Some(end))
+            if parse_notification_time(start).is_some()
+                && parse_notification_time(end).is_some() =>
+        {
+            Ok(())
+        }
+        _ => Err(ApiError::BadRequest(
+            "Quiet hours require valid start and end times".into(),
+        )),
+    }
+}
+
+fn parse_notification_time(value: &str) -> Option<NaiveTime> {
+    NaiveTime::parse_from_str(value.trim(), "%H:%M")
+        .or_else(|_| NaiveTime::parse_from_str(value.trim(), "%H:%M:%S"))
+        .ok()
+}
+
+fn validate_push_device(token: &str, platform: &str, provider: &str) -> ApiResult<()> {
+    if !(16..=4096).contains(&token.len()) || token.chars().any(char::is_whitespace) {
+        return Err(ApiError::BadRequest("Invalid push token".into()));
+    }
+    let supported = matches!(
+        (platform, provider),
+        ("android" | "ios", "fcm") | ("ios", "apns") | ("web", "web_push")
+    );
+    if !supported {
+        return Err(ApiError::BadRequest("Unsupported push device".into()));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RemovePushDeviceInput {
+    token: String,
+}
+
+async fn unregister_push_device(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(input): Json<RemovePushDeviceInput>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let result = sqlx::query(
+        "UPDATE campus_ops.push_devices SET enabled=false,updated_at=now() WHERE tenant_id=$1 AND user_id=$2 AND token=$3",
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(input.token.trim())
+    .execute(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"unregistered": result.rows_affected() > 0}),
+    )))
 }
 
 async fn canteen_store(
@@ -1111,6 +1402,45 @@ async fn place_order(
             &order,
         )
         .await?;
+        let operator_user_ids = sqlx::query_scalar::<_, String>(
+            r#"SELECT assignment.user_id
+               FROM campus_ops.shop_user_assignments assignment
+               JOIN campus_ops.shops shop
+                 ON shop.tenant_id = assignment.tenant_id AND shop.id = assignment.shop_id
+               WHERE assignment.tenant_id = $1 AND shop.shop_key = $2
+                 AND assignment.is_active AND shop.is_active"#,
+        )
+        .bind(tenant)
+        .bind(&store)
+        .fetch_all(&mut *tx)
+        .await?;
+        use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+        for operator_user_id in operator_user_ids {
+            enqueue_tx(
+                &mut tx,
+                tenant,
+                NotificationSpec {
+                    recipient: Recipient::User(operator_user_id.clone()),
+                    category: "canteen".into(),
+                    event_type: "canteen.order.created".into(),
+                    title: "New canteen order".into(),
+                    body: format!(
+                        "{} placed a {} order for ₹{store_total:.0}.",
+                        principal.student.name,
+                        shop_label(&store)
+                    ),
+                    data: order.clone(),
+                    priority: "high".into(),
+                    requires_action: true,
+                    deep_link: Some("/shops/orders".into()),
+                    deduplication_key: Some(format!(
+                        "canteen:order:{order_id}:created:{operator_user_id}"
+                    )),
+                    expires_at: None,
+                },
+            )
+            .await?;
+        }
         orders.push(order);
         transactions.push(transaction);
     }
@@ -3448,8 +3778,67 @@ async fn notify_tx(
     body: &str,
     data: &Value,
 ) -> ApiResult<()> {
-    sqlx::query("INSERT INTO campus_ops.notifications(tenant_id,recipient_user_id,recipient_role,category,title,body,data) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(tenant).bind(user).bind(role).bind(category).bind(title).bind(body).bind(data).execute(&mut **tx).await?;
-    Ok(())
+    use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+
+    let recipient = match (user, role) {
+        (Some(user), _) => Recipient::User(user.to_owned()),
+        (None, Some(role)) => Recipient::Role(role.to_owned()),
+        (None, None) => return Ok(()),
+    };
+    let event_type = match title {
+        "Wallet credited" => "wallet.credited",
+        "Order rejected and refunded" => "canteen.order.refunded",
+        "Order updated" => "canteen.order.updated",
+        "Gatepass updated" => "gatepass.request.decided",
+        "Attendance marked" => "attendance.marked",
+        "Attendance ready for review" => "attendance.ready_for_review",
+        "Attendance report submitted" => "attendance.report.submitted",
+        _ => "general.notice",
+    };
+    let deep_link = match category {
+        "canteen" => Some("/shops/orders"),
+        "gatepass" => Some("/gatepass"),
+        "attendance" => Some("/academics/attendance"),
+        "fees" => Some("/tuition-fee"),
+        "timetable" => Some("/timetable"),
+        "examination" => Some("/examinations"),
+        _ => None,
+    };
+    let identity = data
+        .get("id")
+        .or_else(|| data.get("requestId"))
+        .or_else(|| data.get("sessionId"))
+        .map(Value::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let state = data.get("status").map(Value::to_string).unwrap_or_default();
+    enqueue_tx(
+        tx,
+        tenant,
+        NotificationSpec {
+            recipient,
+            category: category.into(),
+            event_type: event_type.into(),
+            title: title.into(),
+            body: body.into(),
+            data: data.clone(),
+            priority: if matches!(category, "gatepass" | "fees") {
+                "high".into()
+            } else {
+                "normal".into()
+            },
+            requires_action: matches!(
+                title,
+                "Attendance ready for review" | "Attendance report submitted"
+            ),
+            deep_link: deep_link.map(str::to_owned),
+            deduplication_key: Some(format!(
+                "operation:{event_type}:{identity}:{state}:{}",
+                user.or(role).unwrap_or_default()
+            )),
+            expires_at: None,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

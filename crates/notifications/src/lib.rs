@@ -9,6 +9,7 @@
 //! - [`LogMailer`] writes the message to the tracing log and is the development default.
 //! - [`DisabledMailer`] discards messages when email is explicitly disabled.
 
+pub mod push;
 pub mod sms;
 pub mod whatsapp;
 

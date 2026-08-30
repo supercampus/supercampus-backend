@@ -7,10 +7,10 @@ use serde_json::Value;
 use sqlx::{Postgres, Row, Transaction};
 use supercampus_database::{Database, TenantDatabaseManager};
 use supercampus_notifications::{
-    EmailMessage, Mailer,
+    DisabledMailer, EmailMessage, Mailer,
     push::{DeliveryOutcome as PushOutcome, PushMessage, PushSender},
-    sms::{DeliveryOutcome as SmsOutcome, SmsMessage, SmsSender},
-    whatsapp::{DeliveryOutcome as WhatsAppOutcome, WhatsAppMessage, WhatsAppSender},
+    sms::{DeliveryOutcome as SmsOutcome, LogSms, SmsMessage, SmsSender},
+    whatsapp::{DeliveryOutcome as WhatsAppOutcome, LogWhatsApp, WhatsAppMessage, WhatsAppSender},
 };
 use uuid::Uuid;
 
@@ -46,6 +46,7 @@ struct PushDeliveryJob {
 }
 
 struct Transports {
+    legacy_enabled: bool,
     mailer: Arc<dyn Mailer>,
     sms: Arc<dyn SmsSender>,
     whatsapp: Arc<dyn WhatsAppSender>,
@@ -70,13 +71,29 @@ async fn main() -> anyhow::Result<()> {
     }
     let tenants =
         TenantDatabaseManager::clustered_with_max_connections(control.clone(), &control_url, 2)?;
+    let push_only = std::env::var("NOTIFICATION_WORKER_PUSH_ONLY")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
     let transports = Transports {
-        mailer: supercampus_notifications::mailer_from_environment()?,
-        sms: supercampus_notifications::sms::sms_from_environment()?,
-        whatsapp: supercampus_notifications::whatsapp::whatsapp_from_environment()?,
+        legacy_enabled: !push_only,
+        mailer: if push_only {
+            Arc::new(DisabledMailer)
+        } else {
+            supercampus_notifications::mailer_from_environment()?
+        },
+        sms: if push_only {
+            Arc::new(LogSms)
+        } else {
+            supercampus_notifications::sms::sms_from_environment()?
+        },
+        whatsapp: if push_only {
+            Arc::new(LogWhatsApp)
+        } else {
+            supercampus_notifications::whatsapp::whatsapp_from_environment()?
+        },
         push: supercampus_notifications::push::push_from_environment()?,
     };
     tracing::info!(
+        push_only,
         email = transports.mailer.transport(),
         sms = transports.sms.transport(),
         whatsapp = transports.whatsapp.transport(),
@@ -145,10 +162,12 @@ async fn process_tenant(
         .fetch_one(database.pool())
         .await
         .context("tenant identity is missing from its database")?;
-    let jobs = claim_batch(database, tenant_id).await?;
-    for job in jobs {
-        let result = deliver(database, &job, transports).await;
-        record_result(database, &job, result).await?;
+    if transports.legacy_enabled {
+        let jobs = claim_batch(database, tenant_id).await?;
+        for job in jobs {
+            let result = deliver(database, &job, transports).await;
+            record_result(database, &job, result).await?;
+        }
     }
     if let Some(sender) = transports.push.as_ref() {
         enqueue_push_deliveries(database, tenant_id).await?;

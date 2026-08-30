@@ -59,7 +59,15 @@ async fn main() -> anyhow::Result<()> {
     let control_url = std::env::var("CONTROL_DATABASE_URL")
         .context("CONTROL_DATABASE_URL is required by the notification worker")?;
     let control = Database::connect(&control_url).await?;
-    control.migrate().await?;
+    if std::env::var("SKIP_STARTUP_MIGRATIONS")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        tracing::warn!(
+            "notification worker migration check skipped; migrations must be managed by the release job"
+        );
+    } else {
+        control.migrate().await?;
+    }
     let tenants =
         TenantDatabaseManager::clustered_with_max_connections(control.clone(), &control_url, 2)?;
     let transports = Transports {

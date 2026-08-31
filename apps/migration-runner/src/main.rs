@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
         "apply-mec-faculty-matrix" => apply_mec_faculty_matrix().await,
         "apply-student-assessments" => apply_student_assessments().await,
         "apply-push-notification-foundation" => apply_push_notification_foundation().await,
+        "apply-parent-warden-gatepass-portals" => apply_parent_warden_gatepass_portals().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
@@ -46,9 +47,31 @@ async fn main() -> anyhow::Result<()> {
             provision_tenant(tenant_slug, database_name).await
         }
         command => bail!(
-            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
+            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, apply-parent-warden-gatepass-portals, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
+}
+
+/// Applies the isolated MEC parent/warden accounts and outpass schema without
+/// forcing a legacy installation through the checksum-validated full chain.
+async fn apply_parent_warden_gatepass_portals() -> anyhow::Result<()> {
+    const SQL: &str =
+        include_str!("../../../migrations/runtime/0078_parent_warden_gatepass_portals.sql");
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    sqlx::raw_sql(SQL)
+        .execute(control.pool())
+        .await
+        .context("failed to apply parent/warden portals to the control plane")?;
+
+    let manager = TenantDatabaseManager::clustered(control, &control_url)?;
+    let mec = manager.tenant("mec").await?;
+    sqlx::raw_sql(SQL)
+        .execute(mec.pool())
+        .await
+        .context("failed to apply parent/warden portals to MEC")?;
+    println!("applied MEC parent and warden gatepass portals");
+    Ok(())
 }
 
 /// Applies only the idempotent push-notification foundation when a legacy

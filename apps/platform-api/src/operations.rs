@@ -1948,11 +1948,82 @@ async fn gatepass_overview(
     )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let manage = access.allows("gatepass.outpass.approve")
-        || access.allows("gatepass.leave.approve")
-        || access.allows("gatepass.scan.read");
-    let data=sqlx::query_scalar::<_,Value>(r#"SELECT jsonb_build_object('requests',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'requesterUserId',requester_user_id,'requesterName',requester_name,'passType',pass_type,'residency',residency,'departureAt',departure_at,'returnAt',return_at,'destination',destination,'reason',reason,'guardianPhone',guardian_phone,'state',state,'workflow',workflow,'createdAt',created_at,'updatedAt',updated_at) ORDER BY created_at DESC) FROM campus_ops.gatepass_requests WHERE tenant_id=$1 AND ($3 OR requester_user_id=$2)),'[]'::jsonb),'movements',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'userId',user_id,'requestId',request_id,'direction',direction,'checkpoint',checkpoint,'method',method,'createdAt',created_at) ORDER BY created_at DESC) FROM campus_ops.gate_movements WHERE tenant_id=$1 AND ($3 OR user_id=$2)),'[]'::jsonb),'canManage',$3::boolean)"#)
- .bind(tenant).bind(&principal.student.id).bind(manage).fetch_one(db.pool()).await?;
+    let is_parent = access.roles.iter().any(|role| role == "parent");
+    let is_warden = access.roles.iter().any(|role| role == "warden");
+    let is_security = access.roles.iter().any(|role| role == "security");
+    let manage = is_parent || is_warden || is_security || access.allows("gatepass.leave.approve");
+    let viewer_kind = if is_parent {
+        "parent"
+    } else if is_warden {
+        "warden"
+    } else if is_security {
+        "security"
+    } else {
+        "student"
+    };
+    let data = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+          'viewerKind',$3::text,
+          'requests',COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'id',request.id,'requesterUserId',request.requester_user_id,
+              'requesterName',request.requester_name,'passType',request.pass_type,
+              'residency',request.residency,'departureAt',request.departure_at,
+              'returnAt',request.return_at,'destination',request.destination,
+              'reason',request.reason,'guardianPhone',request.guardian_phone,
+              'state',request.state,'workflow',request.workflow,
+              'qrPayload',CASE WHEN $3::text IN ('student','parent')
+                               THEN request.qr_payload ELSE NULL END,
+              'decisionNote',request.decision_note,'decidedBy',request.decided_by,
+              'createdAt',request.created_at,'updatedAt',request.updated_at)
+              ORDER BY request.created_at DESC)
+            FROM campus_ops.gatepass_requests request
+            WHERE request.tenant_id=$1 AND CASE $3::text
+              WHEN 'parent' THEN EXISTS (
+                SELECT 1 FROM campus_ops.parent_student_links link
+                WHERE link.tenant_id=request.tenant_id AND link.active
+                  AND link.parent_user_id=$2
+                  AND link.student_user_id=request.requester_user_id)
+              WHEN 'warden' THEN request.residency='hosteller'
+              WHEN 'security' THEN request.state='approved'
+              ELSE request.requester_user_id=$2
+            END
+          ),'[]'::jsonb),
+          'children',COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'userId',student.user_account_id::text,
+              'name',student.full_name,'email',student.email,
+              'rollNumber',student.student_number,
+              'department',COALESCE(department.name,student.profile->>'dept',''),
+              'year',COALESCE(student.academic_year,student.profile->>'year',''),
+              'hostel',COALESCE(student.profile->>'hostel',''),
+              'room',COALESCE(student.profile->>'room',''),
+              'photoUrl',NULLIF(student.profile->>'photoUrl',''))
+              ORDER BY student.full_name)
+            FROM campus_ops.parent_student_links link
+            JOIN core.students student ON student.tenant_id=link.tenant_id
+              AND student.user_account_id::text=link.student_user_id
+            LEFT JOIN core.departments department ON department.tenant_id=student.tenant_id
+              AND department.id::text=student.department_id
+            WHERE link.tenant_id=$1 AND link.parent_user_id=$2 AND link.active
+          ),'[]'::jsonb),
+          'movements',COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'id',movement.id,'userId',movement.user_id,
+              'requestId',movement.request_id,'direction',movement.direction,
+              'checkpoint',movement.checkpoint,'method',movement.method,
+              'createdAt',movement.created_at) ORDER BY movement.created_at DESC)
+            FROM campus_ops.gate_movements movement
+            WHERE movement.tenant_id=$1 AND movement.user_id=$2
+          ),'[]'::jsonb),
+          'canManage',$4::boolean)"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(viewer_kind)
+    .bind(manage)
+    .fetch_one(db.pool())
+    .await?;
     Ok(Json(ApiResponse::new(data)))
 }
 
@@ -2194,7 +2265,7 @@ pub(crate) async fn advance_gatepass_step(
         .bind(tenant).bind(request_id).bind(step).bind(decision).bind(actor).bind(note)
         .execute(&mut **tx).await?;
 
-    let value = sqlx::query_scalar::<_, Value>("UPDATE campus_ops.gatepass_requests SET state=$3,qr_token_hash=$4,decided_by=$5,decision_note=$6,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'requesterUserId',requester_user_id,'state',state,'qrPayload',$7::text,'updatedAt',updated_at)")
+    let value = sqlx::query_scalar::<_, Value>("UPDATE campus_ops.gatepass_requests SET state=$3,qr_token_hash=$4,qr_payload=$7,decided_by=$5,decision_note=$6,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'requesterUserId',requester_user_id,'state',state,'qrPayload',$7::text,'updatedAt',updated_at)")
         .bind(tenant).bind(request_id).bind(&next)
         .bind(raw_qr.as_ref().map(|v| token_hash(v)))
         .bind(actor).bind(note).bind(&raw_qr)
@@ -2226,6 +2297,33 @@ async fn decide_gatepass_request(
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let is_parent = access.roles.iter().any(|role| role == "parent");
+    let is_warden = access.roles.iter().any(|role| role == "warden");
+    let expected_step = if is_parent {
+        let linked = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM campus_ops.gatepass_requests request
+                 JOIN campus_ops.parent_student_links link
+                   ON link.tenant_id=request.tenant_id
+                  AND link.student_user_id=request.requester_user_id
+                  AND link.active
+                WHERE request.tenant_id=$1 AND request.id=$2
+                  AND link.parent_user_id=$3)"#,
+        )
+        .bind(tenant)
+        .bind(request_id)
+        .bind(&principal.student.id)
+        .fetch_one(db.pool())
+        .await?;
+        if !linked {
+            return Err(ApiError::Forbidden);
+        }
+        Some("parent")
+    } else if is_warden {
+        Some("warden")
+    } else {
+        None
+    };
     let mut tx = db.pool().begin().await?;
     let outcome = advance_gatepass_step(
         &mut tx,
@@ -2234,9 +2332,7 @@ async fn decide_gatepass_request(
         &input.decision,
         input.note.as_deref(),
         &principal.student.id,
-        // Staff may answer whichever step the pass is on; the permission check
-        // above is what limits them.
-        None,
+        expected_step,
     )
     .await?;
     let StepOutcome {

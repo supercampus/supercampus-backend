@@ -1931,6 +1931,20 @@ struct GatepassRequestInput {
     departure_at: DateTime<Utc>,
     return_at: DateTime<Utc>,
 }
+
+async fn tenant_identity_user_id(
+    pool: &sqlx::PgPool,
+    principal: &AuthPrincipal,
+) -> ApiResult<String> {
+    let local_id = sqlx::query_scalar::<_, String>(
+        "SELECT id::text FROM identity.users WHERE lower(email)=lower($1) LIMIT 1",
+    )
+    .bind(&principal.student.email)
+    .fetch_optional(pool)
+    .await?;
+    Ok(local_id.unwrap_or_else(|| principal.student.id.clone()))
+}
+
 async fn gatepass_overview(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -1960,6 +1974,14 @@ async fn gatepass_overview(
         "security"
     } else {
         "student"
+    };
+    // Authentication is issued by the control database, while parent links
+    // live in the tenant database. Resolve the tenant-local identity by email
+    // so split databases do not have to share randomly generated user UUIDs.
+    let scoped_user_id = if is_parent {
+        tenant_identity_user_id(db.pool(), &principal).await?
+    } else {
+        principal.student.id.clone()
     };
     let data = sqlx::query_scalar::<_, Value>(
         r#"SELECT jsonb_build_object(
@@ -2019,7 +2041,7 @@ async fn gatepass_overview(
           'canManage',$4::boolean)"#,
     )
     .bind(tenant)
-    .bind(&principal.student.id)
+    .bind(&scoped_user_id)
     .bind(viewer_kind)
     .bind(manage)
     .fetch_one(db.pool())
@@ -2300,6 +2322,7 @@ async fn decide_gatepass_request(
     let is_parent = access.roles.iter().any(|role| role == "parent");
     let is_warden = access.roles.iter().any(|role| role == "warden");
     let expected_step = if is_parent {
+        let parent_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
         let linked = sqlx::query_scalar::<_, bool>(
             r#"SELECT EXISTS(
                  SELECT 1 FROM campus_ops.gatepass_requests request
@@ -2312,7 +2335,7 @@ async fn decide_gatepass_request(
         )
         .bind(tenant)
         .bind(request_id)
-        .bind(&principal.student.id)
+        .bind(&parent_user_id)
         .fetch_one(db.pool())
         .await?;
         if !linked {
@@ -3287,6 +3310,7 @@ async fn attendance_wards(
     require(&access, "attendance.parent.read")?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let parent_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
     let wards = sqlx::query_scalar::<_, Value>(
         r#"
         SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -3308,7 +3332,7 @@ async fn attendance_wards(
         "#,
     )
     .bind(tenant)
-    .bind(&principal.student.id)
+    .bind(&parent_user_id)
     .fetch_one(db.pool())
     .await?;
     Ok(Json(ApiResponse::new(json!({"wards": wards}))))
@@ -3573,7 +3597,8 @@ async fn attendance_summary(
         return Err(ApiError::Forbidden);
     }
     if target != principal.student.id && access.allows("attendance.parent.read") {
-        let linked=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM campus_ops.parent_student_links WHERE tenant_id=$1 AND parent_user_id=$2 AND student_user_id=$3 AND active)").bind(tenant).bind(&principal.student.id).bind(&target).fetch_one(db.pool()).await?;
+        let parent_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
+        let linked=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM campus_ops.parent_student_links WHERE tenant_id=$1 AND parent_user_id=$2 AND student_user_id=$3 AND active)").bind(tenant).bind(&parent_user_id).bind(&target).fetch_one(db.pool()).await?;
         if !linked {
             return Err(ApiError::Forbidden);
         }

@@ -56,6 +56,19 @@ pub fn router() -> Router<AppState> {
         .route("/canteen/wallet-transactions", get(wallet_transactions))
         .route("/canteen/wallets/{user_id}/top-ups", post(top_up_wallet))
         .route("/canteen/staff-state", put(update_canteen_staff_state))
+        .route(
+            "/library/requests",
+            get(library_requests).post(create_library_request),
+        )
+        .route(
+            "/library/requests/{request_id}",
+            axum::routing::delete(cancel_library_request),
+        )
+        .route(
+            "/library/requests/{request_id}/decision",
+            post(decide_library_request),
+        )
+        .route("/library/requests/scan", post(scan_library_request))
         .route("/gatepass/overview", get(gatepass_overview))
         .route("/gatepass/requests", post(create_gatepass_request))
         .route(
@@ -1937,6 +1950,283 @@ struct GatepassRequestInput {
     guardian_phone: Option<String>,
     departure_at: DateTime<Utc>,
     return_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------- library
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateLibraryRequest {
+    visit_start: DateTime<Utc>,
+    visit_end: DateTime<Utc>,
+    description: Option<String>,
+    zone_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LibraryScanRequest {
+    qr_payload: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LibraryDecisionRequest {
+    decision: String,
+    note: Option<String>,
+}
+
+async fn library_requests(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(
+        &access,
+        &["library.visit_pass.read", "library.visit_pass.approve"],
+    )?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let manage = access.allows("library.visit_pass.approve");
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+               'id',id,'studentUserId',student_user_id,'studentName',student_name,
+               'zoneName',zone_name,'description',description,
+               'visitStart',visit_start,'visitEnd',visit_end,'status',status,
+               'qrPayload',qr_payload,'decisionNote',decision_note,
+               'decidedBy',decided_by,'decidedAt',decided_at,'createdAt',created_at)
+             ORDER BY created_at DESC),'[]'::jsonb)
+           FROM campus_ops.library_visit_requests
+           WHERE tenant_id=$1 AND ($3 OR student_user_id=$2)"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(manage)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({"requests": rows}))))
+}
+
+async fn create_library_request(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<CreateLibraryRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require_any(&access, &["library.visit_pass.create"])?;
+    if input.visit_end <= input.visit_start {
+        return Err(ApiError::BadRequest(
+            "Library visit must end after it starts".into(),
+        ));
+    }
+    if input.visit_start < Utc::now() - chrono::Duration::minutes(5) {
+        return Err(ApiError::BadRequest(
+            "Library visit cannot be booked in the past".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let request_id = Uuid::new_v4();
+    let nonce = Uuid::new_v4();
+    let payload = format!("supercampus:library:{request_id}:{nonce}");
+    let hash = token_hash(&payload);
+    let zone = input
+        .zone_name
+        .as_deref()
+        .unwrap_or("Central Library - Reading Hall")
+        .trim();
+    let mut tx = db.pool().begin().await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.library_visit_requests
+           (id,tenant_id,student_user_id,student_name,zone_name,description,
+            visit_start,visit_end,qr_token_hash,qr_payload)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           RETURNING jsonb_build_object(
+             'id',id,'studentUserId',student_user_id,'studentName',student_name,
+             'zoneName',zone_name,'description',description,'visitStart',visit_start,
+             'visitEnd',visit_end,'status',status,'qrPayload',qr_payload,
+             'createdAt',created_at)"#,
+    )
+    .bind(request_id)
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&principal.student.name)
+    .bind(zone)
+    .bind(input.description.as_deref())
+    .bind(input.visit_start)
+    .bind(input.visit_end)
+    .bind(hash)
+    .bind(&payload)
+    .fetch_one(&mut *tx)
+    .await?;
+    emit_tx(
+        &mut tx,
+        tenant,
+        "library",
+        "visit_request",
+        &request_id.to_string(),
+        "request.created",
+        &principal.student.id,
+        &value,
+    )
+    .await?;
+    notify_tx(
+        &mut tx,
+        tenant,
+        None,
+        Some("librarian"),
+        "library",
+        "Library visit request",
+        &format!("{} submitted a library visit QR", principal.student.name),
+        &value,
+    )
+    .await?;
+    tx.commit().await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "library",
+        "visit_request",
+        &request_id.to_string(),
+        "created",
+    );
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn scan_library_request(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<LibraryScanRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(&access, &["library.visit_pass.approve"])?;
+    let payload = input.qr_payload.trim();
+    if payload.is_empty() {
+        return Err(ApiError::BadRequest("QR payload is required".into()));
+    }
+    let hash = token_hash(payload);
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+             'id',id,'studentUserId',student_user_id,'studentName',student_name,
+             'zoneName',zone_name,'description',description,'visitStart',visit_start,
+             'visitEnd',visit_end,'status',status,'qrPayload',qr_payload,
+             'decisionNote',decision_note,'createdAt',created_at)
+           FROM campus_ops.library_visit_requests
+           WHERE tenant_id=$1 AND qr_token_hash=$2"#,
+    )
+    .bind(tenant)
+    .bind(hash)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("This library request QR is not valid".into()))?;
+    Ok(Json(ApiResponse::new(value)))
+}
+
+async fn decide_library_request(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(request_id): Path<Uuid>,
+    Json(input): Json<LibraryDecisionRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(&access, &["library.visit_pass.approve"])?;
+    let decision = input.decision.trim().to_lowercase();
+    if !matches!(decision.as_str(), "approved" | "rejected") {
+        return Err(ApiError::BadRequest(
+            "Decision must be approved or rejected".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.library_visit_requests
+           SET status=$3,decision_note=$4,decided_by=$5,decided_at=now(),updated_at=now()
+           WHERE tenant_id=$1 AND id=$2 AND status='pending'
+           RETURNING jsonb_build_object(
+             'id',id,'studentUserId',student_user_id,'studentName',student_name,
+             'zoneName',zone_name,'description',description,'visitStart',visit_start,
+             'visitEnd',visit_end,'status',status,'qrPayload',qr_payload,
+             'decisionNote',decision_note,'decidedBy',decided_by,'decidedAt',decided_at)"#,
+    )
+    .bind(tenant)
+    .bind(request_id)
+    .bind(&decision)
+    .bind(input.note.as_deref())
+    .bind(&principal.student.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::Conflict("This library request has already been decided".into()))?;
+    let student_id = value
+        .get("studentUserId")
+        .and_then(Value::as_str)
+        .ok_or(ApiError::Internal)?;
+    emit_tx(
+        &mut tx,
+        tenant,
+        "library",
+        "visit_request",
+        &request_id.to_string(),
+        "request.decided",
+        &principal.student.id,
+        &value,
+    )
+    .await?;
+    notify_tx(
+        &mut tx,
+        tenant,
+        Some(student_id),
+        None,
+        "library",
+        "Library request updated",
+        &format!("Your library visit was {decision}"),
+        &value,
+    )
+    .await?;
+    tx.commit().await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "library",
+        "visit_request",
+        &request_id.to_string(),
+        "updated",
+    );
+    Ok(Json(ApiResponse::new(value)))
+}
+
+async fn cancel_library_request(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(request_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(&access, &["library.visit_pass.create"])?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.library_visit_requests SET status='cancelled',updated_at=now()
+           WHERE tenant_id=$1 AND id=$2 AND student_user_id=$3
+             AND status IN ('pending','approved')
+           RETURNING jsonb_build_object('id',id,'status',status,'updatedAt',updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(request_id)
+    .bind(&principal.student.id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::Conflict("This library request cannot be cancelled".into()))?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "library",
+        "visit_request",
+        &request_id.to_string(),
+        "updated",
+    );
+    Ok(Json(ApiResponse::new(value)))
 }
 
 async fn tenant_identity_user_id(
@@ -3983,6 +4273,8 @@ async fn notify_tx(
         "Attendance marked" => "attendance.marked",
         "Attendance ready for review" => "attendance.ready_for_review",
         "Attendance report submitted" => "attendance.report.submitted",
+        "Library visit request" => "library.request.created",
+        "Library request updated" => "library.request.decided",
         _ => "general.notice",
     };
     let deep_link = match category {
@@ -3992,6 +4284,7 @@ async fn notify_tx(
         "fees" => Some("/tuition-fee"),
         "timetable" => Some("/timetable"),
         "examination" => Some("/examinations"),
+        "library" => Some("/library"),
         _ => None,
     };
     let identity = data

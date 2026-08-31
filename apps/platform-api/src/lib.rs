@@ -34,6 +34,7 @@ use axum::{
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
+use uuid::Uuid;
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_JSON_BODY_LIMIT: usize = 2 * 1024 * 1024;
@@ -218,6 +219,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to apply the canteen captain release patch")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0079_mec_librarian_and_stationery_accounts.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the MEC librarian and stationery accounts release patch")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");
@@ -240,6 +247,44 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to apply MEC canteen captain shop assignments")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0080_mec_library_and_stationery_data.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to apply MEC library and stationery data")?;
+        let stationery_operator_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM identity.users WHERE email='stationary@mec.local'",
+        )
+        .fetch_one(control_database.pool())
+        .await
+        .context("failed to resolve the MEC stationery operator identity")?;
+        sqlx::query(
+            r#"INSERT INTO campus_ops.shop_user_assignments
+               (tenant_id,shop_id,user_id,assignment_role,is_active,assigned_by)
+               SELECT tenant.id,shop.id,$1,'captain',true,'runtime-migration-0080'
+               FROM platform.tenants tenant
+               JOIN campus_ops.shops shop ON shop.tenant_id=tenant.id
+               WHERE tenant.slug='mec' AND shop.shop_key='stationery'
+               ON CONFLICT (tenant_id,shop_id,user_id) DO UPDATE SET
+                 assignment_role='captain',is_active=true,
+                 assigned_by='runtime-migration-0080',updated_at=now()"#,
+        )
+        .bind(stationery_operator_id.to_string())
+        .execute(mec_database.pool())
+        .await
+        .context("failed to assign the MEC stationery operator")?;
+        sqlx::query(
+            r#"INSERT INTO campus_ops.canteen_staff_state
+               (tenant_id,user_id,mode,shop_open)
+               SELECT id,$1,'work',true FROM platform.tenants WHERE slug='mec'
+               ON CONFLICT (tenant_id,user_id) DO UPDATE SET
+                 mode='work',shop_open=true,updated_at=now()"#,
+        )
+        .bind(stationery_operator_id.to_string())
+        .execute(mec_database.pool())
+        .await
+        .context("failed to initialize the MEC stationery operator state")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;

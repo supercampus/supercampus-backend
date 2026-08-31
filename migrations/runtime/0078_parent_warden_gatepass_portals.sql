@@ -68,6 +68,25 @@ BEGIN
         profile = identity.tenant_memberships.profile || EXCLUDED.profile,
         updated_at = now();
 
+    -- Some legacy MEC databases predate the dynamic parent role. Memberships
+    -- store role keys as text, so login can succeed even when the matching
+    -- authorization row is missing; make the role explicit before granting.
+    INSERT INTO authz.roles
+        (tenant_id, role_key, name, team, scope_description, portal_family,
+         protected, active, created_by, updated_by)
+    VALUES
+        (mec_tenant, 'parent', 'Parent / Guardian', 'Parents',
+         'Guardian portal access for linked student status and gatepass approvals',
+         'parent', false, true, 'runtime-migration-0078', 'runtime-migration-0078')
+    ON CONFLICT (tenant_id, role_key) DO UPDATE SET
+        name = EXCLUDED.name,
+        team = EXCLUDED.team,
+        scope_description = EXCLUDED.scope_description,
+        portal_family = 'parent',
+        active = true,
+        updated_by = EXCLUDED.updated_by,
+        updated_at = now();
+
     -- These two portals are intentionally enabled only on the app surface.
     INSERT INTO authz.role_surfaces (tenant_id, role_id, surface, enabled_by)
     SELECT mec_tenant, role.id, 'app', 'runtime-migration-0078'

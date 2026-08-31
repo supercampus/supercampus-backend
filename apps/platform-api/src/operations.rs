@@ -356,6 +356,7 @@ async fn notifications(
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let notification_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
     let rows = sqlx::query_scalar::<_, Value>(
         r#"
       WITH accessible AS (
@@ -389,7 +390,7 @@ async fn notifications(
       )"#,
     )
     .bind(tenant)
-    .bind(&principal.student.id)
+    .bind(&notification_user_id)
     .bind(&principal.roles)
     .fetch_one(db.pool())
     .await?;
@@ -403,6 +404,7 @@ async fn read_notification(
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let notification_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
     let changed = sqlx::query_scalar::<_, Uuid>(
         r#"WITH accessible AS (
              SELECT id,recipient_user_id FROM campus_ops.notifications
@@ -422,7 +424,7 @@ async fn read_notification(
     )
     .bind(notification_id)
     .bind(tenant)
-    .bind(&principal.student.id)
+    .bind(&notification_user_id)
     .bind(&principal.roles)
     .fetch_optional(db.pool())
     .await?
@@ -436,13 +438,14 @@ async fn read_all_notifications(
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let notification_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
     let mut tx = db.pool().begin().await?;
     let direct = sqlx::query(
         r#"UPDATE campus_ops.notifications SET read_at=now()
            WHERE tenant_id=$1 AND recipient_user_id=$2 AND read_at IS NULL"#,
     )
     .bind(tenant)
-    .bind(&principal.student.id)
+    .bind(&notification_user_id)
     .execute(&mut *tx)
     .await?;
     let role = sqlx::query(
@@ -454,7 +457,7 @@ async fn read_all_notifications(
            ON CONFLICT(tenant_id,notification_id,user_id) DO NOTHING"#,
     )
     .bind(tenant)
-    .bind(&principal.student.id)
+    .bind(&notification_user_id)
     .bind(&principal.roles)
     .execute(&mut *tx)
     .await?;
@@ -481,6 +484,7 @@ async fn notification_preferences(
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let notification_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
     let rows = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
              'category', category, 'pushEnabled', push_enabled,
@@ -492,7 +496,7 @@ async fn notification_preferences(
            WHERE tenant_id=$1 AND user_id=$2"#,
     )
     .bind(tenant)
-    .bind(&principal.student.id)
+    .bind(&notification_user_id)
     .fetch_one(db.pool())
     .await?;
     Ok(Json(ApiResponse::new(json!({"preferences": rows}))))
@@ -505,6 +509,7 @@ async fn update_notification_preferences(
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let notification_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
     let mut tx = db.pool().begin().await?;
     for item in &input {
         let category = item.category.trim().to_ascii_lowercase();
@@ -528,7 +533,7 @@ async fn update_notification_preferences(
                  updated_at=now()"#,
         )
         .bind(tenant)
-        .bind(&principal.student.id)
+        .bind(&notification_user_id)
         .bind(category)
         .bind(item.push_enabled)
         .bind(item.digest_enabled)
@@ -567,6 +572,7 @@ async fn register_push_device(
     validate_push_device(token, &platform, &provider)?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let notification_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
     let id = sqlx::query_scalar::<_, Uuid>(
         r#"INSERT INTO campus_ops.push_devices
              (tenant_id,user_id,provider,platform,token,device_name,locale)
@@ -578,7 +584,7 @@ async fn register_push_device(
            RETURNING id"#,
     )
     .bind(tenant)
-    .bind(&principal.student.id)
+    .bind(&notification_user_id)
     .bind(provider)
     .bind(platform)
     .bind(token)
@@ -638,11 +644,12 @@ async fn unregister_push_device(
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let notification_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
     let result = sqlx::query(
         "UPDATE campus_ops.push_devices SET enabled=false,updated_at=now() WHERE tenant_id=$1 AND user_id=$2 AND token=$3",
     )
     .bind(tenant)
-    .bind(&principal.student.id)
+    .bind(&notification_user_id)
     .bind(input.token.trim())
     .execute(db.pool())
     .await?;
@@ -2386,6 +2393,65 @@ async fn decide_gatepass_request(
         &value,
     )
     .await?;
+    if is_parent && input.decision == "approved" {
+        let warden_ids = sqlx::query_scalar::<_, String>(
+            r#"SELECT membership.user_id::text
+               FROM identity.tenant_memberships membership
+               WHERE membership.tenant_id=$1 AND membership.active
+                 AND 'warden'=ANY(membership.roles)"#,
+        )
+        .bind(tenant)
+        .fetch_all(&mut *tx)
+        .await?;
+        for warden_id in warden_ids {
+            notify_tx(
+                &mut tx,
+                tenant,
+                Some(&warden_id),
+                None,
+                "gatepass",
+                "Outpass awaiting warden approval",
+                "A parent-consented hostel outpass needs your decision",
+                &value,
+            )
+            .await?;
+        }
+    }
+    if is_warden {
+        let parent_ids = sqlx::query_scalar::<_, String>(
+            r#"SELECT link.parent_user_id
+               FROM campus_ops.parent_student_links link
+               WHERE link.tenant_id=$1 AND link.student_user_id=$2 AND link.active"#,
+        )
+        .bind(tenant)
+        .bind(&requester_user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for parent_id in parent_ids {
+            let (title, body) = if input.decision == "approved" {
+                (
+                    "Outpass approved by warden",
+                    "The student's outpass is approved and the gate QR is ready",
+                )
+            } else {
+                (
+                    "Outpass rejected by warden",
+                    "The warden rejected the student's outpass request",
+                )
+            };
+            notify_tx(
+                &mut tx,
+                tenant,
+                Some(&parent_id),
+                None,
+                "gatepass",
+                title,
+                body,
+                &value,
+            )
+            .await?;
+        }
+    }
     tx.commit().await?;
     publish_operation_change(
         &state,
@@ -3911,6 +3977,9 @@ async fn notify_tx(
         "Order rejected and refunded" => "canteen.order.refunded",
         "Order updated" => "canteen.order.updated",
         "Gatepass updated" => "gatepass.request.decided",
+        "Outpass awaiting warden approval" => "gatepass.request.awaiting_warden",
+        "Outpass approved by warden" => "gatepass.request.approved",
+        "Outpass rejected by warden" => "gatepass.request.rejected",
         "Attendance marked" => "attendance.marked",
         "Attendance ready for review" => "attendance.ready_for_review",
         "Attendance report submitted" => "attendance.report.submitted",
@@ -3949,7 +4018,9 @@ async fn notify_tx(
             },
             requires_action: matches!(
                 title,
-                "Attendance ready for review" | "Attendance report submitted"
+                "Attendance ready for review"
+                    | "Attendance report submitted"
+                    | "Outpass awaiting warden approval"
             ),
             deep_link: deep_link.map(str::to_owned),
             deduplication_key: Some(format!(

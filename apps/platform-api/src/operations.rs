@@ -708,7 +708,8 @@ async fn canteen_store(
         'walletBalance', COALESCE((SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2),0),
         'menu', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',item.id,'name',item.name,
           'description',item.description,'store',resolved_shop.shop_key,'category',item.category,
-          'price',item.price::float8,'prepMinutes',item.prep_minutes,
+          'price',item.price::float8,'actualPrice',COALESCE(item.actual_price,item.price)::float8,
+          'prepMinutes',item.prep_minutes,
           'isVegetarian',item.is_vegetarian,'isPopular',item.is_popular,
           'isAvailable',item.is_available,'isInstant',item.is_instant,'imageUrl',item.image_url)
           ORDER BY resolved_shop.shop_key,item.category,item.name)
@@ -1103,6 +1104,9 @@ struct MenuItemRequest {
     store: String,
     category: String,
     price: f64,
+    /// Operator cost price. Older clients may omit it; then selling price is used.
+    #[serde(default)]
+    actual_price: Option<f64>,
     #[serde(default = "default_prep_minutes")]
     prep_minutes: i32,
     #[serde(default = "default_true")]
@@ -1147,14 +1151,16 @@ async fn create_menu_item(
     .await?;
     let item = sqlx::query_scalar::<_, Value>(r#"
       INSERT INTO campus_ops.canteen_menu_items
-       (tenant_id,name,description,store,category,price,prep_minutes,is_vegetarian,is_popular,is_available,is_instant,image_url,created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       (tenant_id,name,description,store,category,price,actual_price,prep_minutes,is_vegetarian,is_popular,is_available,is_instant,image_url,created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING jsonb_build_object('id',id,'name',name,'description',description,'store',store,
-        'category',category,'price',price::float8,'prepMinutes',prep_minutes,'isVegetarian',is_vegetarian,
+        'category',category,'price',price::float8,'actualPrice',COALESCE(actual_price,price)::float8,
+        'prepMinutes',prep_minutes,'isVegetarian',is_vegetarian,
         'isPopular',is_popular,'isAvailable',is_available,'isInstant',is_instant,'imageUrl',image_url)"#)
       .bind(tenant).bind(input.name.trim()).bind(input.description.trim())
       .bind(input.store.trim()).bind(input.category.trim())
-      .bind(input.price).bind(input.prep_minutes).bind(input.is_vegetarian).bind(input.is_popular)
+      .bind(input.price).bind(input.actual_price.unwrap_or(input.price))
+      .bind(input.prep_minutes).bind(input.is_vegetarian).bind(input.is_popular)
       .bind(input.is_available).bind(input.is_instant).bind(input.image_url).bind(&principal.student.id)
       .fetch_one(db.pool()).await?;
     emit(
@@ -1194,14 +1200,16 @@ async fn update_menu_item(
     )
     .await?;
     let item=sqlx::query_scalar::<_,Value>(r#"UPDATE campus_ops.canteen_menu_items SET name=$3,
-      description=$4,store=$5,category=$6,price=$7,prep_minutes=$8,is_vegetarian=$9,is_popular=$10,
-      is_available=$11,is_instant=$12,image_url=$13,updated_at=now() WHERE tenant_id=$1 AND id=$2
+      description=$4,store=$5,category=$6,price=$7,actual_price=COALESCE($8,actual_price,$7),
+      prep_minutes=$9,is_vegetarian=$10,is_popular=$11,
+      is_available=$12,is_instant=$13,image_url=$14,updated_at=now() WHERE tenant_id=$1 AND id=$2
       RETURNING jsonb_build_object('id',id,'name',name,'description',description,'store',store,
-      'category',category,'price',price::float8,'prepMinutes',prep_minutes,'isVegetarian',is_vegetarian,
+      'category',category,'price',price::float8,'actualPrice',COALESCE(actual_price,price)::float8,
+      'prepMinutes',prep_minutes,'isVegetarian',is_vegetarian,
       'isPopular',is_popular,'isAvailable',is_available,'isInstant',is_instant,'imageUrl',image_url)"#)
       .bind(tenant).bind(item_id).bind(input.name.trim()).bind(input.description.trim())
       .bind(input.store.trim()).bind(input.category.trim())
-      .bind(input.price).bind(input.prep_minutes).bind(input.is_vegetarian)
+      .bind(input.price).bind(input.actual_price).bind(input.prep_minutes).bind(input.is_vegetarian)
       .bind(input.is_popular).bind(input.is_available).bind(input.is_instant).bind(input.image_url)
       .fetch_optional(db.pool()).await?.ok_or_else(||ApiError::NotFound("Menu item not found".into()))?;
     emit(
@@ -1266,6 +1274,7 @@ async fn delete_menu_item(
 fn validate_menu(input: &MenuItemRequest) -> ApiResult<()> {
     if input.name.trim().is_empty()
         || input.price < 0.0
+        || input.actual_price.is_some_and(|price| price < 0.0)
         || input.prep_minutes < 1
         || input.category.trim().is_empty()
         || input.store.trim().is_empty()

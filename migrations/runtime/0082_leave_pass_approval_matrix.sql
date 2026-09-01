@@ -46,8 +46,8 @@ JOIN (VALUES
     ('class_advisor', 'gatepass.leave.approve', 'department'),
     ('hod', 'gatepass.leave.read', 'department'),
     ('hod', 'gatepass.leave.approve', 'department'),
-    ('principal', 'gatepass.leave.read', 'tenant'),
-    ('principal', 'gatepass.leave.approve', 'tenant')
+    ('principal', 'gatepass.leave.read', 'institution'),
+    ('principal', 'gatepass.leave.approve', 'institution')
 ) grant_row(role_key, permission_key, scope)
   ON grant_row.role_key=role.role_key
 CROSS JOIN (VALUES ('app'::text), ('website'::text)) surface(name)

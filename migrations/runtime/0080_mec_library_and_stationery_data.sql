@@ -68,10 +68,10 @@ WITH mec AS (
     ('Electronics & Batteries','AA battery',18),('Electronics & Batteries','AAA battery',18)
 )
 INSERT INTO campus_ops.canteen_menu_items
-    (tenant_id, name, description, store, category, price, prep_minutes,
+    (tenant_id, name, description, store, category, price, actual_price, prep_minutes,
      is_vegetarian, is_popular, is_available, is_instant, created_by)
 SELECT mec.tenant_id, inventory.name, inventory.category, 'stationery',
-       inventory.category, inventory.price, 1, true, false, true, true,
+       inventory.category, inventory.price, inventory.price, 1, true, false, true, true,
        'runtime-migration-0080'
 FROM mec CROSS JOIN inventory
 ON CONFLICT (tenant_id, store, name, price) DO UPDATE SET

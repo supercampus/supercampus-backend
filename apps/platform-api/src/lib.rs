@@ -225,6 +225,18 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to apply the MEC librarian and stationery accounts release patch")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0084_announcement_format.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the announcement format release patch")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0085_gatepass_manual_codes.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the gatepass manual-code release patch")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");
@@ -253,6 +265,18 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to apply MEC library and stationery data")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0084_announcement_format.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to apply the announcement format to MEC")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0085_gatepass_manual_codes.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to apply gatepass manual codes to MEC")?;
         let stationery_operator_id = sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM identity.users WHERE email='stationary@mec.local'",
         )

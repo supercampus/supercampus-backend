@@ -2271,6 +2271,13 @@ async fn gatepass_overview(
     let is_parent = access.roles.iter().any(|role| role == "parent");
     let is_warden = access.roles.iter().any(|role| role == "warden");
     let is_security = access.roles.iter().any(|role| role == "security");
+    let is_principal = access.roles.iter().any(|role| role == "principal");
+    let is_advisor_or_hod = access.roles.iter().any(|role| {
+        matches!(
+            role.as_str(),
+            "class_advisor" | "hod" | "head_of_department"
+        )
+    });
     let manage = is_parent || is_warden || is_security || access.allows("gatepass.leave.approve");
     let viewer_kind = if is_parent {
         "parent"
@@ -2278,13 +2285,17 @@ async fn gatepass_overview(
         "warden"
     } else if is_security {
         "security"
+    } else if is_principal {
+        "principal"
+    } else if is_advisor_or_hod {
+        "advisor_or_hod"
     } else {
         "student"
     };
     // Authentication is issued by the control database, while parent links
     // live in the tenant database. Resolve the tenant-local identity by email
     // so split databases do not have to share randomly generated user UUIDs.
-    let scoped_user_id = if is_parent {
+    let scoped_user_id = if is_parent || is_principal || is_advisor_or_hod {
         tenant_identity_user_id(db.pool(), &principal).await?
     } else {
         principal.student.id.clone()
@@ -2314,6 +2325,23 @@ async fn gatepass_overview(
                   AND link.student_user_id=request.requester_user_id)
               WHEN 'warden' THEN request.residency='hosteller'
               WHEN 'security' THEN request.state='approved'
+              WHEN 'principal' THEN request.pass_type='leave_pass'
+                AND request.state IN ('pending_principal','approved','rejected')
+              WHEN 'advisor_or_hod' THEN request.pass_type='leave_pass'
+                AND EXISTS (
+                  SELECT 1 FROM core.students student
+                  WHERE student.tenant_id=request.tenant_id
+                    AND student.user_account_id::text=request.requester_user_id
+                    AND (
+                      EXISTS (SELECT 1 FROM core.class_advisor_assignments advisor
+                        WHERE advisor.tenant_id=student.tenant_id AND advisor.active
+                          AND advisor.department_id::text=student.department_id
+                          AND advisor.advisor_user_id::text=$2)
+                      OR EXISTS (SELECT 1 FROM core.department_authorities authority
+                        WHERE authority.tenant_id=student.tenant_id AND authority.active
+                          AND authority.department_id::text=student.department_id
+                          AND authority.user_id::text=$2)
+                    ))
               ELSE request.requester_user_id=$2
             END
           ),'[]'::jsonb),
@@ -2352,6 +2380,32 @@ async fn gatepass_overview(
     .bind(manage)
     .fetch_one(db.pool())
     .await?;
+    let student = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+             'residency',CASE
+               WHEN lower(COALESCE(profile->>'residency',''))='hosteller'
+                 OR NULLIF(profile->>'hostel','') IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM campus_ops.gatepass_requests request
+                   WHERE request.tenant_id=core.students.tenant_id
+                     AND request.requester_user_id=$2
+                     AND request.residency='hosteller')
+               THEN 'hosteller' ELSE 'day_scholar' END,
+             'hostel',NULLIF(profile->>'hostel',''),
+             'room',NULLIF(profile->>'room',''))
+           FROM core.students
+           WHERE tenant_id=$1 AND (user_account_id::text=$2 OR lower(email)=lower($3))
+           LIMIT 1"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&principal.student.email)
+    .fetch_optional(db.pool())
+    .await?
+    .unwrap_or_else(|| json!({"residency":"day_scholar","hostel":null,"room":null}));
+    let mut data = data;
+    if let Some(object) = data.as_object_mut() {
+        object.insert("student".into(), student);
+    }
     Ok(Json(ApiResponse::new(data)))
 }
 
@@ -2371,7 +2425,33 @@ async fn create_gatepass_request(
         ));
     };
     require(&access, permission)?;
-    if input.pass_type == "outpass" && input.residency != "hosteller" {
+    if !matches!(input.residency.as_str(), "day_scholar" | "hosteller") {
+        return Err(ApiError::BadRequest(
+            "Residency must be day_scholar or hosteller".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let residency = sqlx::query_scalar::<_, String>(
+        r#"SELECT COALESCE(
+             (SELECT CASE
+                WHEN lower(COALESCE(profile->>'residency',''))='hosteller'
+                  OR NULLIF(profile->>'hostel','') IS NOT NULL
+                THEN 'hosteller' ELSE 'day_scholar' END
+              FROM core.students
+              WHERE tenant_id=$1 AND (user_account_id::text=$2 OR lower(email)=lower($3))
+              LIMIT 1),
+             (SELECT request.residency FROM campus_ops.gatepass_requests request
+              WHERE request.tenant_id=$1 AND request.requester_user_id=$2
+              ORDER BY request.created_at DESC LIMIT 1),
+             'day_scholar')"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&principal.student.email)
+    .fetch_one(db.pool())
+    .await?;
+    if input.pass_type == "outpass" && residency != "hosteller" {
         return Err(ApiError::BadRequest(
             "Outpass is available only to hostellers".into(),
         ));
@@ -2381,6 +2461,22 @@ async fn create_gatepass_request(
             "Enter valid pass dates and reason".into(),
         ));
     }
+    if input.pass_type == "leave_pass"
+        && input.departure_at.date_naive() != input.return_at.date_naive()
+    {
+        return Err(ApiError::BadRequest(
+            "Leave pass must start and finish on the same college day".into(),
+        ));
+    }
+    let destination = if input.pass_type == "leave_pass" {
+        if residency == "hosteller" {
+            "Hostel"
+        } else {
+            "Home"
+        }
+    } else {
+        input.destination.trim()
+    };
     let workflow = if input.pass_type == "outpass" {
         json!({"steps":["parent","warden","security"],"current":"parent"})
     } else {
@@ -2391,11 +2487,9 @@ async fn create_gatepass_request(
     } else {
         "pending_advisor_or_hod"
     };
-    let db = state.tenant_database(&principal.student.tenant_id).await?;
-    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let id = Uuid::new_v4();
     let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.gatepass_requests(id,tenant_id,requester_user_id,requester_name,pass_type,residency,destination,reason,guardian_phone,departure_at,return_at,state,workflow) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING jsonb_build_object('id',id,'passType',pass_type,'residency',residency,'destination',destination,'reason',reason,'guardianPhone',guardian_phone,'departureAt',departure_at,'returnAt',return_at,'state',state,'workflow',workflow,'createdAt',created_at)")
- .bind(id).bind(tenant).bind(&principal.student.id).bind(&principal.student.name).bind(&input.pass_type).bind(&input.residency).bind(input.destination.trim()).bind(input.reason.trim()).bind(&input.guardian_phone).bind(input.departure_at).bind(input.return_at).bind(state_name).bind(&workflow).fetch_one(db.pool()).await?;
+ .bind(id).bind(tenant).bind(&principal.student.id).bind(&principal.student.name).bind(&input.pass_type).bind(&residency).bind(destination).bind(input.reason.trim()).bind(&input.guardian_phone).bind(input.departure_at).bind(input.return_at).bind(state_name).bind(&workflow).fetch_one(db.pool()).await?;
 
     // An outpass waits on a guardian who has no account, so the link that lets
     // them answer is minted and sent here. The guardian's number comes from the
@@ -2467,6 +2561,26 @@ async fn create_gatepass_request(
         &value,
     )
     .await?;
+    if input.pass_type == "leave_pass" {
+        let mut notification_tx = db.pool().begin().await?;
+        for role in ["class_advisor", "hod"] {
+            notify_tx(
+                &mut notification_tx,
+                tenant,
+                None,
+                Some(role),
+                "gatepass",
+                "Leave pass awaiting review",
+                &format!(
+                    "{} submitted a college-hours leave pass",
+                    principal.student.name
+                ),
+                &value,
+            )
+            .await?;
+        }
+        notification_tx.commit().await?;
+    }
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
 }
 
@@ -2627,6 +2741,13 @@ async fn decide_gatepass_request(
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let is_parent = access.roles.iter().any(|role| role == "parent");
     let is_warden = access.roles.iter().any(|role| role == "warden");
+    let is_principal = access.roles.iter().any(|role| role == "principal");
+    let is_advisor_or_hod = access.roles.iter().any(|role| {
+        matches!(
+            role.as_str(),
+            "class_advisor" | "hod" | "head_of_department"
+        )
+    });
     let expected_step = if is_parent {
         let parent_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
         let linked = sqlx::query_scalar::<_, bool>(
@@ -2650,8 +2771,38 @@ async fn decide_gatepass_request(
         Some("parent")
     } else if is_warden {
         Some("warden")
+    } else if is_principal {
+        Some("principal")
+    } else if is_advisor_or_hod {
+        let actor_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
+        let assigned = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM campus_ops.gatepass_requests request
+                 JOIN core.students student ON student.tenant_id=request.tenant_id
+                   AND student.user_account_id::text=request.requester_user_id
+                 WHERE request.tenant_id=$1 AND request.id=$2
+                   AND request.pass_type='leave_pass'
+                   AND (
+                     EXISTS (SELECT 1 FROM core.class_advisor_assignments advisor
+                       WHERE advisor.tenant_id=student.tenant_id AND advisor.active
+                         AND advisor.department_id::text=student.department_id
+                         AND advisor.advisor_user_id::text=$3)
+                     OR EXISTS (SELECT 1 FROM core.department_authorities authority
+                       WHERE authority.tenant_id=student.tenant_id AND authority.active
+                         AND authority.department_id::text=student.department_id
+                         AND authority.user_id::text=$3)))"#,
+        )
+        .bind(tenant)
+        .bind(request_id)
+        .bind(&actor_user_id)
+        .fetch_one(db.pool())
+        .await?;
+        if !assigned {
+            return Err(ApiError::Forbidden);
+        }
+        Some("advisor_or_hod")
     } else {
-        None
+        return Err(ApiError::Forbidden);
     };
     let mut tx = db.pool().begin().await?;
     let outcome = advance_gatepass_step(
@@ -2750,6 +2901,19 @@ async fn decide_gatepass_request(
             )
             .await?;
         }
+    }
+    if is_advisor_or_hod && input.decision == "approved" {
+        notify_tx(
+            &mut tx,
+            tenant,
+            None,
+            Some("principal"),
+            "gatepass",
+            "Leave pass awaiting principal approval",
+            "An advisor-approved college-hours leave pass needs your decision",
+            &value,
+        )
+        .await?;
     }
     tx.commit().await?;
     publish_operation_change(

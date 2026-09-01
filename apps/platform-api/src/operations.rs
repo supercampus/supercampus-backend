@@ -2006,10 +2006,14 @@ struct LibrarySettingsRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LibraryAnnouncementRequest {
+    announcement_type: String,
+    announcement_date: NaiveDate,
     title: String,
     message: String,
     book_title: Option<String>,
     author: Option<String>,
+    attachment_name: Option<String>,
+    attachment_url: Option<String>,
 }
 
 async fn library_settings(
@@ -2097,8 +2101,11 @@ async fn library_announcements(
     let can_approve = access.allows("library.announcement.approve");
     let rows = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
-             'id',id,'title',title,'message',message,'bookTitle',book_title,
+             'id',id,'announcementType',announcement_type,
+             'announcementDate',announcement_date,'title',title,'message',message,
+             'bookTitle',book_title,
              'author',author,'status',status,'createdBy',created_by,
+             'attachmentName',attachment_name,'attachmentUrl',attachment_url,
              'createdByName',created_by_name,'decisionNote',decision_note,
              'decidedBy',decided_by,'decidedAt',decided_at,'createdAt',created_at)
              ORDER BY created_at DESC),'[]'::jsonb)
@@ -2120,9 +2127,12 @@ async fn create_library_announcement(
     Json(input): Json<LibraryAnnouncementRequest>,
 ) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
     require(&access, "library.announcement.create")?;
-    if input.title.trim().len() < 4 || input.message.trim().len() < 8 {
+    if input.announcement_type.trim().is_empty()
+        || input.title.trim().len() < 4
+        || input.message.trim().len() < 8
+    {
         return Err(ApiError::BadRequest(
-            "Enter an announcement title and message".into(),
+            "Enter an announcement type, date, title and description".into(),
         ));
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
@@ -2130,13 +2140,18 @@ async fn create_library_announcement(
     let mut tx = db.pool().begin().await?;
     let value = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.library_announcements
-           (tenant_id,title,message,book_title,author,created_by,created_by_name)
-           VALUES($1,$2,$3,$4,$5,$6,$7)
-           RETURNING jsonb_build_object('id',id,'title',title,'message',message,
+           (tenant_id,announcement_type,announcement_date,title,message,
+            book_title,author,attachment_name,attachment_url,created_by,created_by_name)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           RETURNING jsonb_build_object('id',id,'announcementType',announcement_type,
+             'announcementDate',announcement_date,'title',title,'message',message,
              'bookTitle',book_title,'author',author,'status',status,
+             'attachmentName',attachment_name,'attachmentUrl',attachment_url,
              'createdBy',created_by,'createdByName',created_by_name,'createdAt',created_at)"#,
     )
     .bind(tenant)
+    .bind(input.announcement_type.trim())
+    .bind(input.announcement_date)
     .bind(input.title.trim())
     .bind(input.message.trim())
     .bind(
@@ -2149,6 +2164,20 @@ async fn create_library_announcement(
     .bind(
         input
             .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(
+        input
+            .attachment_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(
+        input
+            .attachment_url
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty()),
@@ -2218,8 +2247,10 @@ async fn decide_library_announcement(
         r#"UPDATE campus_ops.library_announcements SET status=$3,
              decision_note=$4,decided_by=$5,decided_at=now(),updated_at=now()
            WHERE tenant_id=$1 AND id=$2 AND status='pending'
-           RETURNING jsonb_build_object('id',id,'title',title,'message',message,
+           RETURNING jsonb_build_object('id',id,'announcementType',announcement_type,
+             'announcementDate',announcement_date,'title',title,'message',message,
              'bookTitle',book_title,'author',author,'status',status,
+             'attachmentName',attachment_name,'attachmentUrl',attachment_url,
              'createdBy',created_by,'createdByName',created_by_name,
              'decisionNote',decision_note,'decidedAt',decided_at)"#,
     )
@@ -2598,6 +2629,8 @@ async fn gatepass_overview(
               'state',request.state,'workflow',request.workflow,
               'qrPayload',CASE WHEN $3::text IN ('student','parent')
                                THEN request.qr_payload ELSE NULL END,
+              'manualCode',CASE WHEN $3::text IN ('student','parent')
+                                THEN request.manual_code ELSE NULL END,
               'decisionNote',request.decision_note,'decidedBy',request.decided_by,
               'createdAt',request.created_at,'updatedAt',request.updated_at)
               ORDER BY request.created_at DESC)
@@ -2938,6 +2971,44 @@ pub(crate) struct StepOutcome {
     pub requester_user_id: String,
 }
 
+fn four_digit_candidate(minimum: u16, maximum: u16) -> String {
+    let bytes = Uuid::new_v4().into_bytes();
+    let random = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let span = maximum - minimum + 1;
+    format!("{:04}", minimum + random % span)
+}
+
+async fn unique_gate_code(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    minimum: u16,
+    maximum: u16,
+) -> ApiResult<String> {
+    for _ in 0..64 {
+        let code = four_digit_candidate(minimum, maximum);
+        let hash = token_hash(&code);
+        let available = sqlx::query_scalar::<_, bool>(
+            r#"SELECT NOT EXISTS(
+                 SELECT 1 FROM campus_ops.gatepass_requests
+                  WHERE tenant_id=$1 AND manual_code_hash=$2 AND state='approved'
+                 UNION ALL
+                 SELECT 1 FROM campus_ops.daily_access_passes
+                  WHERE tenant_id=$1 AND manual_code_hash=$2 AND valid_on=CURRENT_DATE
+               )"#,
+        )
+        .bind(tenant)
+        .bind(hash)
+        .fetch_one(&mut **tx)
+        .await?;
+        if available {
+            return Ok(code);
+        }
+    }
+    Err(ApiError::Conflict(
+        "No gate verification code is available; try approval again".into(),
+    ))
+}
+
 pub(crate) async fn advance_gatepass_step(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: Uuid,
@@ -2978,13 +3049,17 @@ pub(crate) async fn advance_gatepass_step(
         ));
     }
 
-    let (next, raw_qr) = if decision == "rejected" {
-        ("rejected".to_string(), None)
+    let (next, raw_qr, manual_code) = if decision == "rejected" {
+        ("rejected".to_string(), None, None)
     } else {
         match current.1.as_str() {
-            "pending_parent" => ("pending_warden".into(), None),
-            "pending_advisor_or_hod" => ("pending_principal".into(), None),
-            _ => ("approved".into(), Some(Uuid::new_v4().to_string())),
+            "pending_parent" => ("pending_warden".into(), None, None),
+            "pending_advisor_or_hod" => ("pending_principal".into(), None, None),
+            _ => (
+                "approved".into(),
+                Some(Uuid::new_v4().to_string()),
+                Some(unique_gate_code(tx, tenant, 1000, 4999).await?),
+            ),
         }
     };
 
@@ -2992,10 +3067,11 @@ pub(crate) async fn advance_gatepass_step(
         .bind(tenant).bind(request_id).bind(step).bind(decision).bind(actor).bind(note)
         .execute(&mut **tx).await?;
 
-    let value = sqlx::query_scalar::<_, Value>("UPDATE campus_ops.gatepass_requests SET state=$3,qr_token_hash=$4,qr_payload=$7,decided_by=$5,decision_note=$6,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'requesterUserId',requester_user_id,'state',state,'qrPayload',$7::text,'updatedAt',updated_at)")
+    let value = sqlx::query_scalar::<_, Value>("UPDATE campus_ops.gatepass_requests SET state=$3,qr_token_hash=$4,qr_payload=$7,manual_code_hash=$8,manual_code=$9,decided_by=$5,decision_note=$6,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'requesterUserId',requester_user_id,'state',state,'qrPayload',$7::text,'manualCode',$9::text,'updatedAt',updated_at)")
         .bind(tenant).bind(request_id).bind(&next)
         .bind(raw_qr.as_ref().map(|v| token_hash(v)))
         .bind(actor).bind(note).bind(&raw_qr)
+        .bind(manual_code.as_ref().map(|v| token_hash(v))).bind(&manual_code)
         .fetch_one(&mut **tx).await?;
 
     Ok(StepOutcome {
@@ -3352,8 +3428,12 @@ async fn activate_daily_access(
     }
     let raw = Uuid::new_v4().to_string();
     let hash = token_hash(&raw);
-    let mut value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.daily_access_passes(tenant_id,user_id,valid_on,qr_token_hash,activated_latitude,activated_longitude) VALUES($1,$2,CURRENT_DATE,$3,$4,$5) ON CONFLICT(tenant_id,user_id,valid_on) DO UPDATE SET qr_token_hash=EXCLUDED.qr_token_hash,activated_latitude=EXCLUDED.activated_latitude,activated_longitude=EXCLUDED.activated_longitude,activated_at=now() RETURNING jsonb_build_object('id',id,'validOn',valid_on,'validFrom',activated_at,'validUntil',(valid_on+1)::timestamptz,'qrPayload',$6::text)")
- .bind(tenant).bind(&principal.student.id).bind(hash).bind(input.latitude).bind(input.longitude).bind(&raw).fetch_one(db.pool()).await?;
+    let mut tx = db.pool().begin().await?;
+    let manual_code = unique_gate_code(&mut tx, tenant, 5000, 9999).await?;
+    let manual_hash = token_hash(&manual_code);
+    let mut value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.daily_access_passes(tenant_id,user_id,valid_on,qr_token_hash,manual_code_hash,manual_code,activated_latitude,activated_longitude) VALUES($1,$2,CURRENT_DATE,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,user_id,valid_on) DO UPDATE SET qr_token_hash=EXCLUDED.qr_token_hash,manual_code_hash=EXCLUDED.manual_code_hash,manual_code=EXCLUDED.manual_code,activated_latitude=EXCLUDED.activated_latitude,activated_longitude=EXCLUDED.activated_longitude,activated_at=now() RETURNING jsonb_build_object('id',id,'validOn',valid_on,'validFrom',activated_at,'validUntil',(valid_on+1)::timestamptz,'qrPayload',$8::text,'manualCode',$5::text)")
+ .bind(tenant).bind(&principal.student.id).bind(hash).bind(manual_hash).bind(&manual_code).bind(input.latitude).bind(input.longitude).bind(&raw).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "location".into(),
@@ -3397,6 +3477,19 @@ struct GateScanRequest {
     direction: String,
     checkpoint: String,
 }
+
+fn validate_request_scan_sequence(direction: &str, previous: Option<&str>) -> ApiResult<()> {
+    match (direction, previous) {
+        ("exit", None) | ("entry", Some("exit")) => Ok(()),
+        ("entry", None) => Err(ApiError::Conflict(
+            "Scan gate exit before gate entry".into(),
+        )),
+        _ => Err(ApiError::Conflict(
+            "This gate movement was already recorded".into(),
+        )),
+    }
+}
+
 async fn scan_gatepass(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -3409,9 +3502,15 @@ async fn scan_gatepass(
             "Direction must be entry or exit".into(),
         ));
     }
+    if input.qr_payload.trim().is_empty() || input.checkpoint.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "QR payload and checkpoint are required".into(),
+        ));
+    }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let hash = token_hash(&input.qr_payload);
+    let hash = token_hash(input.qr_payload.trim());
+    let mut tx = db.pool().begin().await?;
     // Three kinds of token arrive at the same scanner and the guard cannot tell
     // them apart by looking: an approved outpass or leave pass, a member's
     // geofenced daily gate-in, or a visitor's card. A visitor has no account, so
@@ -3432,14 +3531,17 @@ async fn scan_gatepass(
           SELECT requester_user_id user_id,id request_id,NULL::uuid visitor_pass_id,
                  requester_name holder_name,pass_type,return_at valid_until
             FROM campus_ops.gatepass_requests
-           WHERE tenant_id=$1 AND state='approved' AND qr_token_hash=$2
+           WHERE tenant_id=$1 AND state='approved'
+             AND (qr_token_hash=$2 OR manual_code_hash=$2)
+             AND now() BETWEEN departure_at AND return_at
           UNION ALL
           SELECT pass.user_id,NULL::uuid,NULL::uuid,
                  COALESCE(member.display_name,pass.user_id) holder_name,
                  'daily_access' pass_type,(pass.valid_on+1)::timestamptz valid_until
             FROM campus_ops.daily_access_passes pass
             LEFT JOIN identity.users member ON member.id::text=pass.user_id
-           WHERE pass.tenant_id=$1 AND pass.valid_on=CURRENT_DATE AND pass.qr_token_hash=$2
+           WHERE pass.tenant_id=$1 AND pass.valid_on=CURRENT_DATE
+             AND (pass.qr_token_hash=$2 OR pass.manual_code_hash=$2)
           UNION ALL
           -- A visitor pass is only good inside the window it was approved for.
           SELECT id::text,NULL::uuid,id,visitor_name,'visitor' pass_type,
@@ -3451,16 +3553,44 @@ async fn scan_gatepass(
     )
     .bind(tenant)
     .bind(hash)
-    .fetch_optional(db.pool())
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::NotFound("QR is invalid or expired".into()))?;
+
+    if let Some(request_id) = match_row.1 {
+        let previous_direction = sqlx::query_scalar::<_, String>(
+            r#"SELECT direction FROM campus_ops.gate_movements
+               WHERE tenant_id=$1 AND request_id=$2
+               ORDER BY created_at DESC LIMIT 1"#,
+        )
+        .bind(tenant)
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        validate_request_scan_sequence(&input.direction, previous_direction.as_deref())?;
+    }
     let mut value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.gate_movements(tenant_id,user_id,request_id,visitor_pass_id,direction,checkpoint,scanned_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING jsonb_build_object('id',id,'userId',user_id,'requestId',request_id,'visitorPassId',visitor_pass_id,'direction',direction,'checkpoint',checkpoint,'createdAt',created_at)")
- .bind(tenant).bind(&match_row.0).bind(match_row.1).bind(match_row.2).bind(&input.direction).bind(input.checkpoint.trim()).bind(&principal.student.id).fetch_one(db.pool()).await?;
+ .bind(tenant).bind(&match_row.0).bind(match_row.1).bind(match_row.2).bind(&input.direction).bind(input.checkpoint.trim()).bind(&principal.student.id).fetch_one(&mut *tx).await?;
+    if input.direction == "entry"
+        && let Some(request_id) = match_row.1
+    {
+        sqlx::query(
+            r#"UPDATE campus_ops.gatepass_requests
+               SET state='completed',qr_token_hash=NULL,qr_payload=NULL,
+                   manual_code_hash=NULL,manual_code=NULL,updated_at=now()
+               WHERE tenant_id=$1 AND id=$2 AND state='approved'"#,
+        )
+        .bind(tenant)
+        .bind(request_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     if let Some(object) = value.as_object_mut() {
         object.insert("holderName".into(), json!(match_row.3));
         object.insert("passType".into(), json!(match_row.4));
         object.insert("validUntil".into(), json!(match_row.5));
     }
+    tx.commit().await?;
     emit(
         &state,
         &principal.student.tenant_id,
@@ -4859,5 +4989,24 @@ mod tests {
             campus_code_from("Madras Engineering College"),
             "MADRAS-ENGINEERING"
         );
+    }
+
+    #[test]
+    fn gatepass_qr_requires_exit_then_entry_and_cannot_be_reused() {
+        assert!(validate_request_scan_sequence("exit", None).is_ok());
+        assert!(validate_request_scan_sequence("entry", Some("exit")).is_ok());
+        assert!(validate_request_scan_sequence("entry", None).is_err());
+        assert!(validate_request_scan_sequence("exit", Some("exit")).is_err());
+        assert!(validate_request_scan_sequence("entry", Some("entry")).is_err());
+    }
+
+    #[test]
+    fn gate_fallback_codes_are_always_four_digits_in_the_requested_range() {
+        for _ in 0..100 {
+            let code = four_digit_candidate(1000, 4999);
+            assert_eq!(code.len(), 4);
+            let value = code.parse::<u16>().expect("numeric gate code");
+            assert!((1000..=4999).contains(&value));
+        }
     }
 }

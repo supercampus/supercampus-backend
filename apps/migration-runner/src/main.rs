@@ -27,6 +27,8 @@ async fn main() -> anyhow::Result<()> {
         "apply-stationery-inventory-pricing" => apply_stationery_inventory_pricing().await,
         "apply-leave-pass-approval-matrix" => apply_leave_pass_approval_matrix().await,
         "apply-librarian-operations" => apply_librarian_operations().await,
+        "apply-announcement-format" => apply_announcement_format().await,
+        "apply-gatepass-manual-codes" => apply_gatepass_manual_codes().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
@@ -53,6 +55,78 @@ async fn main() -> anyhow::Result<()> {
             "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, apply-parent-warden-gatepass-portals, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
+}
+
+/// Adds the four-digit fallback codes accepted by the gate scanner.
+async fn apply_gatepass_manual_codes() -> anyhow::Result<()> {
+    const SQL: &str = include_str!("../../../migrations/runtime/0085_gatepass_manual_codes.sql");
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    sqlx::raw_sql(SQL)
+        .execute(control.pool())
+        .await
+        .context("failed to apply gatepass manual codes to the control plane")?;
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug,registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id=registry.tenant_id
+           WHERE registry.status='active' AND tenant.status='active' ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await?;
+    let base_options =
+        PgConnectOptions::from_str(&control_url).context("invalid CONTROL_DATABASE_URL")?;
+    for (slug, database_name) in &databases {
+        validate_database_name(database_name)?;
+        let tenant = Database::connect_options(base_options.clone().database(database_name), 2)
+            .await
+            .with_context(|| format!("failed to connect tenant {slug} database"))?;
+        sqlx::raw_sql(SQL)
+            .execute(tenant.pool())
+            .await
+            .with_context(|| format!("failed to apply gatepass manual codes to {slug}"))?;
+    }
+    println!(
+        "applied gatepass manual codes to control and {} tenant database(s)",
+        databases.len()
+    );
+    Ok(())
+}
+
+/// Applies the standard type/date/details-attachment announcement fields.
+async fn apply_announcement_format() -> anyhow::Result<()> {
+    const SQL: &str = include_str!("../../../migrations/runtime/0084_announcement_format.sql");
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    sqlx::raw_sql(SQL)
+        .execute(control.pool())
+        .await
+        .context("failed to apply announcement format to the control plane")?;
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug,registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id=registry.tenant_id
+           WHERE registry.status='active' AND tenant.status='active' ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await?;
+    let base_options =
+        PgConnectOptions::from_str(&control_url).context("invalid CONTROL_DATABASE_URL")?;
+    for (slug, database_name) in &databases {
+        validate_database_name(database_name)?;
+        let tenant = Database::connect_options(base_options.clone().database(database_name), 2)
+            .await
+            .with_context(|| format!("failed to connect tenant {slug} database"))?;
+        sqlx::raw_sql(SQL)
+            .execute(tenant.pool())
+            .await
+            .with_context(|| format!("failed to apply announcement format to {slug}"))?;
+    }
+    println!(
+        "applied announcement format to control and {} tenant database(s)",
+        databases.len()
+    );
+    Ok(())
 }
 
 /// Applies librarian capacity, reporting and announcement approval records.

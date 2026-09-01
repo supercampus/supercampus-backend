@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
         "apply-student-assessments" => apply_student_assessments().await,
         "apply-push-notification-foundation" => apply_push_notification_foundation().await,
         "apply-parent-warden-gatepass-portals" => apply_parent_warden_gatepass_portals().await,
+        "apply-stationery-inventory-pricing" => apply_stationery_inventory_pricing().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
@@ -50,6 +51,48 @@ async fn main() -> anyhow::Result<()> {
             "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, apply-parent-warden-gatepass-portals, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
+}
+
+/// Adds editable cost pricing before the API starts reading the new field.
+/// The SQL is idempotent so this command is safe on every deployment restart.
+async fn apply_stationery_inventory_pricing() -> anyhow::Result<()> {
+    const SQL: &str =
+        include_str!("../../../migrations/runtime/0081_stationery_inventory_item_pricing.sql");
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    sqlx::raw_sql(SQL)
+        .execute(control.pool())
+        .await
+        .context("failed to apply stationery inventory pricing to the control plane")?;
+
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug, registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id = registry.tenant_id
+           WHERE registry.status = 'active' AND tenant.status = 'active'
+           ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await
+    .context("failed to list tenant databases")?;
+
+    let base_options =
+        PgConnectOptions::from_str(&control_url).context("invalid CONTROL_DATABASE_URL")?;
+    for (slug, database_name) in &databases {
+        validate_database_name(database_name)?;
+        let tenant = Database::connect_options(base_options.clone().database(database_name), 2)
+            .await
+            .with_context(|| format!("failed to connect tenant {slug} database"))?;
+        sqlx::raw_sql(SQL)
+            .execute(tenant.pool())
+            .await
+            .with_context(|| format!("failed to apply stationery inventory pricing to {slug}"))?;
+    }
+    println!(
+        "applied stationery inventory pricing to control plane and {} tenant database(s)",
+        databases.len()
+    );
+    Ok(())
 }
 
 /// Applies the isolated MEC parent/warden accounts and outpass schema without

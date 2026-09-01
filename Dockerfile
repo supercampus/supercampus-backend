@@ -16,4 +16,4 @@ ENV HTTP_PORT=4000
 USER supercampus
 EXPOSE 4000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD curl --fail http://127.0.0.1:4000/health || exit 1
-ENTRYPOINT ["supercampus-platform-api"]
+ENTRYPOINT ["sh", "-c", "supercampus-migration-runner apply-stationery-inventory-pricing && exec supercampus-platform-api"]

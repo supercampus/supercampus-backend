@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
         "apply-parent-warden-gatepass-portals" => apply_parent_warden_gatepass_portals().await,
         "apply-stationery-inventory-pricing" => apply_stationery_inventory_pricing().await,
         "apply-leave-pass-approval-matrix" => apply_leave_pass_approval_matrix().await,
+        "apply-librarian-operations" => apply_librarian_operations().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
@@ -52,6 +53,42 @@ async fn main() -> anyhow::Result<()> {
             "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, apply-parent-warden-gatepass-portals, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
+}
+
+/// Applies librarian capacity, reporting and announcement approval records.
+async fn apply_librarian_operations() -> anyhow::Result<()> {
+    const SQL: &str = include_str!("../../../migrations/runtime/0083_librarian_operations.sql");
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    sqlx::raw_sql(SQL)
+        .execute(control.pool())
+        .await
+        .context("failed to apply librarian operations to the control plane")?;
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug,registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id=registry.tenant_id
+           WHERE registry.status='active' AND tenant.status='active' ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await?;
+    let base_options =
+        PgConnectOptions::from_str(&control_url).context("invalid CONTROL_DATABASE_URL")?;
+    for (slug, database_name) in &databases {
+        validate_database_name(database_name)?;
+        let tenant = Database::connect_options(base_options.clone().database(database_name), 2)
+            .await
+            .with_context(|| format!("failed to connect tenant {slug} database"))?;
+        sqlx::raw_sql(SQL)
+            .execute(tenant.pool())
+            .await
+            .with_context(|| format!("failed to apply librarian operations to {slug}"))?;
+    }
+    println!(
+        "applied librarian operations to control and {} tenant database(s)",
+        databases.len()
+    );
+    Ok(())
 }
 
 /// Applies the role grants used by the advisor/HOD -> principal leave-pass chain.

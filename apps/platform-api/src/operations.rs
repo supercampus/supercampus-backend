@@ -69,6 +69,18 @@ pub fn router() -> Router<AppState> {
             post(decide_library_request),
         )
         .route("/library/requests/scan", post(scan_library_request))
+        .route(
+            "/library/settings",
+            get(library_settings).put(update_library_settings),
+        )
+        .route(
+            "/library/announcements",
+            get(library_announcements).post(create_library_announcement),
+        )
+        .route(
+            "/library/announcements/{announcement_id}/decision",
+            post(decide_library_announcement),
+        )
         .route("/gatepass/overview", get(gatepass_overview))
         .route("/gatepass/requests", post(create_gatepass_request))
         .route(
@@ -1985,6 +1997,256 @@ struct LibraryDecisionRequest {
     note: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LibrarySettingsRequest {
+    slot_capacity: i32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LibraryAnnouncementRequest {
+    title: String,
+    message: String,
+    book_title: Option<String>,
+    author: Option<String>,
+}
+
+async fn library_settings(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(
+        &access,
+        &[
+            "library.occupancy.read",
+            "library.capacity.manage",
+            "library.visit_pass.create",
+        ],
+    )?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+             'slotCapacity',COALESCE((SELECT slot_capacity
+               FROM campus_ops.library_settings WHERE tenant_id=$1),500),
+             'activeBookings',(SELECT count(*) FROM campus_ops.library_visit_requests
+               WHERE tenant_id=$1 AND status IN ('pending','approved')
+                 AND visit_end>now()),
+             'completedVisits',(SELECT count(*) FROM campus_ops.library_visit_requests
+               WHERE tenant_id=$1 AND status='completed'))"#,
+    )
+    .bind(tenant)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(value)))
+}
+
+async fn update_library_settings(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<LibrarySettingsRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "library.capacity.manage")?;
+    if !(1..=10_000).contains(&input.slot_capacity) {
+        return Err(ApiError::BadRequest(
+            "Slot capacity must be between 1 and 10000".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.library_settings(tenant_id,slot_capacity,updated_by)
+           VALUES($1,$2,$3)
+           ON CONFLICT(tenant_id) DO UPDATE SET slot_capacity=EXCLUDED.slot_capacity,
+             updated_by=EXCLUDED.updated_by,updated_at=now()
+           RETURNING jsonb_build_object('slotCapacity',slot_capacity,'updatedAt',updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(input.slot_capacity)
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "library",
+        "settings",
+        &tenant.to_string(),
+        "updated",
+    );
+    Ok(Json(ApiResponse::new(value)))
+}
+
+async fn library_announcements(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(
+        &access,
+        &[
+            "library.announcement.create",
+            "library.announcement.approve",
+        ],
+    )?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let can_approve = access.allows("library.announcement.approve");
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'id',id,'title',title,'message',message,'bookTitle',book_title,
+             'author',author,'status',status,'createdBy',created_by,
+             'createdByName',created_by_name,'decisionNote',decision_note,
+             'decidedBy',decided_by,'decidedAt',decided_at,'createdAt',created_at)
+             ORDER BY created_at DESC),'[]'::jsonb)
+           FROM campus_ops.library_announcements
+           WHERE tenant_id=$1 AND ($3 OR created_by=$2)"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(can_approve)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({"announcements":rows}))))
+}
+
+async fn create_library_announcement(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<LibraryAnnouncementRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require(&access, "library.announcement.create")?;
+    if input.title.trim().len() < 4 || input.message.trim().len() < 8 {
+        return Err(ApiError::BadRequest(
+            "Enter an announcement title and message".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.library_announcements
+           (tenant_id,title,message,book_title,author,created_by,created_by_name)
+           VALUES($1,$2,$3,$4,$5,$6,$7)
+           RETURNING jsonb_build_object('id',id,'title',title,'message',message,
+             'bookTitle',book_title,'author',author,'status',status,
+             'createdBy',created_by,'createdByName',created_by_name,'createdAt',created_at)"#,
+    )
+    .bind(tenant)
+    .bind(input.title.trim())
+    .bind(input.message.trim())
+    .bind(
+        input
+            .book_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(
+        input
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(&principal.student.id)
+    .bind(&principal.student.name)
+    .fetch_one(&mut *tx)
+    .await?;
+    let admin_ids = sqlx::query_scalar::<_, String>(
+        r#"SELECT membership.user_id::text FROM identity.tenant_memberships membership
+           WHERE membership.tenant_id=$1 AND membership.active
+             AND membership.roles && ARRAY['tenant_admin','admin','administrator','super_admin']::text[]"#,
+    )
+    .bind(tenant)
+    .fetch_all(&mut *tx)
+    .await?;
+    for admin_id in admin_ids {
+        notify_tx(
+            &mut tx,
+            tenant,
+            Some(&admin_id),
+            None,
+            "library",
+            "Library announcement needs approval",
+            &format!(
+                "{} submitted: {}",
+                principal.student.name,
+                input.title.trim()
+            ),
+            &value,
+        )
+        .await?;
+    }
+    emit_tx(
+        &mut tx,
+        tenant,
+        "library",
+        "announcement",
+        value["id"].as_str().unwrap_or_default(),
+        "announcement.submitted",
+        &principal.student.id,
+        &value,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn decide_library_announcement(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(announcement_id): Path<Uuid>,
+    Json(input): Json<LibraryDecisionRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "library.announcement.approve")?;
+    let decision = input.decision.trim().to_lowercase();
+    if !matches!(decision.as_str(), "approved" | "rejected") {
+        return Err(ApiError::BadRequest(
+            "Decision must be approved or rejected".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.library_announcements SET status=$3,
+             decision_note=$4,decided_by=$5,decided_at=now(),updated_at=now()
+           WHERE tenant_id=$1 AND id=$2 AND status='pending'
+           RETURNING jsonb_build_object('id',id,'title',title,'message',message,
+             'bookTitle',book_title,'author',author,'status',status,
+             'createdBy',created_by,'createdByName',created_by_name,
+             'decisionNote',decision_note,'decidedAt',decided_at)"#,
+    )
+    .bind(tenant)
+    .bind(announcement_id)
+    .bind(&decision)
+    .bind(input.note.as_deref())
+    .bind(&principal.student.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::Conflict("Announcement is no longer pending".into()))?;
+    let librarian_id = value["createdBy"].as_str().ok_or(ApiError::Internal)?;
+    notify_tx(
+        &mut tx,
+        tenant,
+        Some(librarian_id),
+        None,
+        "library",
+        "Library announcement reviewed",
+        &format!("Your announcement was {decision}"),
+        &value,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(value)))
+}
+
 async fn library_requests(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -2045,6 +2307,29 @@ async fn create_library_request(
         .unwrap_or("Central Library - Reading Hall")
         .trim();
     let mut tx = db.pool().begin().await?;
+    let capacity = sqlx::query_scalar::<_, i32>(
+        r#"SELECT slot_capacity FROM campus_ops.library_settings
+           WHERE tenant_id=$1 FOR UPDATE"#,
+    )
+    .bind(tenant)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(500);
+    let occupied = sqlx::query_scalar::<_, i64>(
+        r#"SELECT count(*) FROM campus_ops.library_visit_requests
+           WHERE tenant_id=$1 AND status IN ('pending','approved')
+             AND visit_start<$3 AND visit_end>$2"#,
+    )
+    .bind(tenant)
+    .bind(input.visit_start)
+    .bind(input.visit_end)
+    .fetch_one(&mut *tx)
+    .await?;
+    if occupied >= i64::from(capacity) {
+        return Err(ApiError::Conflict(
+            "This library slot is full. Choose another time".into(),
+        ));
+    }
     let value = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.library_visit_requests
            (id,tenant_id,student_user_id,student_name,zone_name,description,

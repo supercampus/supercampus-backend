@@ -105,6 +105,10 @@ pub fn router() -> Router<AppState> {
             post(publish_attendance_session),
         )
         .route(
+            "/attendance/sessions/{session_id}/review",
+            post(review_attendance_session),
+        )
+        .route(
             "/attendance/reports",
             get(attendance_reports).post(create_attendance_report),
         )
@@ -3469,8 +3473,21 @@ async fn attendance_session_entries(
     .bind(session_id)
     .fetch_one(db.pool())
     .await?;
+    let reviews = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+              'actorRole', actor_role, 'decision', decision,
+              'fromStatus', from_status, 'toStatus', to_status,
+              'note', note, 'createdAt', created_at
+            ) ORDER BY created_at), '[]'::jsonb)
+            FROM campus_ops.attendance_session_reviews
+           WHERE tenant_id=$1 AND session_id=$2"#,
+    )
+    .bind(tenant)
+    .bind(session_id)
+    .fetch_one(db.pool())
+    .await?;
     Ok(Json(ApiResponse::new(
-        json!({"session": session, "entries": entries}),
+        json!({"session": session, "entries": entries, "reviews": reviews}),
     )))
 }
 
@@ -3546,7 +3563,22 @@ async fn publish_attendance_session(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let mut tx = db.pool().begin().await?;
-    let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.attendance_sessions SET status='published_to_hod',updated_at=now() WHERE tenant_id=$1 AND id=$2 AND faculty_user_id=$3 AND status IN('draft','returned') RETURNING jsonb_build_object('id',id,'subjectName',subject_name,'heldOn',held_on,'status',status)").bind(tenant).bind(session_id).bind(&principal.student.id).fetch_optional(&mut *tx).await?.ok_or_else(||ApiError::Conflict("Attendance session cannot be published".into()))?;
+    let advisor_submission = access.roles.iter().any(|role| role == "class_advisor");
+    let next_status = if advisor_submission {
+        "submitted_to_hod"
+    } else {
+        "submitted_to_advisor"
+    };
+    let next_role = if advisor_submission {
+        "hod"
+    } else {
+        "class_advisor"
+    };
+    let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.attendance_sessions SET status=$4,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND faculty_user_id=$3 AND status IN('draft','returned') RETURNING jsonb_build_object('id',id,'subjectName',subject_name,'heldOn',held_on,'status',status)").bind(tenant).bind(session_id).bind(&principal.student.id).bind(next_status).fetch_optional(&mut *tx).await?.ok_or_else(||ApiError::Conflict("Attendance session cannot be submitted".into()))?;
+    sqlx::query("INSERT INTO campus_ops.attendance_session_reviews(tenant_id,session_id,actor_user_id,actor_role,decision,from_status,to_status) VALUES($1,$2,$3,$4,'submit','draft',$5)")
+        .bind(tenant).bind(session_id).bind(&principal.student.id)
+        .bind(if advisor_submission { "class_advisor" } else { "staff" }).bind(next_status)
+        .execute(&mut *tx).await?;
     let students=sqlx::query_as::<_,(String,String)>("SELECT student_user_id,status FROM campus_ops.attendance_entries WHERE tenant_id=$1 AND session_id=$2").bind(tenant).bind(session_id).fetch_all(&mut *tx).await?;
     for (student, status) in &students {
         let body = format!(
@@ -3570,10 +3602,10 @@ async fn publish_attendance_session(
         &mut tx,
         tenant,
         None,
-        Some("hod"),
+        Some(next_role),
         "attendance",
         "Attendance ready for review",
-        "A faculty attendance session was published",
+        "A subject attendance session is waiting in your review queue",
         &value,
     )
     .await?;
@@ -3583,7 +3615,7 @@ async fn publish_attendance_session(
         "attendance",
         "session",
         &session_id.to_string(),
-        "session.published_to_hod",
+        &format!("session.{next_status}"),
         &principal.student.id,
         &value,
     )
@@ -3609,7 +3641,140 @@ async fn publish_attendance_session(
         "attendance",
         "session",
         &session_id.to_string(),
-        "session.published_to_hod",
+        &format!("session.{next_status}"),
+    );
+    Ok(Json(ApiResponse::new(value)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttendanceReviewRequest {
+    decision: String,
+    note: Option<String>,
+}
+
+async fn review_attendance_session(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(session_id): Path<Uuid>,
+    Json(input): Json<AttendanceReviewRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "attendance.session.publish")?;
+    if !matches!(input.decision.as_str(), "approve" | "enquire" | "reject") {
+        return Err(ApiError::BadRequest(
+            "Decision must be approve, enquire, or reject".into(),
+        ));
+    }
+    let actor_role = if access.roles.iter().any(|role| role == "principal") {
+        "principal"
+    } else if access.roles.iter().any(|role| role == "hod") {
+        "hod"
+    } else if access.roles.iter().any(|role| role == "class_advisor") {
+        "class_advisor"
+    } else {
+        return Err(ApiError::Forbidden);
+    };
+    let expected = match actor_role {
+        "class_advisor" => "submitted_to_advisor",
+        "hod" => "submitted_to_hod",
+        _ => "submitted_to_principal",
+    };
+    let next = if input.decision == "approve" {
+        match actor_role {
+            "class_advisor" => "submitted_to_hod",
+            "hod" => "submitted_to_principal",
+            _ => "approved",
+        }
+    } else {
+        "returned"
+    };
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let scope = access
+        .scope_for("attendance.session.publish")
+        .unwrap_or("own");
+    let mut tx = db.pool().begin().await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.attendance_sessions session
+              SET status=$5, hod_note=$6, updated_at=now()
+            WHERE session.tenant_id=$1 AND session.id=$2 AND session.status=$4
+              AND ($3 IN ('institution','all') OR EXISTS (
+                SELECT 1 FROM core.subject_offerings offering
+                JOIN core.subjects subject ON subject.tenant_id=offering.tenant_id AND subject.id=offering.subject_id
+                WHERE offering.tenant_id=session.tenant_id AND offering.id=session.subject_offering_id
+                  AND (($3='assigned' AND EXISTS (
+                    SELECT 1 FROM core.class_advisor_assignments advisor
+                    WHERE advisor.tenant_id=session.tenant_id AND advisor.department_id=subject.department_id
+                      AND advisor.advisor_user_id::text=$7 AND advisor.active
+                  )) OR ($3='department' AND EXISTS (
+                    SELECT 1 FROM core.department_authorities authority
+                    WHERE authority.tenant_id=session.tenant_id AND authority.department_id=subject.department_id
+                      AND authority.user_id::text=$7 AND authority.active
+                  )))
+              ))
+          RETURNING jsonb_build_object('id',id,'subjectName',subject_name,'facultyUserId',faculty_user_id,'heldOn',held_on,'status',status,'reviewNote',hod_note)"#,
+    ).bind(tenant).bind(session_id).bind(scope).bind(expected).bind(next)
+     .bind(input.note.as_deref()).bind(&principal.student.id)
+     .fetch_optional(&mut *tx).await?
+     .ok_or_else(|| ApiError::Conflict("This attendance is not in your review queue".into()))?;
+    sqlx::query("INSERT INTO campus_ops.attendance_session_reviews(tenant_id,session_id,actor_user_id,actor_role,decision,from_status,to_status,note) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
+        .bind(tenant).bind(session_id).bind(&principal.student.id).bind(actor_role)
+        .bind(&input.decision).bind(expected).bind(next).bind(input.note.as_deref())
+        .execute(&mut *tx).await?;
+    let target_role = match next {
+        "submitted_to_hod" => Some("hod"),
+        "submitted_to_principal" => Some("principal"),
+        _ => None,
+    };
+    if let Some(role) = target_role {
+        notify_tx(
+            &mut tx,
+            tenant,
+            None,
+            Some(role),
+            "attendance",
+            "Attendance approval required",
+            "A reviewed attendance session is waiting for you",
+            &value,
+        )
+        .await?;
+    }
+    if next == "returned" {
+        notify_tx(
+            &mut tx,
+            tenant,
+            value["facultyUserId"].as_str(),
+            None,
+            "attendance",
+            "Attendance returned",
+            input
+                .note
+                .as_deref()
+                .unwrap_or("The attendance requires correction"),
+            &value,
+        )
+        .await?;
+    }
+    emit_tx(
+        &mut tx,
+        tenant,
+        "attendance",
+        "session",
+        &session_id.to_string(),
+        &format!("session.{next}"),
+        &principal.student.id,
+        &value,
+    )
+    .await?;
+    tx.commit().await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "attendance",
+        "session",
+        &session_id.to_string(),
+        &format!("session.{next}"),
     );
     Ok(Json(ApiResponse::new(value)))
 }
@@ -3663,7 +3828,7 @@ async fn attendance_summary(
            AND subject.id = offering.subject_id
           WHERE e.tenant_id = $1
             AND e.student_user_id = $2
-            AND s.status IN ('published_to_hod', 'submitted_to_principal')
+            AND s.status = 'approved'
         ),
         subject_totals AS (
           SELECT
@@ -3768,7 +3933,7 @@ async fn create_attendance_report(
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let summary=sqlx::query_scalar::<_,Value>("SELECT jsonb_build_object('sessions',count(DISTINCT s.id),'entries',count(e.*),'present',count(e.*) FILTER(WHERE e.status='present'),'absent',count(e.*) FILTER(WHERE e.status='absent')) FROM campus_ops.attendance_sessions s LEFT JOIN campus_ops.attendance_entries e ON e.tenant_id=s.tenant_id AND e.session_id=s.id WHERE s.tenant_id=$1 AND s.held_on BETWEEN $2 AND $3 AND s.status='published_to_hod'").bind(tenant).bind(input.period_start).bind(input.period_end).fetch_one(db.pool()).await?;
+    let summary=sqlx::query_scalar::<_,Value>("SELECT jsonb_build_object('sessions',count(DISTINCT s.id),'entries',count(e.*),'present',count(e.*) FILTER(WHERE e.status='present'),'absent',count(e.*) FILTER(WHERE e.status='absent')) FROM campus_ops.attendance_sessions s LEFT JOIN campus_ops.attendance_entries e ON e.tenant_id=s.tenant_id AND e.session_id=s.id WHERE s.tenant_id=$1 AND s.held_on BETWEEN $2 AND $3 AND s.status IN ('submitted_to_hod','submitted_to_principal','approved')").bind(tenant).bind(input.period_start).bind(input.period_end).fetch_one(db.pool()).await?;
     let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.attendance_reports(tenant_id,title,period_start,period_end,department_id,generated_by,summary) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING jsonb_build_object('id',id,'title',title,'periodStart',period_start,'periodEnd',period_end,'status',status,'summary',summary)").bind(tenant).bind(input.title.trim()).bind(input.period_start).bind(input.period_end).bind(input.department_id).bind(&principal.student.id).bind(summary).fetch_one(db.pool()).await?;
     emit(
         &state,

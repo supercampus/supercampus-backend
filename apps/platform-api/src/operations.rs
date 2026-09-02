@@ -3490,6 +3490,14 @@ async fn attendance_sessions(
                      'heldOn', session.held_on,
                      'periodLabel', session.period_label,
                      'status', session.status,
+                     'totalCount', (SELECT count(*) FROM campus_ops.attendance_entries entry
+                       WHERE entry.tenant_id=session.tenant_id AND entry.session_id=session.id),
+                     'presentCount', (SELECT count(*) FROM campus_ops.attendance_entries entry
+                       WHERE entry.tenant_id=session.tenant_id AND entry.session_id=session.id AND entry.status='present'),
+                     'absentCount', (SELECT count(*) FROM campus_ops.attendance_entries entry
+                       WHERE entry.tenant_id=session.tenant_id AND entry.session_id=session.id AND entry.status='absent'),
+                     'onDutyCount', (SELECT count(*) FROM campus_ops.attendance_entries entry
+                       WHERE entry.tenant_id=session.tenant_id AND entry.session_id=session.id AND entry.status='od'),
                      'updatedAt', session.updated_at
                    ) ORDER BY session.held_on DESC, session.created_at DESC
                  ),
@@ -3532,7 +3540,36 @@ async fn attendance_sessions(
     .bind(review_scope)
     .fetch_one(db.pool())
     .await?;
-    Ok(Json(ApiResponse::new(json!({"sessions":rows}))))
+    let departments = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'id', department.id, 'code', department.code, 'name', department.name
+               ) ORDER BY department.code), '[]'::jsonb)
+             FROM core.departments department
+            WHERE department.tenant_id=$1 AND department.active
+              AND (
+                $2 IN ('institution','all')
+                OR ($2='department' AND EXISTS (
+                  SELECT 1 FROM core.department_authorities authority
+                   WHERE authority.tenant_id=department.tenant_id
+                     AND authority.department_id=department.id
+                     AND authority.user_id::text=$3 AND authority.active
+                ))
+                OR ($2='assigned' AND EXISTS (
+                  SELECT 1 FROM core.class_advisor_assignments advisor
+                   WHERE advisor.tenant_id=department.tenant_id
+                     AND advisor.department_id=department.id
+                     AND advisor.advisor_user_id::text=$3 AND advisor.active
+                ))
+              )"#,
+    )
+    .bind(tenant)
+    .bind(review_scope)
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"sessions":rows,"departments":departments}),
+    )))
 }
 async fn create_attendance_session(
     State(state): State<AppState>,

@@ -90,6 +90,11 @@ pub fn router() -> Router<AppState> {
             "/advisor/students/{student_id}/assessments/{assessment_id}",
             put(update_advisor_student_assessment),
         )
+        .route(
+            "/marks/batches",
+            get(marks_batches).post(create_marks_batch),
+        )
+        .route("/marks/batches/{batch_id}/review", post(review_marks_batch))
         .route("/attendance/wards", get(attendance_wards))
         .route("/attendance/summary/{student_id}", get(attendance_summary))
         .route(
@@ -2546,6 +2551,191 @@ async fn scan_gatepass(
     )
     .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MarksBatchRequest {
+    subject_code: String,
+    subject_name: String,
+    assessment_type: String,
+    maximum_marks: f64,
+    entries: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MarksBatchReviewRequest {
+    decision: String,
+    note: Option<String>,
+}
+
+async fn marks_batches(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "examination.marks.read")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let scope = access.scope_for("examination.marks.read").unwrap_or("own");
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'id', batch.id, 'departmentId', batch.department_id,
+             'subjectCode', batch.subject_code, 'subjectName', batch.subject_name,
+             'assessmentType', batch.assessment_type, 'maximumMarks', batch.maximum_marks,
+             'entries', batch.entries, 'submittedBy', batch.submitted_by,
+             'status', batch.status, 'reviewNote', batch.review_note,
+             'createdAt', batch.created_at, 'updatedAt', batch.updated_at
+           ) ORDER BY batch.created_at DESC), '[]'::jsonb)
+           FROM core.marks_batches batch
+          WHERE batch.tenant_id=$1 AND (
+            batch.submitted_by=$2 OR $3 IN ('institution','all')
+            OR ($3='department' AND EXISTS (
+              SELECT 1 FROM core.department_authorities authority
+               WHERE authority.tenant_id=batch.tenant_id AND authority.department_id=batch.department_id
+                 AND authority.user_id::text=$2 AND authority.active
+            )) OR ($3='assigned' AND EXISTS (
+              SELECT 1 FROM core.class_advisor_assignments advisor
+               WHERE advisor.tenant_id=batch.tenant_id AND advisor.department_id=batch.department_id
+                 AND advisor.advisor_user_id::text=$2 AND advisor.active
+            ))
+          )"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(scope)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({"batches": rows}))))
+}
+
+async fn create_marks_batch(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<MarksBatchRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require(&access, "examination.marks.create")?;
+    let entries = input
+        .entries
+        .as_array()
+        .ok_or_else(|| ApiError::BadRequest("Marks entries must be an array".into()))?;
+    if entries.is_empty()
+        || entries.len() > 500
+        || !input.maximum_marks.is_finite()
+        || input.maximum_marks <= 0.0
+    {
+        return Err(ApiError::BadRequest(
+            "Provide 1 to 500 valid marks rows and a positive maximum".into(),
+        ));
+    }
+    for entry in entries {
+        let marks = entry["marksObtained"].as_f64().ok_or_else(|| {
+            ApiError::BadRequest("Every row requires numeric marksObtained".into())
+        })?;
+        if marks < 0.0
+            || marks > input.maximum_marks
+            || entry["registerNumber"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        {
+            return Err(ApiError::BadRequest(
+                "A marks row is outside the permitted range".into(),
+            ));
+        }
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let department = sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT subject.department_id FROM core.subjects subject
+           WHERE subject.tenant_id=$1 AND lower(subject.code)=lower($2) AND subject.active
+             AND (EXISTS (
+               SELECT 1 FROM core.subject_offerings offering
+               JOIN core.teaching_assignments teaching ON teaching.tenant_id=offering.tenant_id AND teaching.subject_offering_id=offering.id
+               WHERE offering.tenant_id=subject.tenant_id AND offering.subject_id=subject.id
+                 AND teaching.faculty_user_id::text=$3 AND teaching.active
+             ) OR EXISTS (
+               SELECT 1 FROM core.class_advisor_assignments advisor
+               WHERE advisor.tenant_id=subject.tenant_id AND advisor.department_id=subject.department_id
+                 AND advisor.advisor_user_id::text=$3 AND advisor.active
+             )) LIMIT 1"#,
+    ).bind(tenant).bind(input.subject_code.trim()).bind(&principal.student.id)
+     .fetch_optional(db.pool()).await?.ok_or(ApiError::Forbidden)?;
+    let advisor = access.roles.iter().any(|role| role == "class_advisor");
+    let status = if advisor {
+        "submitted_to_hod"
+    } else {
+        "submitted_to_advisor"
+    };
+    let value = sqlx::query_scalar::<_, Value>(
+        "INSERT INTO core.marks_batches(tenant_id,department_id,subject_code,subject_name,assessment_type,maximum_marks,entries,submitted_by,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING jsonb_build_object('id',id,'subjectCode',subject_code,'subjectName',subject_name,'assessmentType',assessment_type,'maximumMarks',maximum_marks,'entries',entries,'status',status,'createdAt',created_at)",
+    ).bind(tenant).bind(department).bind(input.subject_code.trim()).bind(input.subject_name.trim())
+     .bind(input.assessment_type.trim()).bind(input.maximum_marks).bind(&input.entries)
+     .bind(&principal.student.id).bind(status).fetch_one(db.pool()).await?;
+    sqlx::query("INSERT INTO core.marks_batch_reviews(tenant_id,batch_id,actor_user_id,actor_role,decision,from_status,to_status) VALUES($1,($2->>'id')::uuid,$3,$4,'submit','draft',$5)")
+        .bind(tenant).bind(&value).bind(&principal.student.id).bind(if advisor { "class_advisor" } else { "staff" }).bind(status)
+        .execute(db.pool()).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn review_marks_batch(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(batch_id): Path<Uuid>,
+    Json(input): Json<MarksBatchReviewRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "examination.marks.update")?;
+    if !matches!(input.decision.as_str(), "approve" | "reject") {
+        return Err(ApiError::BadRequest(
+            "Decision must be approve or reject".into(),
+        ));
+    }
+    let role = if access.roles.iter().any(|r| r == "principal") {
+        "principal"
+    } else if access.roles.iter().any(|r| r == "hod") {
+        "hod"
+    } else if access.roles.iter().any(|r| r == "class_advisor") {
+        "class_advisor"
+    } else {
+        return Err(ApiError::Forbidden);
+    };
+    let expected = match role {
+        "class_advisor" => "submitted_to_advisor",
+        "hod" => "submitted_to_hod",
+        _ => "submitted_to_principal",
+    };
+    let next = if input.decision == "reject" {
+        "returned"
+    } else {
+        match role {
+            "class_advisor" => "submitted_to_hod",
+            "hod" => "submitted_to_principal",
+            _ => "approved",
+        }
+    };
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let scope = access
+        .scope_for("examination.marks.update")
+        .or_else(|| access.scope_for("examination.marks.read"))
+        .unwrap_or("own");
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE core.marks_batches batch SET status=$5,review_note=$6,updated_at=now()
+           WHERE batch.tenant_id=$1 AND batch.id=$2 AND batch.status=$4 AND (
+             $3 IN ('institution','all') OR ($3='department' AND EXISTS (
+               SELECT 1 FROM core.department_authorities a WHERE a.tenant_id=batch.tenant_id AND a.department_id=batch.department_id AND a.user_id::text=$7 AND a.active
+             )) OR ($3='assigned' AND EXISTS (
+               SELECT 1 FROM core.class_advisor_assignments a WHERE a.tenant_id=batch.tenant_id AND a.department_id=batch.department_id AND a.advisor_user_id::text=$7 AND a.active
+             ))) RETURNING jsonb_build_object('id',id,'subjectName',subject_name,'status',status,'reviewNote',review_note)"#,
+    ).bind(tenant).bind(batch_id).bind(scope).bind(expected).bind(next).bind(input.note.as_deref()).bind(&principal.student.id)
+     .fetch_optional(db.pool()).await?.ok_or_else(|| ApiError::Conflict("This marks batch is not in your review queue".into()))?;
+    sqlx::query("INSERT INTO core.marks_batch_reviews(tenant_id,batch_id,actor_user_id,actor_role,decision,from_status,to_status,note) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
+        .bind(tenant).bind(batch_id).bind(&principal.student.id).bind(role).bind(&input.decision).bind(expected).bind(next).bind(input.note.as_deref()).execute(db.pool()).await?;
+    Ok(Json(ApiResponse::new(value)))
 }
 
 #[derive(Deserialize)]

@@ -98,7 +98,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/attendance/sessions/{session_id}/entries",
-            put(replace_attendance_entries),
+            get(attendance_session_entries).put(replace_attendance_entries),
         )
         .route(
             "/attendance/sessions/{session_id}/publish",
@@ -3229,12 +3229,70 @@ async fn attendance_sessions(
             "attendance.roster.read",
             "attendance.records.read",
             "attendance.reports.create",
+            "attendance.reports.publish",
         ],
     )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let manage = access.allows("attendance.reports.create");
-    let rows=sqlx::query_scalar::<_,Value>("SELECT COALESCE(jsonb_agg(jsonb_build_object('id',id,'timetableEntryId',timetable_entry_id,'subjectOfferingId',subject_offering_id,'sectionId',section_id,'subjectName',subject_name,'facultyUserId',faculty_user_id,'heldOn',held_on,'periodLabel',period_label,'status',status,'updatedAt',updated_at) ORDER BY held_on DESC,created_at DESC),'[]'::jsonb) FROM campus_ops.attendance_sessions WHERE tenant_id=$1 AND ($3 OR faculty_user_id=$2)").bind(tenant).bind(&principal.student.id).bind(manage).fetch_one(db.pool()).await?;
+    let review_scope = access
+        .scope_for("attendance.reports.publish")
+        .or_else(|| access.scope_for("attendance.reports.create"))
+        .unwrap_or("own");
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(
+                 jsonb_agg(
+                   jsonb_build_object(
+                     'id', session.id,
+                     'timetableEntryId', session.timetable_entry_id,
+                     'subjectOfferingId', session.subject_offering_id,
+                     'sectionId', session.section_id,
+                     'subjectName', session.subject_name,
+                     'facultyUserId', session.faculty_user_id,
+                     'heldOn', session.held_on,
+                     'periodLabel', session.period_label,
+                     'status', session.status,
+                     'updatedAt', session.updated_at
+                   ) ORDER BY session.held_on DESC, session.created_at DESC
+                 ),
+                 '[]'::jsonb
+               )
+           FROM campus_ops.attendance_sessions session
+          WHERE session.tenant_id = $1
+            AND (
+              session.faculty_user_id = $2
+              OR $3 IN ('institution', 'all')
+              OR EXISTS (
+                SELECT 1
+                  FROM core.subject_offerings offering
+                  JOIN core.subjects subject
+                    ON subject.tenant_id = offering.tenant_id
+                   AND subject.id = offering.subject_id
+                 WHERE offering.tenant_id = session.tenant_id
+                   AND offering.id = session.subject_offering_id
+                   AND (
+                     ($3 = 'assigned' AND EXISTS (
+                       SELECT 1 FROM core.class_advisor_assignments advisor
+                        WHERE advisor.tenant_id = session.tenant_id
+                          AND advisor.department_id = subject.department_id
+                          AND advisor.advisor_user_id::text = $2
+                          AND advisor.active
+                     ))
+                     OR ($3 = 'department' AND EXISTS (
+                       SELECT 1 FROM core.department_authorities authority
+                        WHERE authority.tenant_id = session.tenant_id
+                          AND authority.department_id = subject.department_id
+                          AND authority.user_id::text = $2
+                          AND authority.active
+                     ))
+                   )
+              )
+            )"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(review_scope)
+    .fetch_one(db.pool())
+    .await?;
     Ok(Json(ApiResponse::new(json!({"sessions":rows}))))
 }
 async fn create_attendance_session(
@@ -3314,6 +3372,106 @@ async fn create_attendance_session(
     )
     .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn attendance_session_entries(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(session_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(
+        &access,
+        &[
+            "attendance.roster.read",
+            "attendance.reports.create",
+            "attendance.reports.publish",
+        ],
+    )?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let review_scope = access
+        .scope_for("attendance.reports.publish")
+        .or_else(|| access.scope_for("attendance.reports.create"))
+        .unwrap_or("own");
+    let session = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+                 'id', session.id,
+                 'subjectName', session.subject_name,
+                 'sectionId', session.section_id,
+                 'facultyUserId', session.faculty_user_id,
+                 'heldOn', session.held_on,
+                 'periodLabel', session.period_label,
+                 'status', session.status
+               )
+           FROM campus_ops.attendance_sessions session
+          WHERE session.tenant_id = $1
+            AND session.id = $2
+            AND (
+              session.faculty_user_id = $3
+              OR $4 IN ('institution', 'all')
+              OR EXISTS (
+                SELECT 1
+                  FROM core.subject_offerings offering
+                  JOIN core.subjects subject
+                    ON subject.tenant_id = offering.tenant_id
+                   AND subject.id = offering.subject_id
+                 WHERE offering.tenant_id = session.tenant_id
+                   AND offering.id = session.subject_offering_id
+                   AND (
+                     ($4 = 'assigned' AND EXISTS (
+                       SELECT 1 FROM core.class_advisor_assignments advisor
+                        WHERE advisor.tenant_id = session.tenant_id
+                          AND advisor.department_id = subject.department_id
+                          AND advisor.advisor_user_id::text = $3
+                          AND advisor.active
+                     ))
+                     OR ($4 = 'department' AND EXISTS (
+                       SELECT 1 FROM core.department_authorities authority
+                        WHERE authority.tenant_id = session.tenant_id
+                          AND authority.department_id = subject.department_id
+                          AND authority.user_id::text = $3
+                          AND authority.active
+                     ))
+                   )
+              )
+            )"#,
+    )
+    .bind(tenant)
+    .bind(session_id)
+    .bind(&principal.student.id)
+    .bind(review_scope)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Attendance session not found".into()))?;
+    let entries = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(
+                 jsonb_agg(
+                   jsonb_build_object(
+                     'studentUserId', entry.student_user_id,
+                     'studentName', entry.student_name,
+                     'studentNumber', student.student_number,
+                     'status', entry.status,
+                     'markedAt', entry.marked_at
+                   )
+                   ORDER BY entry.student_name
+                 ),
+                 '[]'::jsonb
+               )
+           FROM campus_ops.attendance_entries entry
+           LEFT JOIN core.students student
+             ON student.tenant_id = entry.tenant_id
+            AND student.user_account_id::text = entry.student_user_id
+          WHERE entry.tenant_id = $1
+            AND entry.session_id = $2"#,
+    )
+    .bind(tenant)
+    .bind(session_id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"session": session, "entries": entries}),
+    )))
 }
 
 #[derive(Deserialize)]

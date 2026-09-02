@@ -90,6 +90,7 @@ pub fn router() -> Router<AppState> {
             "/advisor/students/{student_id}/assessments/{assessment_id}",
             put(update_advisor_student_assessment),
         )
+        .route("/marks/subjects", get(marks_subjects))
         .route(
             "/marks/batches",
             get(marks_batches).post(create_marks_batch),
@@ -2570,6 +2571,40 @@ struct MarksBatchReviewRequest {
     note: Option<String>,
 }
 
+async fn marks_subjects(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "examination.marks.create")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let subjects = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'subjectCode', code, 'subjectName', name,
+             'departmentId', department_id, 'departmentCode', department_code
+           ) ORDER BY code), '[]'::jsonb)
+           FROM (SELECT DISTINCT subject.code, subject.name, subject.department_id,
+                                department.code AS department_code
+             FROM core.subjects subject
+             JOIN core.departments department ON department.tenant_id=subject.tenant_id AND department.id=subject.department_id
+            WHERE subject.tenant_id=$1 AND subject.active AND (
+              EXISTS (SELECT 1 FROM core.subject_offerings offering
+                      JOIN core.teaching_assignments teaching ON teaching.tenant_id=offering.tenant_id AND teaching.subject_offering_id=offering.id
+                     WHERE offering.tenant_id=subject.tenant_id AND offering.subject_id=subject.id
+                       AND teaching.faculty_user_id::text=$2 AND teaching.active)
+              OR EXISTS (SELECT 1 FROM core.class_advisor_assignments advisor
+                         WHERE advisor.tenant_id=subject.tenant_id AND advisor.department_id=subject.department_id
+                           AND advisor.advisor_user_id::text=$2 AND advisor.active)
+            )) available"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({"subjects": subjects}))))
+}
+
 async fn marks_batches(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -3442,6 +3477,16 @@ async fn attendance_sessions(
                      'sectionId', session.section_id,
                      'subjectName', session.subject_name,
                      'facultyUserId', session.faculty_user_id,
+                     'departmentCode', (SELECT department.code
+                       FROM core.subject_offerings offering
+                       JOIN core.subjects subject ON subject.tenant_id=offering.tenant_id AND subject.id=offering.subject_id
+                       JOIN core.departments department ON department.tenant_id=subject.tenant_id AND department.id=subject.department_id
+                       WHERE offering.tenant_id=session.tenant_id AND offering.id=session.subject_offering_id),
+                     'departmentName', (SELECT department.name
+                       FROM core.subject_offerings offering
+                       JOIN core.subjects subject ON subject.tenant_id=offering.tenant_id AND subject.id=offering.subject_id
+                       JOIN core.departments department ON department.tenant_id=subject.tenant_id AND department.id=subject.department_id
+                       WHERE offering.tenant_id=session.tenant_id AND offering.id=session.subject_offering_id),
                      'heldOn', session.held_on,
                      'periodLabel', session.period_label,
                      'status', session.status,

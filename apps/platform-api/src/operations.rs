@@ -1705,7 +1705,7 @@ async fn wallet_directory(
     let limit = query.limit.unwrap_or(500).clamp(1, 2000);
     let wallets = sqlx::query_scalar::<_, Value>(
         r#"
-        SELECT COALESCE(jsonb_agg(row ORDER BY lower(row->>'studentName'), row->>'studentNumber'), '[]'::jsonb)
+        SELECT COALESCE(jsonb_agg(row ORDER BY row->>'studentNumber', lower(row->>'studentName')), '[]'::jsonb)
         FROM (
           SELECT jsonb_build_object(
             'userId', student.user_account_id::text,
@@ -1739,7 +1739,7 @@ async fn wallet_directory(
             AND student.status IN ('provisional','active')
             AND ($2='' OR lower(concat_ws(' ', student.student_number,
               student.full_name, student.email, department.code)) LIKE $3)
-          ORDER BY lower(student.full_name), student.student_number
+          ORDER BY student.student_number, lower(student.full_name)
           LIMIT $4
         ) directory"#,
     )
@@ -3429,7 +3429,7 @@ async fn attendance_wards(
           'studentName', student.full_name,
           'departmentId', student.department_id,
           'sectionId', student.section_id
-        ) ORDER BY student.full_name), '[]'::jsonb)
+        ) ORDER BY student.student_number, student.full_name), '[]'::jsonb)
         FROM campus_ops.parent_student_links link
         JOIN core.students student
           ON student.tenant_id = link.tenant_id

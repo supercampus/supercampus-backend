@@ -115,6 +115,12 @@ pub fn router() -> Router<AppState> {
             "/advisor/students/{student_id}/assessments/{assessment_id}",
             put(update_advisor_student_assessment),
         )
+        .route("/marks/subjects", get(marks_subjects))
+        .route(
+            "/marks/batches",
+            get(marks_batches).post(create_marks_batch),
+        )
+        .route("/marks/batches/{batch_id}/review", post(review_marks_batch))
         .route("/attendance/wards", get(attendance_wards))
         .route("/attendance/summary/{student_id}", get(attendance_summary))
         .route(
@@ -123,11 +129,15 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/attendance/sessions/{session_id}/entries",
-            put(replace_attendance_entries),
+            get(attendance_session_entries).put(replace_attendance_entries),
         )
         .route(
             "/attendance/sessions/{session_id}/publish",
             post(publish_attendance_session),
+        )
+        .route(
+            "/attendance/sessions/{session_id}/review",
+            post(review_attendance_session),
         )
         .route(
             "/attendance/reports",
@@ -1736,7 +1746,7 @@ async fn wallet_directory(
     let limit = query.limit.unwrap_or(500).clamp(1, 2000);
     let wallets = sqlx::query_scalar::<_, Value>(
         r#"
-        SELECT COALESCE(jsonb_agg(row ORDER BY lower(row->>'studentName'), row->>'studentNumber'), '[]'::jsonb)
+        SELECT COALESCE(jsonb_agg(row ORDER BY row->>'studentNumber', lower(row->>'studentName')), '[]'::jsonb)
         FROM (
           SELECT jsonb_build_object(
             'userId', student.user_account_id::text,
@@ -1770,7 +1780,7 @@ async fn wallet_directory(
             AND student.status IN ('provisional','active')
             AND ($2='' OR lower(concat_ws(' ', student.student_number,
               student.full_name, student.email, department.code)) LIKE $3)
-          ORDER BY lower(student.full_name), student.student_number
+          ORDER BY student.student_number, lower(student.full_name)
           LIMIT $4
         ) directory"#,
     )
@@ -3609,6 +3619,225 @@ async fn scan_gatepass(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MarksBatchRequest {
+    subject_code: String,
+    subject_name: String,
+    assessment_type: String,
+    maximum_marks: f64,
+    entries: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MarksBatchReviewRequest {
+    decision: String,
+    note: Option<String>,
+}
+
+async fn marks_subjects(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "examination.marks.create")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let subjects = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'subjectCode', code, 'subjectName', name,
+             'departmentId', department_id, 'departmentCode', department_code
+           ) ORDER BY code), '[]'::jsonb)
+           FROM (SELECT DISTINCT subject.code, subject.name, subject.department_id,
+                                department.code AS department_code
+             FROM core.subjects subject
+             JOIN core.departments department ON department.tenant_id=subject.tenant_id AND department.id=subject.department_id
+            WHERE subject.tenant_id=$1 AND subject.active AND (
+              EXISTS (SELECT 1 FROM core.subject_offerings offering
+                      JOIN core.teaching_assignments teaching ON teaching.tenant_id=offering.tenant_id AND teaching.subject_offering_id=offering.id
+                     WHERE offering.tenant_id=subject.tenant_id AND offering.subject_id=subject.id
+                       AND teaching.faculty_user_id::text=$2 AND teaching.active)
+              OR EXISTS (SELECT 1 FROM core.class_advisor_assignments advisor
+                         WHERE advisor.tenant_id=subject.tenant_id AND advisor.department_id=subject.department_id
+                           AND advisor.advisor_user_id::text=$2 AND advisor.active)
+            )) available"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({"subjects": subjects}))))
+}
+
+async fn marks_batches(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "examination.marks.read")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let scope = access.scope_for("examination.marks.read").unwrap_or("own");
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'id', batch.id, 'departmentId', batch.department_id,
+             'subjectCode', batch.subject_code, 'subjectName', batch.subject_name,
+             'assessmentType', batch.assessment_type, 'maximumMarks', batch.maximum_marks,
+             'entries', batch.entries, 'submittedBy', batch.submitted_by,
+             'status', batch.status, 'reviewNote', batch.review_note,
+             'createdAt', batch.created_at, 'updatedAt', batch.updated_at
+           ) ORDER BY batch.created_at DESC), '[]'::jsonb)
+           FROM core.marks_batches batch
+          WHERE batch.tenant_id=$1 AND (
+            batch.submitted_by=$2 OR $3 IN ('institution','all')
+            OR ($3='department' AND EXISTS (
+              SELECT 1 FROM core.department_authorities authority
+               WHERE authority.tenant_id=batch.tenant_id AND authority.department_id=batch.department_id
+                 AND authority.user_id::text=$2 AND authority.active
+            )) OR ($3='assigned' AND EXISTS (
+              SELECT 1 FROM core.class_advisor_assignments advisor
+               WHERE advisor.tenant_id=batch.tenant_id AND advisor.department_id=batch.department_id
+                 AND advisor.advisor_user_id::text=$2 AND advisor.active
+            ))
+          )"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(scope)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({"batches": rows}))))
+}
+
+async fn create_marks_batch(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<MarksBatchRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require(&access, "examination.marks.create")?;
+    let entries = input
+        .entries
+        .as_array()
+        .ok_or_else(|| ApiError::BadRequest("Marks entries must be an array".into()))?;
+    if entries.is_empty()
+        || entries.len() > 500
+        || !input.maximum_marks.is_finite()
+        || input.maximum_marks <= 0.0
+    {
+        return Err(ApiError::BadRequest(
+            "Provide 1 to 500 valid marks rows and a positive maximum".into(),
+        ));
+    }
+    for entry in entries {
+        let marks = entry["marksObtained"].as_f64().ok_or_else(|| {
+            ApiError::BadRequest("Every row requires numeric marksObtained".into())
+        })?;
+        if marks < 0.0
+            || marks > input.maximum_marks
+            || entry["registerNumber"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        {
+            return Err(ApiError::BadRequest(
+                "A marks row is outside the permitted range".into(),
+            ));
+        }
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let department = sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT subject.department_id FROM core.subjects subject
+           WHERE subject.tenant_id=$1 AND lower(subject.code)=lower($2) AND subject.active
+             AND (EXISTS (
+               SELECT 1 FROM core.subject_offerings offering
+               JOIN core.teaching_assignments teaching ON teaching.tenant_id=offering.tenant_id AND teaching.subject_offering_id=offering.id
+               WHERE offering.tenant_id=subject.tenant_id AND offering.subject_id=subject.id
+                 AND teaching.faculty_user_id::text=$3 AND teaching.active
+             ) OR EXISTS (
+               SELECT 1 FROM core.class_advisor_assignments advisor
+               WHERE advisor.tenant_id=subject.tenant_id AND advisor.department_id=subject.department_id
+                 AND advisor.advisor_user_id::text=$3 AND advisor.active
+             )) LIMIT 1"#,
+    ).bind(tenant).bind(input.subject_code.trim()).bind(&principal.student.id)
+     .fetch_optional(db.pool()).await?.ok_or(ApiError::Forbidden)?;
+    let advisor = access.roles.iter().any(|role| role == "class_advisor");
+    let status = if advisor {
+        "submitted_to_hod"
+    } else {
+        "submitted_to_advisor"
+    };
+    let value = sqlx::query_scalar::<_, Value>(
+        "INSERT INTO core.marks_batches(tenant_id,department_id,subject_code,subject_name,assessment_type,maximum_marks,entries,submitted_by,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING jsonb_build_object('id',id,'subjectCode',subject_code,'subjectName',subject_name,'assessmentType',assessment_type,'maximumMarks',maximum_marks,'entries',entries,'status',status,'createdAt',created_at)",
+    ).bind(tenant).bind(department).bind(input.subject_code.trim()).bind(input.subject_name.trim())
+     .bind(input.assessment_type.trim()).bind(input.maximum_marks).bind(&input.entries)
+     .bind(&principal.student.id).bind(status).fetch_one(db.pool()).await?;
+    sqlx::query("INSERT INTO core.marks_batch_reviews(tenant_id,batch_id,actor_user_id,actor_role,decision,from_status,to_status) VALUES($1,($2->>'id')::uuid,$3,$4,'submit','draft',$5)")
+        .bind(tenant).bind(&value).bind(&principal.student.id).bind(if advisor { "class_advisor" } else { "staff" }).bind(status)
+        .execute(db.pool()).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn review_marks_batch(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(batch_id): Path<Uuid>,
+    Json(input): Json<MarksBatchReviewRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "examination.marks.update")?;
+    if !matches!(input.decision.as_str(), "approve" | "reject") {
+        return Err(ApiError::BadRequest(
+            "Decision must be approve or reject".into(),
+        ));
+    }
+    let role = if access.roles.iter().any(|r| r == "principal") {
+        "principal"
+    } else if access.roles.iter().any(|r| r == "hod") {
+        "hod"
+    } else if access.roles.iter().any(|r| r == "class_advisor") {
+        "class_advisor"
+    } else {
+        return Err(ApiError::Forbidden);
+    };
+    let expected = match role {
+        "class_advisor" => "submitted_to_advisor",
+        "hod" => "submitted_to_hod",
+        _ => "submitted_to_principal",
+    };
+    let next = if input.decision == "reject" {
+        "returned"
+    } else {
+        match role {
+            "class_advisor" => "submitted_to_hod",
+            "hod" => "submitted_to_principal",
+            _ => "approved",
+        }
+    };
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let scope = access
+        .scope_for("examination.marks.update")
+        .or_else(|| access.scope_for("examination.marks.read"))
+        .unwrap_or("own");
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE core.marks_batches batch SET status=$5,review_note=$6,updated_at=now()
+           WHERE batch.tenant_id=$1 AND batch.id=$2 AND batch.status=$4 AND (
+             $3 IN ('institution','all') OR ($3='department' AND EXISTS (
+               SELECT 1 FROM core.department_authorities a WHERE a.tenant_id=batch.tenant_id AND a.department_id=batch.department_id AND a.user_id::text=$7 AND a.active
+             )) OR ($3='assigned' AND EXISTS (
+               SELECT 1 FROM core.class_advisor_assignments a WHERE a.tenant_id=batch.tenant_id AND a.department_id=batch.department_id AND a.advisor_user_id::text=$7 AND a.active
+             ))) RETURNING jsonb_build_object('id',id,'subjectName',subject_name,'status',status,'reviewNote',review_note)"#,
+    ).bind(tenant).bind(batch_id).bind(scope).bind(expected).bind(next).bind(input.note.as_deref()).bind(&principal.student.id)
+     .fetch_optional(db.pool()).await?.ok_or_else(|| ApiError::Conflict("This marks batch is not in your review queue".into()))?;
+    sqlx::query("INSERT INTO core.marks_batch_reviews(tenant_id,batch_id,actor_user_id,actor_role,decision,from_status,to_status,note) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
+        .bind(tenant).bind(batch_id).bind(&principal.student.id).bind(role).bind(&input.decision).bind(expected).bind(next).bind(input.note.as_deref()).execute(db.pool()).await?;
+    Ok(Json(ApiResponse::new(value)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AttendanceSessionRequest {
     timetable_entry_id: Option<Uuid>,
     subject_name: String,
@@ -4264,7 +4493,7 @@ async fn attendance_wards(
           'studentName', student.full_name,
           'departmentId', student.department_id,
           'sectionId', student.section_id
-        ) ORDER BY student.full_name), '[]'::jsonb)
+        ) ORDER BY student.student_number, student.full_name), '[]'::jsonb)
         FROM campus_ops.parent_student_links link
         JOIN core.students student
           ON student.tenant_id = link.tenant_id
@@ -4293,13 +4522,118 @@ async fn attendance_sessions(
             "attendance.roster.read",
             "attendance.records.read",
             "attendance.reports.create",
+            "attendance.reports.publish",
         ],
     )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let manage = access.allows("attendance.reports.create");
-    let rows=sqlx::query_scalar::<_,Value>("SELECT COALESCE(jsonb_agg(jsonb_build_object('id',id,'timetableEntryId',timetable_entry_id,'subjectOfferingId',subject_offering_id,'sectionId',section_id,'subjectName',subject_name,'facultyUserId',faculty_user_id,'heldOn',held_on,'periodLabel',period_label,'status',status,'updatedAt',updated_at) ORDER BY held_on DESC,created_at DESC),'[]'::jsonb) FROM campus_ops.attendance_sessions WHERE tenant_id=$1 AND ($3 OR faculty_user_id=$2)").bind(tenant).bind(&principal.student.id).bind(manage).fetch_one(db.pool()).await?;
-    Ok(Json(ApiResponse::new(json!({"sessions":rows}))))
+    let review_scope = access
+        .scope_for("attendance.reports.publish")
+        .or_else(|| access.scope_for("attendance.reports.create"))
+        .unwrap_or("own");
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(
+                 jsonb_agg(
+                   jsonb_build_object(
+                     'id', session.id,
+                     'timetableEntryId', session.timetable_entry_id,
+                     'subjectOfferingId', session.subject_offering_id,
+                     'sectionId', session.section_id,
+                     'subjectName', session.subject_name,
+                     'facultyUserId', session.faculty_user_id,
+                     'departmentCode', (SELECT department.code
+                       FROM core.subject_offerings offering
+                       JOIN core.subjects subject ON subject.tenant_id=offering.tenant_id AND subject.id=offering.subject_id
+                       JOIN core.departments department ON department.tenant_id=subject.tenant_id AND department.id=subject.department_id
+                       WHERE offering.tenant_id=session.tenant_id AND offering.id=session.subject_offering_id),
+                     'departmentName', (SELECT department.name
+                       FROM core.subject_offerings offering
+                       JOIN core.subjects subject ON subject.tenant_id=offering.tenant_id AND subject.id=offering.subject_id
+                       JOIN core.departments department ON department.tenant_id=subject.tenant_id AND department.id=subject.department_id
+                       WHERE offering.tenant_id=session.tenant_id AND offering.id=session.subject_offering_id),
+                     'heldOn', session.held_on,
+                     'periodLabel', session.period_label,
+                     'status', session.status,
+                     'totalCount', (SELECT count(*) FROM campus_ops.attendance_entries entry
+                       WHERE entry.tenant_id=session.tenant_id AND entry.session_id=session.id),
+                     'presentCount', (SELECT count(*) FROM campus_ops.attendance_entries entry
+                       WHERE entry.tenant_id=session.tenant_id AND entry.session_id=session.id AND entry.status='present'),
+                     'absentCount', (SELECT count(*) FROM campus_ops.attendance_entries entry
+                       WHERE entry.tenant_id=session.tenant_id AND entry.session_id=session.id AND entry.status='absent'),
+                     'onDutyCount', (SELECT count(*) FROM campus_ops.attendance_entries entry
+                       WHERE entry.tenant_id=session.tenant_id AND entry.session_id=session.id AND entry.status='od'),
+                     'updatedAt', session.updated_at
+                   ) ORDER BY session.held_on DESC, session.created_at DESC
+                 ),
+                 '[]'::jsonb
+               )
+           FROM campus_ops.attendance_sessions session
+          WHERE session.tenant_id = $1
+            AND (
+              session.faculty_user_id = $2
+              OR $3 IN ('institution', 'all')
+              OR EXISTS (
+                SELECT 1
+                  FROM core.subject_offerings offering
+                  JOIN core.subjects subject
+                    ON subject.tenant_id = offering.tenant_id
+                   AND subject.id = offering.subject_id
+                 WHERE offering.tenant_id = session.tenant_id
+                   AND offering.id = session.subject_offering_id
+                   AND (
+                     ($3 = 'assigned' AND EXISTS (
+                       SELECT 1 FROM core.class_advisor_assignments advisor
+                        WHERE advisor.tenant_id = session.tenant_id
+                          AND advisor.department_id = subject.department_id
+                          AND advisor.advisor_user_id::text = $2
+                          AND advisor.active
+                     ))
+                     OR ($3 = 'department' AND EXISTS (
+                       SELECT 1 FROM core.department_authorities authority
+                        WHERE authority.tenant_id = session.tenant_id
+                          AND authority.department_id = subject.department_id
+                          AND authority.user_id::text = $2
+                          AND authority.active
+                     ))
+                   )
+              )
+            )"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(review_scope)
+    .fetch_one(db.pool())
+    .await?;
+    let departments = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'id', department.id, 'code', department.code, 'name', department.name
+               ) ORDER BY department.code), '[]'::jsonb)
+             FROM core.departments department
+            WHERE department.tenant_id=$1 AND department.active
+              AND (
+                $2 IN ('institution','all')
+                OR ($2='department' AND EXISTS (
+                  SELECT 1 FROM core.department_authorities authority
+                   WHERE authority.tenant_id=department.tenant_id
+                     AND authority.department_id=department.id
+                     AND authority.user_id::text=$3 AND authority.active
+                ))
+                OR ($2='assigned' AND EXISTS (
+                  SELECT 1 FROM core.class_advisor_assignments advisor
+                   WHERE advisor.tenant_id=department.tenant_id
+                     AND advisor.department_id=department.id
+                     AND advisor.advisor_user_id::text=$3 AND advisor.active
+                ))
+              )"#,
+    )
+    .bind(tenant)
+    .bind(review_scope)
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"sessions":rows,"departments":departments}),
+    )))
 }
 async fn create_attendance_session(
     State(state): State<AppState>,
@@ -4380,6 +4714,119 @@ async fn create_attendance_session(
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
 }
 
+async fn attendance_session_entries(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(session_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(
+        &access,
+        &[
+            "attendance.roster.read",
+            "attendance.reports.create",
+            "attendance.reports.publish",
+        ],
+    )?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let review_scope = access
+        .scope_for("attendance.reports.publish")
+        .or_else(|| access.scope_for("attendance.reports.create"))
+        .unwrap_or("own");
+    let session = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+                 'id', session.id,
+                 'subjectName', session.subject_name,
+                 'sectionId', session.section_id,
+                 'facultyUserId', session.faculty_user_id,
+                 'heldOn', session.held_on,
+                 'periodLabel', session.period_label,
+                 'status', session.status
+               )
+           FROM campus_ops.attendance_sessions session
+          WHERE session.tenant_id = $1
+            AND session.id = $2
+            AND (
+              session.faculty_user_id = $3
+              OR $4 IN ('institution', 'all')
+              OR EXISTS (
+                SELECT 1
+                  FROM core.subject_offerings offering
+                  JOIN core.subjects subject
+                    ON subject.tenant_id = offering.tenant_id
+                   AND subject.id = offering.subject_id
+                 WHERE offering.tenant_id = session.tenant_id
+                   AND offering.id = session.subject_offering_id
+                   AND (
+                     ($4 = 'assigned' AND EXISTS (
+                       SELECT 1 FROM core.class_advisor_assignments advisor
+                        WHERE advisor.tenant_id = session.tenant_id
+                          AND advisor.department_id = subject.department_id
+                          AND advisor.advisor_user_id::text = $3
+                          AND advisor.active
+                     ))
+                     OR ($4 = 'department' AND EXISTS (
+                       SELECT 1 FROM core.department_authorities authority
+                        WHERE authority.tenant_id = session.tenant_id
+                          AND authority.department_id = subject.department_id
+                          AND authority.user_id::text = $3
+                          AND authority.active
+                     ))
+                   )
+              )
+            )"#,
+    )
+    .bind(tenant)
+    .bind(session_id)
+    .bind(&principal.student.id)
+    .bind(review_scope)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Attendance session not found".into()))?;
+    let entries = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(
+                 jsonb_agg(
+                   jsonb_build_object(
+                     'studentUserId', entry.student_user_id,
+                     'studentName', entry.student_name,
+                     'studentNumber', student.student_number,
+                     'status', entry.status,
+                     'markedAt', entry.marked_at
+                   )
+                   ORDER BY entry.student_name
+                 ),
+                 '[]'::jsonb
+               )
+           FROM campus_ops.attendance_entries entry
+           LEFT JOIN core.students student
+             ON student.tenant_id = entry.tenant_id
+            AND student.user_account_id::text = entry.student_user_id
+          WHERE entry.tenant_id = $1
+            AND entry.session_id = $2"#,
+    )
+    .bind(tenant)
+    .bind(session_id)
+    .fetch_one(db.pool())
+    .await?;
+    let reviews = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+              'actorRole', actor_role, 'decision', decision,
+              'fromStatus', from_status, 'toStatus', to_status,
+              'note', note, 'createdAt', created_at
+            ) ORDER BY created_at), '[]'::jsonb)
+            FROM campus_ops.attendance_session_reviews
+           WHERE tenant_id=$1 AND session_id=$2"#,
+    )
+    .bind(tenant)
+    .bind(session_id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"session": session, "entries": entries, "reviews": reviews}),
+    )))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AttendanceEntryInput {
@@ -4452,7 +4899,22 @@ async fn publish_attendance_session(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let mut tx = db.pool().begin().await?;
-    let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.attendance_sessions SET status='published_to_hod',updated_at=now() WHERE tenant_id=$1 AND id=$2 AND faculty_user_id=$3 AND status IN('draft','returned') RETURNING jsonb_build_object('id',id,'subjectName',subject_name,'heldOn',held_on,'status',status)").bind(tenant).bind(session_id).bind(&principal.student.id).fetch_optional(&mut *tx).await?.ok_or_else(||ApiError::Conflict("Attendance session cannot be published".into()))?;
+    let advisor_submission = access.roles.iter().any(|role| role == "class_advisor");
+    let next_status = if advisor_submission {
+        "submitted_to_hod"
+    } else {
+        "submitted_to_advisor"
+    };
+    let next_role = if advisor_submission {
+        "hod"
+    } else {
+        "class_advisor"
+    };
+    let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.attendance_sessions SET status=$4,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND faculty_user_id=$3 AND status IN('draft','returned') RETURNING jsonb_build_object('id',id,'subjectName',subject_name,'heldOn',held_on,'status',status)").bind(tenant).bind(session_id).bind(&principal.student.id).bind(next_status).fetch_optional(&mut *tx).await?.ok_or_else(||ApiError::Conflict("Attendance session cannot be submitted".into()))?;
+    sqlx::query("INSERT INTO campus_ops.attendance_session_reviews(tenant_id,session_id,actor_user_id,actor_role,decision,from_status,to_status) VALUES($1,$2,$3,$4,'submit','draft',$5)")
+        .bind(tenant).bind(session_id).bind(&principal.student.id)
+        .bind(if advisor_submission { "class_advisor" } else { "staff" }).bind(next_status)
+        .execute(&mut *tx).await?;
     let students=sqlx::query_as::<_,(String,String)>("SELECT student_user_id,status FROM campus_ops.attendance_entries WHERE tenant_id=$1 AND session_id=$2").bind(tenant).bind(session_id).fetch_all(&mut *tx).await?;
     for (student, status) in &students {
         let body = format!(
@@ -4476,10 +4938,10 @@ async fn publish_attendance_session(
         &mut tx,
         tenant,
         None,
-        Some("hod"),
+        Some(next_role),
         "attendance",
         "Attendance ready for review",
-        "A faculty attendance session was published",
+        "A subject attendance session is waiting in your review queue",
         &value,
     )
     .await?;
@@ -4489,7 +4951,7 @@ async fn publish_attendance_session(
         "attendance",
         "session",
         &session_id.to_string(),
-        "session.published_to_hod",
+        &format!("session.{next_status}"),
         &principal.student.id,
         &value,
     )
@@ -4515,7 +4977,140 @@ async fn publish_attendance_session(
         "attendance",
         "session",
         &session_id.to_string(),
-        "session.published_to_hod",
+        &format!("session.{next_status}"),
+    );
+    Ok(Json(ApiResponse::new(value)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttendanceReviewRequest {
+    decision: String,
+    note: Option<String>,
+}
+
+async fn review_attendance_session(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(session_id): Path<Uuid>,
+    Json(input): Json<AttendanceReviewRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "attendance.session.publish")?;
+    if !matches!(input.decision.as_str(), "approve" | "enquire" | "reject") {
+        return Err(ApiError::BadRequest(
+            "Decision must be approve, enquire, or reject".into(),
+        ));
+    }
+    let actor_role = if access.roles.iter().any(|role| role == "principal") {
+        "principal"
+    } else if access.roles.iter().any(|role| role == "hod") {
+        "hod"
+    } else if access.roles.iter().any(|role| role == "class_advisor") {
+        "class_advisor"
+    } else {
+        return Err(ApiError::Forbidden);
+    };
+    let expected = match actor_role {
+        "class_advisor" => "submitted_to_advisor",
+        "hod" => "submitted_to_hod",
+        _ => "submitted_to_principal",
+    };
+    let next = if input.decision == "approve" {
+        match actor_role {
+            "class_advisor" => "submitted_to_hod",
+            "hod" => "submitted_to_principal",
+            _ => "approved",
+        }
+    } else {
+        "returned"
+    };
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let scope = access
+        .scope_for("attendance.session.publish")
+        .unwrap_or("own");
+    let mut tx = db.pool().begin().await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.attendance_sessions session
+              SET status=$5, hod_note=$6, updated_at=now()
+            WHERE session.tenant_id=$1 AND session.id=$2 AND session.status=$4
+              AND ($3 IN ('institution','all') OR EXISTS (
+                SELECT 1 FROM core.subject_offerings offering
+                JOIN core.subjects subject ON subject.tenant_id=offering.tenant_id AND subject.id=offering.subject_id
+                WHERE offering.tenant_id=session.tenant_id AND offering.id=session.subject_offering_id
+                  AND (($3='assigned' AND EXISTS (
+                    SELECT 1 FROM core.class_advisor_assignments advisor
+                    WHERE advisor.tenant_id=session.tenant_id AND advisor.department_id=subject.department_id
+                      AND advisor.advisor_user_id::text=$7 AND advisor.active
+                  )) OR ($3='department' AND EXISTS (
+                    SELECT 1 FROM core.department_authorities authority
+                    WHERE authority.tenant_id=session.tenant_id AND authority.department_id=subject.department_id
+                      AND authority.user_id::text=$7 AND authority.active
+                  )))
+              ))
+          RETURNING jsonb_build_object('id',id,'subjectName',subject_name,'facultyUserId',faculty_user_id,'heldOn',held_on,'status',status,'reviewNote',hod_note)"#,
+    ).bind(tenant).bind(session_id).bind(scope).bind(expected).bind(next)
+     .bind(input.note.as_deref()).bind(&principal.student.id)
+     .fetch_optional(&mut *tx).await?
+     .ok_or_else(|| ApiError::Conflict("This attendance is not in your review queue".into()))?;
+    sqlx::query("INSERT INTO campus_ops.attendance_session_reviews(tenant_id,session_id,actor_user_id,actor_role,decision,from_status,to_status,note) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
+        .bind(tenant).bind(session_id).bind(&principal.student.id).bind(actor_role)
+        .bind(&input.decision).bind(expected).bind(next).bind(input.note.as_deref())
+        .execute(&mut *tx).await?;
+    let target_role = match next {
+        "submitted_to_hod" => Some("hod"),
+        "submitted_to_principal" => Some("principal"),
+        _ => None,
+    };
+    if let Some(role) = target_role {
+        notify_tx(
+            &mut tx,
+            tenant,
+            None,
+            Some(role),
+            "attendance",
+            "Attendance approval required",
+            "A reviewed attendance session is waiting for you",
+            &value,
+        )
+        .await?;
+    }
+    if next == "returned" {
+        notify_tx(
+            &mut tx,
+            tenant,
+            value["facultyUserId"].as_str(),
+            None,
+            "attendance",
+            "Attendance returned",
+            input
+                .note
+                .as_deref()
+                .unwrap_or("The attendance requires correction"),
+            &value,
+        )
+        .await?;
+    }
+    emit_tx(
+        &mut tx,
+        tenant,
+        "attendance",
+        "session",
+        &session_id.to_string(),
+        &format!("session.{next}"),
+        &principal.student.id,
+        &value,
+    )
+    .await?;
+    tx.commit().await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "attendance",
+        "session",
+        &session_id.to_string(),
+        &format!("session.{next}"),
     );
     Ok(Json(ApiResponse::new(value)))
 }
@@ -4570,7 +5165,7 @@ async fn attendance_summary(
            AND subject.id = offering.subject_id
           WHERE e.tenant_id = $1
             AND e.student_user_id = $2
-            AND s.status IN ('published_to_hod', 'submitted_to_principal')
+            AND s.status = 'approved'
         ),
         subject_totals AS (
           SELECT
@@ -4675,7 +5270,7 @@ async fn create_attendance_report(
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let summary=sqlx::query_scalar::<_,Value>("SELECT jsonb_build_object('sessions',count(DISTINCT s.id),'entries',count(e.*),'present',count(e.*) FILTER(WHERE e.status='present'),'absent',count(e.*) FILTER(WHERE e.status='absent')) FROM campus_ops.attendance_sessions s LEFT JOIN campus_ops.attendance_entries e ON e.tenant_id=s.tenant_id AND e.session_id=s.id WHERE s.tenant_id=$1 AND s.held_on BETWEEN $2 AND $3 AND s.status='published_to_hod'").bind(tenant).bind(input.period_start).bind(input.period_end).fetch_one(db.pool()).await?;
+    let summary=sqlx::query_scalar::<_,Value>("SELECT jsonb_build_object('sessions',count(DISTINCT s.id),'entries',count(e.*),'present',count(e.*) FILTER(WHERE e.status='present'),'absent',count(e.*) FILTER(WHERE e.status='absent')) FROM campus_ops.attendance_sessions s LEFT JOIN campus_ops.attendance_entries e ON e.tenant_id=s.tenant_id AND e.session_id=s.id WHERE s.tenant_id=$1 AND s.held_on BETWEEN $2 AND $3 AND s.status IN ('submitted_to_hod','submitted_to_principal','approved')").bind(tenant).bind(input.period_start).bind(input.period_end).fetch_one(db.pool()).await?;
     let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.attendance_reports(tenant_id,title,period_start,period_end,department_id,generated_by,summary) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING jsonb_build_object('id',id,'title',title,'periodStart',period_start,'periodEnd',period_end,'status',status,'summary',summary)").bind(tenant).bind(input.title.trim()).bind(input.period_start).bind(input.period_end).bind(input.department_id).bind(&principal.student.id).bind(summary).fetch_one(db.pool()).await?;
     emit(
         &state,

@@ -518,7 +518,7 @@ impl AppState {
                  ON department.tenant_id = student.tenant_id
                 AND department.id::text = student.department_id::text
                WHERE tenant.slug = $1
-               ORDER BY student.full_name, student.student_number"#,
+               ORDER BY student.student_number, student.full_name"#,
         )
         .bind(tenant_slug)
         .fetch_all(database.pool())

@@ -309,6 +309,36 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to initialize the MEC stationery operator state")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0078_staff_attendance_review_workflow.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to apply the MEC attendance review workflow")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0079_marks_batch_approval_workflow.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to apply the MEC marks approval workflow")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0080_academic_workflow_role_access.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to apply the MEC academic workflow role access")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0081_class_advisor_attendance_scope.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to apply the MEC class advisor attendance scope")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0082_anna_university_student_numbers.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to apply the MEC Anna University student roster")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;

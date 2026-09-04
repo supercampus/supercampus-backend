@@ -4336,6 +4336,7 @@ async fn advisor_student_assessments(
              SELECT mark.id::text AS id,
                     mark.assessment_kind,
                     mark.title,
+                    NULL::text AS subject_code,
                     mark.semester,
                     mark.marks_obtained,
                     mark.maximum_marks,
@@ -4349,12 +4350,22 @@ async fn advisor_student_assessments(
              UNION ALL
 
              SELECT batch.id::text || ':' || entry.ordinality::text AS id,
-                    CASE lower(batch.assessment_type)
+                    CASE lower(COALESCE(
+                      NULLIF(entry.value ->> 'assessmentType', ''),
+                      batch.assessment_type
+                    ))
                       WHEN 'internal' THEN 'internal'
                       WHEN 'semester' THEN 'semester'
                       ELSE 'test'
                     END AS assessment_kind,
-                    batch.subject_name AS title,
+                    COALESCE(
+                      NULLIF(entry.value ->> 'subjectName', ''),
+                      batch.subject_name
+                    ) AS title,
+                    COALESCE(
+                      NULLIF(entry.value ->> 'subjectCode', ''),
+                      batch.subject_code
+                    ) AS subject_code,
                     NULL::smallint AS semester,
                     (entry.value ->> 'marksObtained')::double precision AS marks_obtained,
                     COALESCE(
@@ -4383,6 +4394,7 @@ async fn advisor_student_assessments(
              'id', mark.id,
              'assessmentKind', mark.assessment_kind,
              'title', mark.title,
+             'subjectCode', mark.subject_code,
              'semester', mark.semester,
              'marksObtained', mark.marks_obtained,
              'maximumMarks', mark.maximum_marks,
@@ -4539,6 +4551,7 @@ async fn student_assessments(
              SELECT mark.id::text AS id,
                     mark.assessment_kind,
                     mark.title,
+                    NULL::text AS subject_code,
                     mark.semester,
                     mark.marks_obtained,
                     mark.maximum_marks,
@@ -4552,12 +4565,22 @@ async fn student_assessments(
              UNION ALL
 
              SELECT batch.id::text || ':' || entry.ordinality::text AS id,
-                    CASE lower(batch.assessment_type)
+                    CASE lower(COALESCE(
+                      NULLIF(entry.value ->> 'assessmentType', ''),
+                      batch.assessment_type
+                    ))
                       WHEN 'internal' THEN 'internal'
                       WHEN 'semester' THEN 'semester'
                       ELSE 'test'
                     END AS assessment_kind,
-                    batch.subject_name AS title,
+                    COALESCE(
+                      NULLIF(entry.value ->> 'subjectName', ''),
+                      batch.subject_name
+                    ) AS title,
+                    COALESCE(
+                      NULLIF(entry.value ->> 'subjectCode', ''),
+                      batch.subject_code
+                    ) AS subject_code,
                     NULL::smallint AS semester,
                     (entry.value ->> 'marksObtained')::double precision AS marks_obtained,
                     COALESCE(
@@ -4586,6 +4609,7 @@ async fn student_assessments(
              'id', mark.id,
              'assessmentKind', mark.assessment_kind,
              'title', mark.title,
+             'subjectCode', mark.subject_code,
              'semester', mark.semester,
              'marksObtained', mark.marks_obtained,
              'maximumMarks', mark.maximum_marks,

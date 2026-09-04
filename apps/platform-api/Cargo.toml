@@ -30,6 +30,8 @@ supercampus-database = { path = "../../crates/database" }
 supercampus-notifications = { path = "../../crates/notifications" }
 supercampus-crm = { path = "../../modules/crm" }
 supercampus-application-desk = { path = "../../modules/application-desk" }
+hex = "0.4.3"
+hmac.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

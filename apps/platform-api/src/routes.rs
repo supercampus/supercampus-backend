@@ -85,6 +85,14 @@ pub fn router(state: AppState) -> Router {
         .route("/student/fees", get(list_own_student_fee_records))
         .route("/student-master/import", post(import_student_master))
         .route("/student-master/{student_id}/photo", put(set_student_photo))
+        .route(
+            "/payments/razorpay/orders",
+            post(crate::razorpay::create_order),
+        )
+        .route(
+            "/payments/razorpay/verify",
+            post(crate::razorpay::verify_payment),
+        )
         // Reached by a guardian holding a WhatsApp link and nothing else.
         // Exempted from authorization in `requires_authorization` below.
         .route(

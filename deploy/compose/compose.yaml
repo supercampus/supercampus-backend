@@ -36,6 +36,8 @@ services:
       HTTP_PORT: 4000
       CONTROL_DATABASE_URL: postgresql://supercampus:supercampus-local@postgres:5432/supercampus_control
       JWT_SECRET: replace-with-at-least-32-random-characters
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
       RUST_LOG: info
     ports: ["4000:4000"]
     depends_on:

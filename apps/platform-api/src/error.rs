@@ -20,6 +20,8 @@ pub enum ApiError {
     NotFound(String),
     ServiceUnavailable(String),
     BadGateway(String),
+    PaymentProviderUnauthorized(String),
+    PaymentProvider(String),
     Internal,
 }
 
@@ -90,6 +92,18 @@ impl IntoResponse for ApiError {
                 None,
             ),
             Self::BadGateway(error) => (StatusCode::BAD_GATEWAY, "upstream_error", error, None),
+            Self::PaymentProviderUnauthorized(error) => (
+                StatusCode::UNAUTHORIZED,
+                "payment_provider_auth_failed",
+                error,
+                None,
+            ),
+            Self::PaymentProvider(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "payment_provider_error",
+                error,
+                None,
+            ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",

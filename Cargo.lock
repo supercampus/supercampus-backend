@@ -2650,6 +2650,8 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures-util",
+ "hex",
+ "hmac",
  "image",
  "qrcode",
  "reqwest",

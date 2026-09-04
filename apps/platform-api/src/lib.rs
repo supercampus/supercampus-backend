@@ -8,6 +8,7 @@ pub mod models;
 pub mod notification;
 pub mod operations;
 pub mod passes;
+pub mod razorpay;
 pub mod visitors;
 
 pub(crate) use routes::public_base_url;

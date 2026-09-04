@@ -5,6 +5,8 @@ use reqwest::StatusCode as UpstreamStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
+use sqlx::Row;
+use uuid::Uuid;
 
 use crate::{
     error::{ApiError, ApiResult},
@@ -18,6 +20,7 @@ pub struct CreateOrderRequest {
     amount: Option<i64>,
     currency: Option<String>,
     receipt: Option<String>,
+    purpose: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -50,6 +53,11 @@ pub struct VerifyPaymentResponse {
     success: bool,
     order_id: String,
     payment_id: String,
+    purpose: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet_balance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet_transaction: Option<Value>,
 }
 
 pub async fn create_order(
@@ -57,11 +65,17 @@ pub async fn create_order(
     Extension(access): Extension<EffectiveAccess>,
     Json(request): Json<CreateOrderRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateOrderResponse>)> {
-    require_payment_create(&access)?;
+    let purpose = payment_purpose(request.purpose.as_deref())?;
+    require_payment_create(&access, &principal, purpose)?;
     let amount = request
         .amount
         .filter(|amount| *amount >= 100)
         .ok_or_else(|| ApiError::BadRequest("amount must be at least 100 paise".into()))?;
+    if purpose == "wallet_top_up" && !(5_000..=500_000).contains(&amount) {
+        return Err(ApiError::BadRequest(
+            "Wallet top-up must be between 5000 and 500000 paise".into(),
+        ));
+    }
     let currency = required(request.currency, "currency")?.to_ascii_uppercase();
     if currency.len() != 3 || !currency.chars().all(|value| value.is_ascii_alphabetic()) {
         return Err(ApiError::BadRequest(
@@ -85,6 +99,7 @@ pub async fn create_order(
             "notes": {
                 "tenantId": principal.student.tenant_id,
                 "studentId": principal.student.id,
+                "purpose": purpose,
             },
         }))
         .send()
@@ -108,7 +123,6 @@ pub async fn verify_payment(
     Extension(access): Extension<EffectiveAccess>,
     Json(request): Json<VerifyPaymentRequest>,
 ) -> ApiResult<Json<VerifyPaymentResponse>> {
-    require_payment_create(&access)?;
     let payment_id = required(request.razorpay_payment_id, "razorpay_payment_id")?;
     let order_id = required(request.razorpay_order_id, "razorpay_order_id")?;
     let signature = required(request.razorpay_signature, "razorpay_signature")?;
@@ -138,13 +152,75 @@ pub async fn verify_payment(
         ));
     }
 
+    let purpose = payment_purpose(order.notes.get("purpose").and_then(Value::as_str))?;
+    require_payment_create(&access, &principal, purpose)?;
+    let (wallet_balance, wallet_transaction) = if purpose == "wallet_top_up" {
+        let result = credit_wallet(&state, &principal, &order, &order_id, &payment_id).await?;
+        (Some(result.0), Some(result.1))
+    } else {
+        record_tuition_payment(&state, &principal, &order, &order_id, &payment_id).await?;
+        (None, None)
+    };
+
+    Ok(Json(VerifyPaymentResponse {
+        success: true,
+        order_id,
+        payment_id,
+        purpose: purpose.into(),
+        wallet_balance,
+        wallet_transaction,
+    }))
+}
+
+fn payment_purpose(value: Option<&str>) -> ApiResult<&'static str> {
+    match value.unwrap_or("tuition_fee").trim() {
+        "tuition_fee" => Ok("tuition_fee"),
+        "wallet_top_up" => Ok("wallet_top_up"),
+        _ => Err(ApiError::BadRequest("Unsupported payment purpose".into())),
+    }
+}
+
+fn require_payment_create(
+    access: &EffectiveAccess,
+    principal: &AuthPrincipal,
+    purpose: &str,
+) -> ApiResult<()> {
+    let allowed = match purpose {
+        "wallet_top_up" => {
+            principal
+                .student
+                .portal_families
+                .iter()
+                .any(|family| family == "student")
+                && (access.allows("canteen.wallet.read")
+                    || access.allows("canteen.wallet.update")
+                    || access.allows("canteen.wallet.top_up"))
+        }
+        _ => {
+            access.allows("tuition_fee.payment.create")
+                || access.allows("tuition_fee.payments.create")
+        }
+    };
+    if access.allows("*") || allowed {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+async fn record_tuition_payment(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    order: &RazorpayOrder,
+    order_id: &str,
+    payment_id: &str,
+) -> ApiResult<()> {
     let existing = state
         .list_records(&principal.student.tenant_id, "fees")
         .await?;
     let already_recorded = existing.iter().any(|record| {
         record.record_type == "payments"
-            && record.data.get("paymentReference").and_then(Value::as_str)
-                == Some(payment_id.as_str())
+            && record.data.get("paymentReference").and_then(Value::as_str) == Some(payment_id)
     });
     if !already_recorded {
         state
@@ -160,6 +236,7 @@ pub async fn verify_payment(
                     "amountPaise": order.amount,
                     "currency": order.currency,
                     "method": "Razorpay",
+                    "paymentPurpose": "tuition_fee",
                     "paymentReference": payment_id,
                     "razorpayOrderId": order_id,
                     "receipt": order.receipt,
@@ -169,23 +246,85 @@ pub async fn verify_payment(
             )
             .await?;
     }
-
-    Ok(Json(VerifyPaymentResponse {
-        success: true,
-        order_id,
-        payment_id,
-    }))
+    Ok(())
 }
 
-fn require_payment_create(access: &EffectiveAccess) -> ApiResult<()> {
-    if access.allows("*")
-        || access.allows("tuition_fee.payment.create")
-        || access.allows("tuition_fee.payments.create")
-    {
-        Ok(())
+async fn credit_wallet(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    order: &RazorpayOrder,
+    order_id: &str,
+    payment_id: &str,
+) -> ApiResult<(f64, Value)> {
+    let amount = order.amount as f64 / 100.0;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM platform.tenants WHERE slug = $1")
+            .bind(&principal.student.tenant_id)
+            .fetch_optional(database.pool())
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Tenant not found".into()))?;
+    let mut transaction = database.pool().begin().await?;
+    let idempotency_key = format!("razorpay:{payment_id}");
+    let inserted = sqlx::query(
+        r#"INSERT INTO campus_ops.canteen_wallet_transactions
+           (tenant_id,user_id,amount,transaction_type,description,reference_id,
+            idempotency_key,actor_user_id)
+           VALUES($1,$2,$3,'online_top_up','Razorpay wallet top-up',$4,$5,$2)
+           ON CONFLICT(tenant_id,idempotency_key) DO NOTHING
+           RETURNING id,created_at"#,
+    )
+    .bind(tenant_id)
+    .bind(&principal.student.id)
+    .bind(amount)
+    .bind(order_id)
+    .bind(&idempotency_key)
+    .fetch_optional(&mut *transaction)
+    .await?;
+
+    let balance = if inserted.is_some() {
+        sqlx::query_scalar::<_, f64>(
+            r#"INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,balance,version)
+               VALUES($1,$2,$3,1)
+               ON CONFLICT(tenant_id,user_id) DO UPDATE SET
+                 balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,
+                 version=campus_ops.canteen_wallets.version+1,
+                 updated_at=now()
+               RETURNING balance::float8"#,
+        )
+        .bind(tenant_id)
+        .bind(&principal.student.id)
+        .bind(amount)
+        .fetch_one(&mut *transaction)
+        .await?
     } else {
-        Err(ApiError::Forbidden)
-    }
+        sqlx::query_scalar::<_, f64>(
+            "SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2",
+        )
+        .bind(tenant_id)
+        .bind(&principal.student.id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .unwrap_or(0.0)
+    };
+    transaction.commit().await?;
+    let created_at = inserted
+        .as_ref()
+        .and_then(|row| row.try_get::<chrono::DateTime<Utc>, _>("created_at").ok())
+        .unwrap_or_else(Utc::now);
+    let transaction_value = json!({
+        "id": inserted
+            .as_ref()
+            .and_then(|row| row.try_get::<Uuid, _>("id").ok())
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| payment_id.to_owned()),
+        "amount": amount,
+        "transactionType": "online_top_up",
+        "description": "Razorpay wallet top-up",
+        "referenceId": order_id,
+        "createdAt": created_at,
+    });
+    Ok((balance, transaction_value))
 }
 
 fn required(value: Option<String>, field: &str) -> ApiResult<String> {

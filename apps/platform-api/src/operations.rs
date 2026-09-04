@@ -715,6 +715,41 @@ async fn canteen_store(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let assigned_shop_keys = assigned_shop_keys(db.pool(), tenant, &principal.student.id).await?;
+    // Older menu rows may still carry a legacy store key while the shop shown
+    // to operators uses the tenant-configured key. Expand only through the
+    // same deterministic resolver used by the menu payload so assigned
+    // operators receive those orders without widening access to other shops.
+    let mut order_shop_keys = assigned_shop_keys.clone();
+    if !assigned_shop_keys.is_empty() {
+        let aliases = sqlx::query_scalar::<_, String>(
+            r#"SELECT DISTINCT item.store
+               FROM campus_ops.canteen_menu_items item
+               JOIN LATERAL (
+                 SELECT shop.shop_key
+                 FROM campus_ops.shops shop
+                 WHERE shop.tenant_id=item.tenant_id AND shop.is_active
+                   AND (shop.shop_key=item.store
+                     OR lower(shop.category)=CASE
+                       WHEN lower(item.store) LIKE '%laundry%' THEN 'laundry'
+                       WHEN lower(item.store) LIKE '%station%' THEN 'stationery'
+                       ELSE 'canteen'
+                     END)
+                 ORDER BY CASE WHEN shop.shop_key=item.store THEN 0 ELSE 1 END,
+                   shop.created_at, shop.shop_key
+                 LIMIT 1
+               ) resolved_shop ON true
+               WHERE item.tenant_id=$1 AND resolved_shop.shop_key = ANY($2)"#,
+        )
+        .bind(tenant)
+        .bind(&assigned_shop_keys)
+        .fetch_all(db.pool())
+        .await?;
+        for alias in aliases {
+            if !order_shop_keys.contains(&alias) {
+                order_shop_keys.push(alias);
+            }
+        }
+    }
     let configures_shops = access.allows("vendor_management.vendors.update");
     let is_vendor_operator = access.allows("canteen.orders.manage")
         || access.allows("canteen.menu.create")
@@ -761,24 +796,27 @@ async fn canteen_store(
           'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,
           'tokenNumber',token_number,'qrPayload',id::text,'createdAt',created_at,'updatedAt',updated_at)
           ORDER BY created_at DESC) FROM campus_ops.canteen_orders
-          WHERE tenant_id=$1 AND (($7 AND (NOT $9 OR store = ANY($10))) OR customer_user_id=$2)), '[]'::jsonb),
+          WHERE tenant_id=$1 AND (($7 AND (NOT $9 OR store = ANY($11))) OR customer_user_id=$2)), '[]'::jsonb),
         'walletTransactions', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,
           'amount',amount::float8,'transactionType',transaction_type,'description',description,
           'referenceId',reference_id,'createdAt',created_at) ORDER BY created_at DESC)
           FROM campus_ops.canteen_wallet_transactions WHERE tenant_id=$1 AND user_id=$2), '[]'::jsonb),
-        'staffState', COALESCE((SELECT jsonb_build_object('mode',mode,'shopOpen',shop_open)
-          FROM campus_ops.canteen_staff_state WHERE tenant_id=$1 AND user_id=$2),
-          jsonb_build_object('mode','eat','shopOpen',null)),
+        'staffState', jsonb_build_object(
+          'mode',COALESCE((SELECT mode FROM campus_ops.canteen_staff_state
+            WHERE tenant_id=$1 AND user_id=$2),'eat'),
+          'shopOpen',CASE WHEN $9 THEN (SELECT bool_and(shop.shop_open)
+            FROM campus_ops.shops shop WHERE shop.tenant_id=$1 AND shop.shop_key = ANY($10)) ELSE null END),
         'canManage', $7::boolean,
         'analytics', CASE WHEN $8 THEN jsonb_build_object(
-          'ordersToday',(SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($10)) AND created_at::date=CURRENT_DATE),
-          'revenueToday',COALESCE((SELECT sum(total)::float8 FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($10)) AND status='completed' AND created_at::date=CURRENT_DATE),0),
-          'pending',(SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($10)) AND status IN ('pending','accepted','preparing','ready'))
+          'ordersToday',(SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($11)) AND created_at::date=CURRENT_DATE),
+          'revenueToday',COALESCE((SELECT sum(total)::float8 FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($11)) AND status='completed' AND created_at::date=CURRENT_DATE),0),
+          'pending',(SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($11)) AND status IN ('pending','accepted','preparing','ready'))
         ) ELSE null END
       )"#)
       .bind(tenant).bind(&principal.student.id).bind(&principal.student.name)
       .bind(&principal.student.email).bind(&principal.student.roll).bind(&principal.student.dept)
       .bind(can_manage).bind(can_read_analytics).bind(restrict_to_assignments).bind(&assigned_shop_keys)
+      .bind(&order_shop_keys)
       .fetch_one(db.pool()).await?;
     let shops = shops_json(
         db.pool(),
@@ -1037,7 +1075,7 @@ async fn shops_json(
     Ok(sqlx::query_scalar::<_, Value>(
         r#"
       SELECT COALESCE(jsonb_agg(jsonb_build_object('id',shop.id,'shopKey',shop.shop_key,'name',shop.name,
-        'category',shop.category,'description',shop.description,'isActive',shop.is_active,
+        'category',shop.category,'description',shop.description,'isActive',shop.is_active,'shopOpen',shop.shop_open,
         'mealCompliance',shop.meal_compliance,'qrPayments',shop.qr_payments,'createdAt',shop.created_at,
         'updatedAt',shop.updated_at,'operators',COALESCE((SELECT jsonb_agg(jsonb_build_object(
           'userId',assignment.user_id,'assignmentRole',assignment.assignment_role) ORDER BY assignment.assignment_role,assignment.user_id)
@@ -1382,7 +1420,23 @@ async fn place_order(
         // The line is a snapshot, so it carries everything history needs to stay
         // readable after the item is edited or removed — including whether it was
         // vegetarian, which the streak screens count.
-        let item=sqlx::query_as::<_,(String,String,String,f64,bool)>("SELECT item.name,item.store,item.category,item.price::float8,item.is_vegetarian FROM campus_ops.canteen_menu_items item JOIN campus_ops.shops shop ON shop.tenant_id=item.tenant_id AND shop.shop_key=item.store AND shop.is_active WHERE item.tenant_id=$1 AND item.id=$2 AND item.is_available FOR SHARE OF item")
+        let item=sqlx::query_as::<_,(String,String,String,f64,bool)>(r#"SELECT item.name,resolved_shop.shop_key,item.category,item.price::float8,item.is_vegetarian
+          FROM campus_ops.canteen_menu_items item
+          JOIN LATERAL (
+            SELECT shop.shop_key
+            FROM campus_ops.shops shop
+            WHERE shop.tenant_id=item.tenant_id AND shop.is_active AND shop.shop_open
+              AND (shop.shop_key=item.store
+                OR lower(shop.category)=CASE
+                  WHEN lower(item.store) LIKE '%laundry%' THEN 'laundry'
+                  WHEN lower(item.store) LIKE '%station%' THEN 'stationery'
+                  ELSE 'canteen'
+                END)
+            ORDER BY CASE WHEN shop.shop_key=item.store THEN 0 ELSE 1 END,
+              shop.created_at,shop.shop_key
+            LIMIT 1
+          ) resolved_shop ON true
+          WHERE item.tenant_id=$1 AND item.id=$2 AND item.is_available FOR SHARE OF item"#)
         .bind(tenant).bind(requested.item_id).fetch_optional(&mut *tx).await?
         .ok_or_else(||ApiError::BadRequest("An item is unavailable".into()))?;
         let line_total = item.3 * f64::from(requested.quantity);
@@ -2058,6 +2112,11 @@ async fn update_canteen_staff_state(
         .is_empty()
     {
         return Err(ApiError::Forbidden);
+    }
+    if let Some(shop_open) = input.shop_open {
+        let assigned = assigned_shop_keys(db.pool(), tenant, &principal.student.id).await?;
+        sqlx::query("UPDATE campus_ops.shops SET shop_open=$3,updated_at=now() WHERE tenant_id=$1 AND shop_key = ANY($2) AND is_active")
+            .bind(tenant).bind(&assigned).bind(shop_open).execute(db.pool()).await?;
     }
     let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.canteen_staff_state(tenant_id,user_id,mode,shop_open) VALUES($1,$2,$3,$4) ON CONFLICT(tenant_id,user_id) DO UPDATE SET mode=EXCLUDED.mode,shop_open=COALESCE(EXCLUDED.shop_open,campus_ops.canteen_staff_state.shop_open),updated_at=now() RETURNING jsonb_build_object('mode',mode,'shopOpen',shop_open)")
  .bind(tenant).bind(&principal.student.id).bind(&input.mode).bind(input.shop_open).fetch_one(db.pool()).await?;

@@ -247,6 +247,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to grant wallet settings access")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0089_student_residency_management.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to grant student residency management access")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");
@@ -361,6 +367,18 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to configure wallet top-up settings")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0088_canteen_shop_availability.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to configure canteen shop availability")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0089_student_residency_management.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to configure student residency management")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;

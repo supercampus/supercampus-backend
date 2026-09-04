@@ -5316,6 +5316,17 @@ async fn attendance_summary(
             subject.code AS subject_code,
             s.held_on,
             s.period_label,
+            faculty.display_name AS faculty_name,
+            start_slot.starts_at,
+            COALESCE(block_end.ends_at, start_slot.ends_at) AS ends_at,
+            CASE
+              WHEN start_slot.starts_at IS NULL THEN NULL
+              ELSE round(EXTRACT(EPOCH FROM (
+                COALESCE(block_end.ends_at, start_slot.ends_at) - start_slot.starts_at
+              )) / 60)::int
+            END AS duration_minutes,
+            section.name AS section_name,
+            room.code AS room_code,
             s.created_at,
             e.status
           FROM campus_ops.attendance_entries e
@@ -5327,6 +5338,32 @@ async fn attendance_summary(
           LEFT JOIN core.subjects subject
             ON subject.tenant_id = offering.tenant_id
            AND subject.id = offering.subject_id
+          LEFT JOIN core.sections section
+            ON section.tenant_id = offering.tenant_id
+           AND section.id = offering.section_id
+          LEFT JOIN core.timetable_entries timetable_entry
+            ON timetable_entry.tenant_id = s.tenant_id
+           AND timetable_entry.id = s.timetable_entry_id
+          LEFT JOIN core.timetable_slots start_slot
+            ON start_slot.tenant_id = timetable_entry.tenant_id
+           AND start_slot.id = timetable_entry.slot_id
+          LEFT JOIN core.rooms room
+            ON room.tenant_id = timetable_entry.tenant_id
+           AND room.id = timetable_entry.room_id
+          LEFT JOIN LATERAL (
+            SELECT ending_slot.ends_at
+            FROM core.timetable_entries ending_entry
+            JOIN core.timetable_slots ending_slot
+              ON ending_slot.tenant_id = ending_entry.tenant_id
+             AND ending_slot.id = ending_entry.slot_id
+            WHERE ending_entry.tenant_id = timetable_entry.tenant_id
+              AND ending_entry.version_id = timetable_entry.version_id
+              AND ending_entry.session_block_id = timetable_entry.session_block_id
+              AND ending_entry.block_sequence = timetable_entry.block_length
+            LIMIT 1
+          ) block_end ON true
+          LEFT JOIN identity.users faculty
+            ON faculty.id::text = s.faculty_user_id
           WHERE e.tenant_id = $1
             AND e.student_user_id = $2
             AND s.status IN ('submitted_to_principal', 'approved')
@@ -5367,6 +5404,12 @@ async fn attendance_summary(
               'subjectName', subject_name,
               'heldOn', held_on,
               'periodLabel', period_label,
+              'facultyName', faculty_name,
+              'startsAt', starts_at,
+              'endsAt', ends_at,
+              'durationMinutes', duration_minutes,
+              'sectionName', section_name,
+              'roomCode', room_code,
               'status', status
             ) ORDER BY held_on DESC, created_at DESC)
             FROM student_records

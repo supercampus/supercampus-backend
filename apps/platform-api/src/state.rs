@@ -511,6 +511,10 @@ impl AppState {
                       ) AS department,
                       student.phone, student.email, student.status,
                       NULLIF(student.profile ->> 'photoUrl', '') AS photo_url,
+                      CASE lower(COALESCE(student.profile ->> 'residency', ''))
+                        WHEN 'hosteller' THEN 'hosteller'
+                        ELSE 'day_scholar'
+                      END AS residency,
                       student.created_at, student.updated_at
                FROM core.students student
                JOIN platform.tenants tenant ON tenant.id = student.tenant_id
@@ -538,12 +542,72 @@ impl AppState {
                     "email": row.try_get::<Option<String>, _>("email")?.unwrap_or_default(),
                     "status": row.try_get::<String, _>("status")?,
                     "photoUrl": row.try_get::<Option<String>, _>("photo_url")?,
+                    "residency": row.try_get::<String, _>("residency")?,
                     "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?,
                     "updatedAt": row.try_get::<DateTime<Utc>, _>("updated_at")?,
                 }))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(json!(students))
+    }
+
+    pub async fn set_student_residency(
+        &self,
+        tenant_slug: &str,
+        student_id: Uuid,
+        residency: &str,
+    ) -> anyhow::Result<Option<Value>> {
+        let database = self.tenant_database(tenant_slug).await?;
+        let mut transaction = database.pool().begin().await?;
+        let student = sqlx::query(
+            r#"UPDATE core.students student
+               SET profile = jsonb_set(COALESCE(student.profile, '{}'::jsonb),
+                                       '{residency}',to_jsonb($3::text),true),
+                   updated_at = now()
+               FROM platform.tenants tenant
+               WHERE tenant.id=student.tenant_id AND tenant.slug=$1 AND student.id=$2
+               RETURNING student.id,student.user_account_id,student.full_name"#,
+        )
+        .bind(tenant_slug)
+        .bind(student_id)
+        .bind(residency)
+        .fetch_optional(&mut *transaction)
+        .await
+        .context("failed to update student residency")?;
+        let Some(student) = student else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        let user_id = student.try_get::<Option<Uuid>, _>("user_account_id")?;
+        if let Some(user_id) = user_id {
+            sqlx::query(
+                r#"UPDATE identity.users SET profile=jsonb_set(COALESCE(profile,'{}'::jsonb),
+                   '{residency}',to_jsonb($2::text),true),updated_at=now() WHERE id=$1"#,
+            )
+            .bind(user_id)
+            .bind(residency)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                r#"UPDATE identity.tenant_memberships membership
+                   SET profile=jsonb_set(COALESCE(membership.profile,'{}'::jsonb),
+                     '{residency}',to_jsonb($3::text),true),updated_at=now()
+                   FROM platform.tenants tenant
+                   WHERE membership.tenant_id=tenant.id AND tenant.slug=$1
+                     AND membership.user_id=$2"#,
+            )
+            .bind(tenant_slug)
+            .bind(user_id)
+            .bind(residency)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(Some(json!({
+            "id": student.try_get::<Uuid, _>("id")?,
+            "name": student.try_get::<String, _>("full_name")?,
+            "residency": residency,
+        })))
     }
 
     pub async fn import_student_master(

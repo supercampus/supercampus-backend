@@ -21,8 +21,8 @@ use crate::{
         ForgotPasswordRequest, HealthDocument, LoginData, LoginRequest, LogoutRequest,
         NavigationItem, PutConfigurationRequest, RefreshRequest, ResetPasswordRequest,
         SaveAppStateRequest, SessionData, SessionMode, SetRolePermissionsRequest,
-        SetUserAccessRequest, StudentPhotoRequest, UpdateAuthorizationRoleRequest,
-        UpdateRecordRequest, ValidateWorkflowTransitionRequest,
+        SetUserAccessRequest, StudentPhotoRequest, StudentResidencyRequest,
+        UpdateAuthorizationRoleRequest, UpdateRecordRequest, ValidateWorkflowTransitionRequest,
     },
     realtime::RealtimePublication,
     state::{
@@ -85,6 +85,10 @@ pub fn router(state: AppState) -> Router {
         .route("/student/fees", get(list_own_student_fee_records))
         .route("/student-master/import", post(import_student_master))
         .route("/student-master/{student_id}/photo", put(set_student_photo))
+        .route(
+            "/student-master/{student_id}/residency",
+            put(set_student_residency),
+        )
         .route(
             "/payments/razorpay/orders",
             post(crate::razorpay::create_order),
@@ -684,6 +688,31 @@ async fn set_student_photo(
         .await?
         .ok_or_else(|| ApiError::NotFound("Student not found".into()))?;
 
+    Ok(Json(ApiResponse::new(updated)))
+}
+
+async fn set_student_residency(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(student_id): Path<Uuid>,
+    Json(request): Json<StudentResidencyRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "students.directory.update")?;
+    if !matches!(request.residency.as_str(), "day_scholar" | "hosteller") {
+        return Err(ApiError::BadRequest(
+            "Residency must be day_scholar or hosteller".into(),
+        ));
+    }
+    let updated = state
+        .set_student_residency(&principal.student.tenant_id, student_id, &request.residency)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Student not found".into()))?;
+    state.publish_realtime(RealtimePublication::tenant(
+        principal.student.tenant_id,
+        "student.residency.updated",
+        updated.clone(),
+    ));
     Ok(Json(ApiResponse::new(updated)))
 }
 

@@ -2875,14 +2875,15 @@ async fn gatepass_overview(
     .await?;
     let student = sqlx::query_scalar::<_, Value>(
         r#"SELECT jsonb_build_object(
-             'residency',CASE
-               WHEN lower(COALESCE(profile->>'residency',''))='hosteller'
-                 OR NULLIF(profile->>'hostel','') IS NOT NULL
+             'residency',CASE lower(COALESCE(profile->>'residency',''))
+               WHEN 'hosteller' THEN 'hosteller'
+               WHEN 'day_scholar' THEN 'day_scholar'
+               ELSE CASE WHEN NULLIF(profile->>'hostel','') IS NOT NULL
                  OR EXISTS (SELECT 1 FROM campus_ops.gatepass_requests request
                    WHERE request.tenant_id=core.students.tenant_id
                      AND request.requester_user_id=$2
                      AND request.residency='hosteller')
-               THEN 'hosteller' ELSE 'day_scholar' END,
+               THEN 'hosteller' ELSE 'day_scholar' END END,
              'hostel',NULLIF(profile->>'hostel',''),
              'room',NULLIF(profile->>'room',''))
            FROM core.students
@@ -2927,10 +2928,11 @@ async fn create_gatepass_request(
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let residency = sqlx::query_scalar::<_, String>(
         r#"SELECT COALESCE(
-             (SELECT CASE
-                WHEN lower(COALESCE(profile->>'residency',''))='hosteller'
-                  OR NULLIF(profile->>'hostel','') IS NOT NULL
-                THEN 'hosteller' ELSE 'day_scholar' END
+             (SELECT CASE lower(COALESCE(profile->>'residency',''))
+                WHEN 'hosteller' THEN 'hosteller'
+                WHEN 'day_scholar' THEN 'day_scholar'
+                ELSE CASE WHEN NULLIF(profile->>'hostel','') IS NOT NULL
+                  THEN 'hosteller' ELSE 'day_scholar' END END
               FROM core.students
               WHERE tenant_id=$1 AND (user_account_id::text=$2 OR lower(email)=lower($3))
               LIMIT 1),

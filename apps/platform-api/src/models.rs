@@ -107,6 +107,12 @@ pub struct StudentPhotoRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StudentResidencyRequest {
+    pub residency: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BulkStudentImportRequest {
     pub rows: Vec<StudentImportRow>,
 }

@@ -4791,6 +4791,7 @@ async fn attendance_session_entries(
                      'studentUserId', entry.student_user_id,
                      'studentName', entry.student_name,
                      'studentNumber', student.student_number,
+                     'photoUrl', NULLIF(student.profile ->> 'photoUrl', ''),
                      'status', entry.status,
                      'markedAt', entry.marked_at
                    )

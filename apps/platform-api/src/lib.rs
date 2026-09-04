@@ -238,6 +238,15 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to apply the gatepass manual-code release patch")?;
+        // Effective access is resolved from the control plane. Apply the
+        // permission half of the wallet settings migration here as well as in
+        // the tenant database where the actual limits are stored.
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0087_wallet_top_up_settings.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to grant wallet settings access")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");

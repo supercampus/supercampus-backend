@@ -61,6 +61,7 @@ pub struct VerifyPaymentResponse {
 }
 
 pub async fn create_order(
+    State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
     Json(request): Json<CreateOrderRequest>,
@@ -71,10 +72,31 @@ pub async fn create_order(
         .amount
         .filter(|amount| *amount >= 100)
         .ok_or_else(|| ApiError::BadRequest("amount must be at least 100 paise".into()))?;
-    if purpose == "wallet_top_up" && !(5_000..=500_000).contains(&amount) {
-        return Err(ApiError::BadRequest(
-            "Wallet top-up must be between 5000 and 500000 paise".into(),
-        ));
+    if purpose == "wallet_top_up" {
+        let database = state.tenant_database(&principal.student.tenant_id).await?;
+        let tenant_id =
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM platform.tenants WHERE slug = $1")
+                .bind(&principal.student.tenant_id)
+                .fetch_optional(database.pool())
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Tenant not found".into()))?;
+        let limits = sqlx::query_as::<_, (i64, i64)>(
+            r#"SELECT
+                 COALESCE((SELECT round(minimum_amount * 100)::bigint
+                           FROM campus_ops.wallet_top_up_settings WHERE tenant_id=$1), 5000),
+                 COALESCE((SELECT round(maximum_amount * 100)::bigint
+                           FROM campus_ops.wallet_top_up_settings WHERE tenant_id=$1), 500000)"#,
+        )
+        .bind(tenant_id)
+        .fetch_one(database.pool())
+        .await?;
+        if amount < limits.0 || amount > limits.1 {
+            return Err(ApiError::BadRequest(format!(
+                "Wallet top-up must be between {:.2} and {:.2}",
+                limits.0 as f64 / 100.0,
+                limits.1 as f64 / 100.0
+            )));
+        }
     }
     let currency = required(request.currency, "currency")?.to_ascii_uppercase();
     if currency.len() != 3 || !currency.chars().all(|value| value.is_ascii_alphabetic()) {

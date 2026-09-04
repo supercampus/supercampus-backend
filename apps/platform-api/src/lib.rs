@@ -346,6 +346,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to assign MEC HOD department authorities")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0087_wallet_top_up_settings.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to configure wallet top-up settings")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;

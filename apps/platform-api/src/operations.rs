@@ -54,6 +54,10 @@ pub fn router() -> Router<AppState> {
         .route("/canteen/orders/scan", post(scan_order))
         .route("/canteen/wallets", get(wallet_directory))
         .route("/canteen/wallet-transactions", get(wallet_transactions))
+        .route(
+            "/canteen/wallet-settings",
+            get(wallet_top_up_settings).put(update_wallet_top_up_settings),
+        )
         .route("/canteen/wallets/{user_id}/top-ups", post(top_up_wallet))
         .route("/canteen/staff-state", put(update_canteen_staff_state))
         .route(
@@ -1730,6 +1734,107 @@ struct WalletDirectoryQuery {
 #[serde(rename_all = "camelCase")]
 struct WalletTransactionQuery {
     limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WalletTopUpSettingsRequest {
+    minimum_amount: f64,
+    maximum_amount: f64,
+}
+
+async fn wallet_top_up_settings(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(
+        &access,
+        &[
+            "canteen.wallet.read",
+            "canteen.wallet.top_up",
+            "canteen.wallet.configure",
+        ],
+    )?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let value = wallet_top_up_settings_json(db.pool(), tenant).await?;
+    Ok(Json(ApiResponse::new(value)))
+}
+
+async fn update_wallet_top_up_settings(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<WalletTopUpSettingsRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "canteen.wallet.configure")?;
+    if !input.minimum_amount.is_finite()
+        || !input.maximum_amount.is_finite()
+        || input.minimum_amount < 1.0
+        || input.maximum_amount < input.minimum_amount
+        || input.maximum_amount > 100000.0
+    {
+        return Err(ApiError::BadRequest(
+            "Set a minimum of at least 1 and a maximum up to 100000".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    sqlx::query(
+        r#"INSERT INTO campus_ops.wallet_top_up_settings
+           (tenant_id,minimum_amount,maximum_amount,updated_by)
+           VALUES($1,$2,$3,$4)
+           ON CONFLICT(tenant_id) DO UPDATE SET
+             minimum_amount=EXCLUDED.minimum_amount,
+             maximum_amount=EXCLUDED.maximum_amount,
+             updated_by=EXCLUDED.updated_by,
+             updated_at=now()"#,
+    )
+    .bind(tenant)
+    .bind(input.minimum_amount)
+    .bind(input.maximum_amount)
+    .bind(&principal.student.id)
+    .execute(db.pool())
+    .await?;
+    let value = wallet_top_up_settings_json(db.pool(), tenant).await?;
+    emit(
+        &state,
+        &principal.student.tenant_id,
+        db.pool(),
+        tenant,
+        "canteen",
+        "wallet_settings",
+        &tenant.to_string(),
+        "wallet.settings.updated",
+        &principal.student.id,
+        &value,
+    )
+    .await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "canteen",
+        "wallet_settings",
+        &tenant.to_string(),
+        "wallet.settings.updated",
+    );
+    Ok(Json(ApiResponse::new(value)))
+}
+
+async fn wallet_top_up_settings_json(pool: &sqlx::PgPool, tenant: Uuid) -> ApiResult<Value> {
+    Ok(sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+             'minimumAmount', minimum_amount::float8,
+             'maximumAmount', maximum_amount::float8,
+             'updatedBy', updated_by,
+             'updatedAt', updated_at)
+           FROM campus_ops.wallet_top_up_settings WHERE tenant_id=$1"#,
+    )
+    .bind(tenant)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or_else(|| json!({"minimumAmount":50.0,"maximumAmount":5000.0})))
 }
 
 async fn wallet_directory(

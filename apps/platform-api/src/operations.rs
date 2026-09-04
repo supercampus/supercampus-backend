@@ -4325,8 +4325,61 @@ async fn advisor_student_assessments(
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     ensure_advisor_owns_student(db.pool(), tenant, &principal.student.id, student_id).await?;
 
+    // Keep the advisor's per-student view consistent with what the learner
+    // sees by including rows submitted through the official bulk template.
     let assessments = sqlx::query_scalar::<_, Value>(
-        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        r#"WITH student_profile AS (
+             SELECT id, student_number
+             FROM core.students
+             WHERE tenant_id = $1 AND id = $2
+           ), visible_marks AS (
+             SELECT mark.id::text AS id,
+                    mark.assessment_kind,
+                    mark.title,
+                    mark.semester,
+                    mark.marks_obtained,
+                    mark.maximum_marks,
+                    mark.notes,
+                    mark.assessed_on,
+                    mark.updated_at,
+                    mark.created_at
+             FROM core.student_assessment_marks mark
+             WHERE mark.tenant_id = $1 AND mark.student_id = $2
+
+             UNION ALL
+
+             SELECT batch.id::text || ':' || entry.ordinality::text AS id,
+                    CASE lower(batch.assessment_type)
+                      WHEN 'internal' THEN 'internal'
+                      WHEN 'semester' THEN 'semester'
+                      ELSE 'test'
+                    END AS assessment_kind,
+                    batch.subject_name AS title,
+                    NULL::smallint AS semester,
+                    (entry.value ->> 'marksObtained')::double precision AS marks_obtained,
+                    COALESCE(
+                      NULLIF(entry.value ->> 'maximumMarks', '')::double precision,
+                      batch.maximum_marks
+                    ) AS maximum_marks,
+                    NULLIF(entry.value ->> 'remarks', '') AS notes,
+                    COALESCE(
+                      NULLIF(entry.value ->> 'assessedOn', '')::date,
+                      batch.created_at::date
+                    ) AS assessed_on,
+                    batch.updated_at,
+                    batch.created_at
+             FROM core.marks_batches batch
+             CROSS JOIN LATERAL jsonb_array_elements(batch.entries)
+               WITH ORDINALITY AS entry(value, ordinality)
+             CROSS JOIN student_profile student
+             WHERE batch.tenant_id = $1
+               AND batch.status IN ('submitted_to_hod', 'submitted_to_principal', 'approved')
+               AND (
+                 NULLIF(trim(entry.value ->> 'studentId'), '') = student.id::text
+                 OR lower(trim(entry.value ->> 'registerNumber')) = lower(student.student_number)
+               )
+           )
+           SELECT COALESCE(jsonb_agg(jsonb_build_object(
              'id', mark.id,
              'assessmentKind', mark.assessment_kind,
              'title', mark.title,
@@ -4339,8 +4392,7 @@ async fn advisor_student_assessments(
            ) ORDER BY mark.semester DESC NULLS LAST,
                       mark.assessed_on DESC NULLS LAST,
                       mark.created_at DESC), '[]'::jsonb)
-           FROM core.student_assessment_marks mark
-           WHERE mark.tenant_id = $1 AND mark.student_id = $2"#,
+           FROM visible_marks mark"#,
     )
     .bind(tenant)
     .bind(student_id)
@@ -4474,8 +4526,63 @@ async fn student_assessments(
     .await?
     .ok_or_else(|| ApiError::NotFound("Student profile not found".into()))?;
 
+    // Advisor CSV uploads live in marks_batches while individually entered
+    // assessments live in student_assessment_marks.  Read both sources so a
+    // submitted spreadsheet reaches the learner. Register-number matching
+    // covers the official template where Student ID is optional.
     let assessments = sqlx::query_scalar::<_, Value>(
-        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        r#"WITH student_profile AS (
+             SELECT id, student_number
+             FROM core.students
+             WHERE tenant_id = $1 AND id = $2
+           ), visible_marks AS (
+             SELECT mark.id::text AS id,
+                    mark.assessment_kind,
+                    mark.title,
+                    mark.semester,
+                    mark.marks_obtained,
+                    mark.maximum_marks,
+                    mark.notes,
+                    mark.assessed_on,
+                    mark.updated_at,
+                    mark.created_at
+             FROM core.student_assessment_marks mark
+             WHERE mark.tenant_id = $1 AND mark.student_id = $2
+
+             UNION ALL
+
+             SELECT batch.id::text || ':' || entry.ordinality::text AS id,
+                    CASE lower(batch.assessment_type)
+                      WHEN 'internal' THEN 'internal'
+                      WHEN 'semester' THEN 'semester'
+                      ELSE 'test'
+                    END AS assessment_kind,
+                    batch.subject_name AS title,
+                    NULL::smallint AS semester,
+                    (entry.value ->> 'marksObtained')::double precision AS marks_obtained,
+                    COALESCE(
+                      NULLIF(entry.value ->> 'maximumMarks', '')::double precision,
+                      batch.maximum_marks
+                    ) AS maximum_marks,
+                    NULLIF(entry.value ->> 'remarks', '') AS notes,
+                    COALESCE(
+                      NULLIF(entry.value ->> 'assessedOn', '')::date,
+                      batch.created_at::date
+                    ) AS assessed_on,
+                    batch.updated_at,
+                    batch.created_at
+             FROM core.marks_batches batch
+             CROSS JOIN LATERAL jsonb_array_elements(batch.entries)
+               WITH ORDINALITY AS entry(value, ordinality)
+             CROSS JOIN student_profile student
+             WHERE batch.tenant_id = $1
+               AND batch.status IN ('submitted_to_hod', 'submitted_to_principal', 'approved')
+               AND (
+                 NULLIF(trim(entry.value ->> 'studentId'), '') = student.id::text
+                 OR lower(trim(entry.value ->> 'registerNumber')) = lower(student.student_number)
+               )
+           )
+           SELECT COALESCE(jsonb_agg(jsonb_build_object(
              'id', mark.id,
              'assessmentKind', mark.assessment_kind,
              'title', mark.title,
@@ -4488,8 +4595,7 @@ async fn student_assessments(
            ) ORDER BY mark.semester DESC NULLS LAST,
                       mark.assessed_on DESC NULLS LAST,
                       mark.created_at DESC), '[]'::jsonb)
-           FROM core.student_assessment_marks mark
-           WHERE mark.tenant_id = $1 AND mark.student_id = $2"#,
+           FROM visible_marks mark"#,
     )
     .bind(tenant)
     .bind(student_id)

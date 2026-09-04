@@ -3938,9 +3938,7 @@ async fn review_attendance_session(
             "Decision must be approve, enquire, or reject".into(),
         ));
     }
-    let actor_role = if access.roles.iter().any(|role| role == "principal") {
-        "principal"
-    } else if access.roles.iter().any(|role| role == "hod") {
+    let actor_role = if access.roles.iter().any(|role| role == "hod") {
         "hod"
     } else if access.roles.iter().any(|role| role == "class_advisor") {
         "class_advisor"
@@ -3949,14 +3947,12 @@ async fn review_attendance_session(
     };
     let expected = match actor_role {
         "class_advisor" => "submitted_to_advisor",
-        "hod" => "submitted_to_hod",
-        _ => "submitted_to_principal",
+        _ => "submitted_to_hod",
     };
     let next = if input.decision == "approve" {
         match actor_role {
             "class_advisor" => "submitted_to_hod",
-            "hod" => "submitted_to_principal",
-            _ => "approved",
+            _ => "submitted_to_principal",
         }
     } else {
         "returned"
@@ -4100,7 +4096,7 @@ async fn attendance_summary(
            AND subject.id = offering.subject_id
           WHERE e.tenant_id = $1
             AND e.student_user_id = $2
-            AND s.status = 'approved'
+            AND s.status IN ('submitted_to_principal', 'approved')
         ),
         subject_totals AS (
           SELECT

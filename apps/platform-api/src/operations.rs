@@ -52,6 +52,13 @@ pub fn router() -> Router<AppState> {
             put(update_order_status),
         )
         .route("/canteen/orders/scan", post(scan_order))
+        .route("/canteen/laundry/settings", put(update_laundry_settings))
+        .route("/canteen/laundry/charges", post(create_laundry_charge))
+        .route("/canteen/laundry/charges/claim", post(claim_laundry_charge))
+        .route(
+            "/canteen/laundry/charges/{charge_id}/pay",
+            post(pay_laundry_charge),
+        )
         .route("/canteen/wallets", get(wallet_directory))
         .route("/canteen/wallet-transactions", get(wallet_transactions))
         .route(
@@ -825,8 +832,47 @@ async fn canteen_store(
         restrict_to_assignments.then_some(&assigned_shop_keys),
     )
     .await?;
+    let laundry_price_per_kg = sqlx::query_scalar::<_, f64>(
+        "SELECT COALESCE((SELECT price_per_kg::float8 FROM campus_ops.laundry_settings WHERE tenant_id=$1 AND shop_key='mec-laundry'),0)",
+    )
+    .bind(tenant)
+    .fetch_one(db.pool())
+    .await?;
+    let laundry_charges = if can_manage && assigned_shop_keys.iter().any(|key| key == "mec-laundry")
+    {
+        sqlx::query_scalar::<_, Value>(
+            r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'id',id,'serviceType',service_type,'name',name,'description',description,
+                 'quantity',quantity::float8,'unitLabel',unit_label,'unitPrice',unit_price::float8,
+                 'total',total::float8,'status',status,'claimedBy',claimed_by,
+                 'createdAt',created_at,'claimedAt',claimed_at,'paidAt',paid_at)
+                 ORDER BY created_at DESC),'[]'::jsonb)
+               FROM campus_ops.laundry_charges
+               WHERE tenant_id=$1 AND shop_key='mec-laundry'"#,
+        )
+        .bind(tenant)
+        .fetch_one(db.pool())
+        .await?
+    } else {
+        sqlx::query_scalar::<_, Value>(
+            r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'id',id,'serviceType',service_type,'name',name,'description',description,
+                 'quantity',quantity::float8,'unitLabel',unit_label,'unitPrice',unit_price::float8,
+                 'total',total::float8,'status',status,'createdAt',created_at,
+                 'claimedAt',claimed_at,'paidAt',paid_at)
+                 ORDER BY created_at DESC),'[]'::jsonb)
+               FROM campus_ops.laundry_charges
+               WHERE tenant_id=$1 AND claimed_by=$2"#,
+        )
+        .bind(tenant)
+        .bind(&principal.student.id)
+        .fetch_one(db.pool())
+        .await?
+    };
     if let Some(object) = data.as_object_mut() {
         object.insert("shops".into(), shops);
+        object.insert("laundryPricePerKg".into(), json!(laundry_price_per_kg));
+        object.insert("laundryCharges".into(), laundry_charges);
         object.insert("assignedShopKeys".into(), json!(assigned_shop_keys));
         object.insert(
             "capabilities".into(),
@@ -1588,6 +1634,299 @@ fn shop_label(store: &str) -> String {
             .collect::<Vec<_>>()
             .join(" "),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaundrySettingsRequest {
+    price_per_kg: f64,
+}
+
+async fn update_laundry_settings(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<LaundrySettingsRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "canteen.menu.update")?;
+    if !input.price_per_kg.is_finite() || input.price_per_kg <= 0.0 || input.price_per_kg > 10_000.0
+    {
+        return Err(ApiError::BadRequest(
+            "Enter a valid laundry price per kg".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    require_assigned_shop(
+        db.pool(),
+        tenant,
+        &principal.student.id,
+        "mec-laundry",
+        &access,
+    )
+    .await?;
+    let price = (input.price_per_kg * 100.0).round() / 100.0;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.laundry_settings(tenant_id,shop_key,price_per_kg,updated_by)
+           VALUES($1,'mec-laundry',$2,$3)
+           ON CONFLICT(tenant_id,shop_key) DO UPDATE SET
+             price_per_kg=EXCLUDED.price_per_kg,updated_by=EXCLUDED.updated_by,updated_at=now()
+           RETURNING jsonb_build_object('pricePerKg',price_per_kg::float8,'updatedAt',updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(price)
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(value)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaundryChargeRequest {
+    service_type: String,
+    name: String,
+    #[serde(default)]
+    description: String,
+    quantity: f64,
+    price: Option<f64>,
+}
+
+async fn create_laundry_charge(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<LaundryChargeRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require(&access, "canteen.menu.create")?;
+    if !matches!(input.service_type.as_str(), "wash" | "ironing")
+        || input.name.trim().is_empty()
+        || !input.quantity.is_finite()
+        || input.quantity <= 0.0
+        || input.quantity > 1_000.0
+    {
+        return Err(ApiError::BadRequest(
+            "Enter valid laundry charge details".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    require_assigned_shop(
+        db.pool(),
+        tenant,
+        &principal.student.id,
+        "mec-laundry",
+        &access,
+    )
+    .await?;
+    let (unit_label, unit_price, total) = if input.service_type == "wash" {
+        let rate = sqlx::query_scalar::<_, f64>(
+            "SELECT COALESCE((SELECT price_per_kg::float8 FROM campus_ops.laundry_settings WHERE tenant_id=$1 AND shop_key='mec-laundry'),0)",
+        )
+        .bind(tenant)
+        .fetch_one(db.pool())
+        .await?;
+        if rate <= 0.0 {
+            return Err(ApiError::Conflict(
+                "Set the wash price per kg before generating a QR".into(),
+            ));
+        }
+        ("kg", rate, (rate * input.quantity * 100.0).round() / 100.0)
+    } else {
+        let price = input
+            .price
+            .filter(|price| price.is_finite() && *price > 0.0 && *price <= 100_000.0)
+            .ok_or_else(|| ApiError::BadRequest("Enter the ironing price".into()))?;
+        let total = (price * 100.0).round() / 100.0;
+        ("clothes", total / input.quantity, total)
+    };
+    let raw_token = Uuid::new_v4().to_string();
+    let qr_payload = format!("supercampus://laundry/{raw_token}");
+    let charge = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.laundry_charges
+           (tenant_id,shop_key,service_type,name,description,quantity,unit_label,
+            unit_price,total,qr_token_hash,created_by)
+           VALUES($1,'mec-laundry',$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           RETURNING jsonb_build_object('id',id,'serviceType',service_type,'name',name,
+             'description',description,'quantity',quantity::float8,'unitLabel',unit_label,
+             'unitPrice',unit_price::float8,'total',total::float8,'status',status,
+             'qrPayload',$11::text,'createdAt',created_at)"#,
+    )
+    .bind(tenant)
+    .bind(&input.service_type)
+    .bind(input.name.trim())
+    .bind(input.description.trim())
+    .bind(input.quantity)
+    .bind(unit_label)
+    .bind(unit_price)
+    .bind(total)
+    .bind(token_hash(&qr_payload))
+    .bind(&principal.student.id)
+    .bind(&qr_payload)
+    .fetch_one(db.pool())
+    .await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "canteen",
+        "laundry_charge",
+        charge["id"].as_str().unwrap_or_default(),
+        "laundry.charge.created",
+    );
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(charge))))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaundryClaimRequest {
+    qr_payload: String,
+}
+
+async fn claim_laundry_charge(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<LaundryClaimRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "canteen.order.create")?;
+    let payload = input.qr_payload.trim();
+    if !payload.starts_with("supercampus://laundry/") {
+        return Err(ApiError::BadRequest(
+            "This is not a laundry payment QR".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let current = sqlx::query_as::<_, (Uuid, String, Option<String>)>(
+        "SELECT id,status,claimed_by FROM campus_ops.laundry_charges WHERE tenant_id=$1 AND qr_token_hash=$2 FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(token_hash(payload))
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Laundry QR is invalid or unavailable".into()))?;
+    if current.1 == "paid" || current.1 == "cancelled" {
+        return Err(ApiError::Conflict(
+            "This laundry QR is no longer payable".into(),
+        ));
+    }
+    if current
+        .2
+        .as_deref()
+        .is_some_and(|user| user != principal.student.id)
+    {
+        return Err(ApiError::Conflict(
+            "This laundry QR has already been claimed".into(),
+        ));
+    }
+    let charge = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.laundry_charges SET claimed_by=$3,claimed_at=COALESCE(claimed_at,now()),
+             status='claimed',updated_at=now() WHERE tenant_id=$1 AND id=$2
+           RETURNING jsonb_build_object('id',id,'serviceType',service_type,'name',name,
+             'description',description,'quantity',quantity::float8,'unitLabel',unit_label,
+             'unitPrice',unit_price::float8,'total',total::float8,'status',status,
+             'claimedAt',claimed_at,'createdAt',created_at)"#,
+    )
+    .bind(tenant)
+    .bind(current.0)
+    .bind(&principal.student.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "canteen",
+        "laundry_charge",
+        &current.0.to_string(),
+        "laundry.charge.claimed",
+    );
+    Ok(Json(ApiResponse::new(charge)))
+}
+
+async fn pay_laundry_charge(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(charge_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "canteen.order.create")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let charge = sqlx::query_as::<_, (String, String, f64)>(
+        "SELECT status,claimed_by,total::float8 FROM campus_ops.laundry_charges WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(charge_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Laundry charge not found".into()))?;
+    if charge.1 != principal.student.id {
+        return Err(ApiError::Forbidden);
+    }
+    if charge.0 == "paid" {
+        return Err(ApiError::Conflict(
+            "This laundry charge is already paid".into(),
+        ));
+    }
+    if charge.0 != "claimed" {
+        return Err(ApiError::Conflict(
+            "This laundry charge cannot be paid".into(),
+        ));
+    }
+    sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
+        .bind(tenant).bind(&principal.student.id).execute(&mut *tx).await?;
+    let balance = sqlx::query_scalar::<_, f64>(
+        "SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE",
+    )
+    .bind(tenant).bind(&principal.student.id).fetch_one(&mut *tx).await?;
+    if balance + 0.0001 < charge.2 {
+        return Err(ApiError::Conflict("Wallet balance is insufficient".into()));
+    }
+    let new_balance = sqlx::query_scalar::<_, f64>(
+        "UPDATE campus_ops.canteen_wallets SET balance=balance-$3,version=version+1,updated_at=now() WHERE tenant_id=$1 AND user_id=$2 RETURNING balance::float8",
+    )
+    .bind(tenant).bind(&principal.student.id).bind(charge.2).fetch_one(&mut *tx).await?;
+    let transaction = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.canteen_wallet_transactions
+           (tenant_id,user_id,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id)
+           VALUES($1,$2,$3,'order_debit','Campus Laundry payment',$4,$5,$2)
+           RETURNING jsonb_build_object('id',id,'amount',amount::float8,
+             'transactionType',transaction_type,'description',description,
+             'referenceId',reference_id,'createdAt',created_at)"#,
+    )
+    .bind(tenant).bind(&principal.student.id).bind(-charge.2).bind(charge_id.to_string())
+    .bind(format!("laundry-payment-{charge_id}"))
+    .fetch_one(&mut *tx).await?;
+    let transaction_id = Uuid::parse_str(transaction["id"].as_str().unwrap_or_default())
+        .map_err(|_| ApiError::Internal)?;
+    let paid_charge = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.laundry_charges SET status='paid',paid_at=now(),
+             wallet_transaction_id=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2
+           RETURNING jsonb_build_object('id',id,'serviceType',service_type,'name',name,
+             'description',description,'quantity',quantity::float8,'unitLabel',unit_label,
+             'unitPrice',unit_price::float8,'total',total::float8,'status',status,
+             'paidAt',paid_at,'createdAt',created_at)"#,
+    )
+    .bind(tenant)
+    .bind(charge_id)
+    .bind(transaction_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "canteen",
+        "laundry_charge",
+        &charge_id.to_string(),
+        "laundry.charge.paid",
+    );
+    Ok(Json(ApiResponse::new(
+        json!({"balance":new_balance,"charge":paid_charge,"transaction":transaction}),
+    )))
 }
 
 #[derive(Deserialize)]

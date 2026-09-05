@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
         "apply-announcement-format" => apply_announcement_format().await,
         "apply-gatepass-manual-codes" => apply_gatepass_manual_codes().await,
         "apply-canteen-shop-availability" => apply_canteen_shop_availability().await,
+        "apply-laundry-charge-workflow" => apply_laundry_charge_workflow().await,
         "align-mec-canteen-owner" => align_mec_canteen_owner().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
@@ -57,6 +58,45 @@ async fn main() -> anyhow::Result<()> {
             "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, apply-parent-warden-gatepass-portals, apply-canteen-shop-availability, align-mec-canteen-owner, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
+}
+
+async fn apply_laundry_charge_workflow() -> anyhow::Result<()> {
+    const SQL: &str = include_str!("../../../migrations/runtime/0090_laundry_charge_workflow.sql");
+    apply_to_control_and_tenants(SQL, "laundry charge workflow").await
+}
+
+async fn apply_to_control_and_tenants(sql: &str, label: &str) -> anyhow::Result<()> {
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    sqlx::raw_sql(sql)
+        .execute(control.pool())
+        .await
+        .with_context(|| format!("failed to apply {label} to the control plane"))?;
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug,registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id=registry.tenant_id
+           WHERE registry.status='active' AND tenant.status='active' ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await?;
+    let base_options =
+        PgConnectOptions::from_str(&control_url).context("invalid CONTROL_DATABASE_URL")?;
+    for (slug, database_name) in &databases {
+        validate_database_name(database_name)?;
+        let tenant = Database::connect_options(base_options.clone().database(database_name), 2)
+            .await
+            .with_context(|| format!("failed to connect tenant {slug} database"))?;
+        sqlx::raw_sql(sql)
+            .execute(tenant.pool())
+            .await
+            .with_context(|| format!("failed to apply {label} to {slug}"))?;
+    }
+    println!(
+        "applied {label} to control and {} tenant database(s)",
+        databases.len()
+    );
+    Ok(())
 }
 
 /// Adds the shared shop availability flag before the API starts reading it.

@@ -16,4 +16,4 @@ ENV HTTP_PORT=4000
 USER supercampus
 EXPOSE 4000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD curl --fail http://127.0.0.1:4000/health || exit 1
-ENTRYPOINT ["sh", "-c", "supercampus-migration-runner apply-stationery-inventory-pricing && supercampus-migration-runner apply-leave-pass-approval-matrix && supercampus-migration-runner apply-librarian-operations && supercampus-migration-runner apply-canteen-shop-availability && supercampus-migration-runner align-mec-canteen-owner && exec supercampus-platform-api"]
+ENTRYPOINT ["sh", "-c", "supercampus-migration-runner apply-stationery-inventory-pricing && supercampus-migration-runner apply-leave-pass-approval-matrix && supercampus-migration-runner apply-librarian-operations && supercampus-migration-runner apply-canteen-shop-availability && supercampus-migration-runner apply-laundry-charge-workflow && supercampus-migration-runner align-mec-canteen-owner && exec supercampus-platform-api"]

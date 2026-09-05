@@ -35,6 +35,50 @@ CREATE INDEX IF NOT EXISTS laundry_charges_student_idx
 CREATE INDEX IF NOT EXISTS laundry_charges_shop_idx
     ON campus_ops.laundry_charges (tenant_id, shop_key, created_at DESC);
 
+-- Laundry operators need a stable role in every database copy. Some tenant
+-- databases intentionally do not carry the legacy generic `owner` role, so do
+-- not make the workflow depend on that control-plane-only role.
+INSERT INTO authz.roles
+    (tenant_id, role_key, name, team, scope_description, portal_family,
+     protected, created_by, updated_by)
+SELECT tenant.id, 'laundry_operator', 'Laundry operator', 'Vendors',
+       'Creates laundry charges and manages the assigned laundry counter',
+       'staff', false, 'runtime-migration-0090', 'runtime-migration-0090'
+FROM platform.tenants tenant
+ON CONFLICT (tenant_id, role_key) DO UPDATE SET
+    name=EXCLUDED.name,
+    team=EXCLUDED.team,
+    scope_description=EXCLUDED.scope_description,
+    portal_family='staff',
+    active=true,
+    updated_by='runtime-migration-0090',
+    updated_at=now();
+
+INSERT INTO authz.role_surfaces(tenant_id,role_id,surface,enabled_by)
+SELECT role.tenant_id,role.id,'app','runtime-migration-0090'
+FROM authz.roles role
+WHERE role.role_key='laundry_operator' AND role.active
+ON CONFLICT(tenant_id,role_id,surface) DO NOTHING;
+
+INSERT INTO authz.role_permissions
+    (tenant_id,role_id,permission_key,surface,scope,constraints,granted_by)
+SELECT role.tenant_id,role.id,permission.permission_key,'app','assigned',
+       '{}'::jsonb,'runtime-migration-0090'
+FROM authz.roles role
+JOIN authz.permission_definitions permission
+  ON permission.tenant_id=role.tenant_id
+ AND permission.permission_key IN (
+     'canteen.menu.read','canteen.menu.create','canteen.menu.update',
+     'canteen.order.read','canteen.analytics.read'
+ )
+ AND permission.active
+WHERE role.role_key='laundry_operator' AND role.active
+ON CONFLICT(tenant_id,role_id,surface,permission_key) DO UPDATE SET
+    scope=EXCLUDED.scope,
+    constraints=EXCLUDED.constraints,
+    granted_by=EXCLUDED.granted_by,
+    granted_at=now();
+
 DO $$
 DECLARE
     mec_tenant uuid;
@@ -79,9 +123,9 @@ BEGIN
     RETURNING id INTO laundry_user;
 
     SELECT id INTO owner_role FROM authz.roles
-      WHERE tenant_id=mec_tenant AND role_key='owner' AND active LIMIT 1;
+      WHERE tenant_id=mec_tenant AND role_key='laundry_operator' AND active LIMIT 1;
     IF owner_role IS NULL THEN
-        RAISE EXCEPTION 'MEC owner role is unavailable';
+        RAISE EXCEPTION 'MEC laundry operator role is unavailable';
     END IF;
 
     UPDATE identity.tenant_memberships SET is_primary=false,updated_at=now()
@@ -89,7 +133,7 @@ BEGIN
     INSERT INTO identity.tenant_memberships
         (tenant_id,user_id,roles,active,is_primary,profile)
     VALUES
-        (mec_tenant,laundry_user,ARRAY['owner']::text[],true,true,
+        (mec_tenant,laundry_user,ARRAY['laundry_operator']::text[],true,true,
          '{"shop":"Campus Laundry","post":"owner","team":"Vendors"}'::jsonb)
     ON CONFLICT(tenant_id,user_id) DO UPDATE SET
         roles=EXCLUDED.roles,active=true,is_primary=true,

@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
         "apply-announcement-format" => apply_announcement_format().await,
         "apply-gatepass-manual-codes" => apply_gatepass_manual_codes().await,
         "apply-canteen-shop-availability" => apply_canteen_shop_availability().await,
+        "align-mec-canteen-owner" => align_mec_canteen_owner().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
@@ -53,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
             provision_tenant(tenant_slug, database_name).await
         }
         command => bail!(
-            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, apply-parent-warden-gatepass-portals, apply-canteen-shop-availability, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
+            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, apply-parent-warden-gatepass-portals, apply-canteen-shop-availability, align-mec-canteen-owner, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
 }
@@ -95,6 +96,186 @@ async fn apply_canteen_shop_availability() -> anyhow::Result<()> {
     println!(
         "applied canteen shop availability to control and {} tenant database(s)",
         databases.len()
+    );
+    Ok(())
+}
+
+/// Routes the production canteen owner account into MEC and carries over any
+/// menu photographs it saved while the account was attached to a legacy
+/// tenant. This keeps the owner queue and the student storefront on one data
+/// set without changing the user's credentials.
+async fn align_mec_canteen_owner() -> anyhow::Result<()> {
+    const OWNER_EMAIL: &str = "akhil@gmail.com";
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    let owner_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM identity.users WHERE lower(email)=lower($1) AND active LIMIT 1",
+    )
+    .bind(OWNER_EMAIL)
+    .fetch_one(control.pool())
+    .await
+    .context("failed to resolve the Akhil canteen owner identity")?;
+    let mec_tenant_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM platform.tenants WHERE slug='mec' AND status='active'",
+    )
+    .fetch_one(control.pool())
+    .await
+    .context("failed to resolve the MEC tenant")?;
+    let owner_role_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM authz.roles WHERE tenant_id=$1 AND role_key='owner' AND active LIMIT 1",
+    )
+    .bind(mec_tenant_id)
+    .fetch_one(control.pool())
+    .await
+    .context("failed to resolve the MEC shop owner role")?;
+    let already_primary_in_mec = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM identity.tenant_memberships WHERE tenant_id=$1 AND user_id=$2 AND active AND is_primary)",
+    )
+    .bind(mec_tenant_id)
+    .bind(owner_id)
+    .fetch_one(control.pool())
+    .await?;
+
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug,registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id=registry.tenant_id
+           WHERE registry.status='active' AND tenant.status='active' ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await
+    .context("failed to list tenant databases")?;
+    let base_options =
+        PgConnectOptions::from_str(&control_url).context("invalid CONTROL_DATABASE_URL")?;
+    let mut uploaded_images = Vec::<(String, String)>::new();
+    if !already_primary_in_mec {
+        for (slug, database_name) in &databases {
+            if slug == "mec" {
+                continue;
+            }
+            validate_database_name(database_name)?;
+            let source = Database::connect_options(base_options.clone().database(database_name), 2)
+                .await
+                .with_context(|| format!("failed to connect tenant {slug} database"))?;
+            let mut images = sqlx::query_as::<_, (String, String)>(
+                r#"SELECT lower(item.name),item.image_url
+                   FROM campus_ops.canteen_menu_items item
+                   JOIN campus_ops.shops shop
+                     ON shop.tenant_id=item.tenant_id AND shop.shop_key=item.store
+                   JOIN campus_ops.shop_user_assignments assignment
+                     ON assignment.tenant_id=shop.tenant_id AND assignment.shop_id=shop.id
+                   WHERE assignment.user_id=$1 AND assignment.is_active
+                     AND item.image_url IS NOT NULL AND btrim(item.image_url)<>''"#,
+            )
+            .bind(owner_id.to_string())
+            .fetch_all(source.pool())
+            .await
+            .with_context(|| format!("failed to read Akhil menu images from {slug}"))?;
+            uploaded_images.append(&mut images);
+        }
+    }
+
+    let mec_database_name = databases
+        .iter()
+        .find_map(|(slug, name)| (slug == "mec").then_some(name))
+        .context("the MEC tenant database is not registered")?;
+    validate_database_name(mec_database_name)?;
+    let mec = Database::connect_options(base_options.database(mec_database_name), 2)
+        .await
+        .context("failed to connect the MEC tenant database")?;
+    let (shop_id, shop_key) = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        r#"SELECT shop.id,shop.shop_key FROM campus_ops.shops shop
+           WHERE shop.tenant_id=$1 AND (shop.shop_key IN ('mec-canteen','classic')
+             OR lower(shop.category)='canteen')
+           ORDER BY CASE WHEN shop.shop_key='mec-canteen' THEN 0
+                         WHEN shop.shop_key='classic' THEN 1 ELSE 2 END,
+                    shop.created_at LIMIT 1"#,
+    )
+    .bind(mec_tenant_id)
+    .fetch_one(mec.pool())
+    .await
+    .context("failed to resolve the MEC canteen shop")?;
+
+    sqlx::query(
+        r#"INSERT INTO campus_ops.shop_user_assignments
+           (tenant_id,shop_id,user_id,assignment_role,is_active,assigned_by)
+           VALUES($1,$2,$3,'owner',true,'runtime-align-mec-owner')
+           ON CONFLICT(tenant_id,shop_id,user_id) DO UPDATE SET
+             assignment_role='owner',is_active=true,
+             assigned_by='runtime-align-mec-owner',updated_at=now()"#,
+    )
+    .bind(mec_tenant_id)
+    .bind(shop_id)
+    .bind(owner_id.to_string())
+    .execute(mec.pool())
+    .await
+    .context("failed to assign Akhil to the MEC canteen")?;
+    sqlx::query(
+        r#"INSERT INTO campus_ops.canteen_staff_state(tenant_id,user_id,mode,shop_open)
+           VALUES($1,$2,'work',true) ON CONFLICT(tenant_id,user_id) DO UPDATE SET
+           mode='work',updated_at=now()"#,
+    )
+    .bind(mec_tenant_id)
+    .bind(owner_id.to_string())
+    .execute(mec.pool())
+    .await
+    .context("failed to initialize Akhil's MEC canteen state")?;
+    for (item_name, image_url) in &uploaded_images {
+        sqlx::query(
+            r#"UPDATE campus_ops.canteen_menu_items SET image_url=$3,updated_at=now()
+               WHERE tenant_id=$1 AND lower(name)=$2
+                 AND store IN ($4,'classic','mec-canteen')"#,
+        )
+        .bind(mec_tenant_id)
+        .bind(item_name)
+        .bind(image_url)
+        .bind(&shop_key)
+        .execute(mec.pool())
+        .await
+        .with_context(|| format!("failed to copy the {item_name} image into MEC"))?;
+    }
+
+    let mut transaction = control.pool().begin().await?;
+    sqlx::query("UPDATE identity.tenant_memberships SET is_primary=false,updated_at=now() WHERE user_id=$1 AND is_primary")
+        .bind(owner_id).execute(&mut *transaction).await?;
+    sqlx::query(
+        r#"INSERT INTO identity.tenant_memberships
+           (tenant_id,user_id,roles,active,is_primary,profile)
+           VALUES($1,$2,ARRAY['owner']::text[],true,true,
+             jsonb_build_object('shop','Campus Canteen','post','owner','team','Vendors'))
+           ON CONFLICT(tenant_id,user_id) DO UPDATE SET roles=EXCLUDED.roles,
+             active=true,is_primary=true,
+             profile=identity.tenant_memberships.profile || EXCLUDED.profile,
+             updated_at=now()"#,
+    )
+    .bind(mec_tenant_id)
+    .bind(owner_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("DELETE FROM authz.user_roles WHERE tenant_id=$1 AND user_id=$2")
+        .bind(mec_tenant_id)
+        .bind(owner_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(
+        r#"INSERT INTO authz.user_roles(tenant_id,user_id,role_id,assigned_by)
+           VALUES($1,$2,$3,'runtime-align-mec-owner')
+           ON CONFLICT(tenant_id,user_id,role_id) DO NOTHING"#,
+    )
+    .bind(mec_tenant_id)
+    .bind(owner_id)
+    .bind(owner_role_id)
+    .execute(&mut *transaction)
+    .await?;
+    if !already_primary_in_mec {
+        sqlx::query("UPDATE identity.auth_sessions SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=$1::text")
+            .bind(owner_id.to_string()).execute(&mut *transaction).await?;
+    }
+    transaction.commit().await?;
+
+    println!(
+        "aligned {OWNER_EMAIL} with the MEC canteen and copied {} uploaded image(s)",
+        uploaded_images.len()
     );
     Ok(())
 }

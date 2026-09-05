@@ -721,7 +721,13 @@ async fn canteen_store(
     )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let assigned_shop_keys = assigned_shop_keys(db.pool(), tenant, &principal.student.id).await?;
+    let assigned_shop_keys = assigned_shop_keys(
+        db.pool(),
+        tenant,
+        &principal.student.id,
+        &principal.student.email,
+    )
+    .await?;
     // Older menu rows may still carry a legacy store key while the shop shown
     // to operators uses the tenant-configured key. Expand only through the
     // same deterministic resolver used by the menu payload so assigned
@@ -1142,15 +1148,21 @@ async fn assigned_shop_keys(
     pool: &sqlx::PgPool,
     tenant: Uuid,
     user_id: &str,
+    user_email: &str,
 ) -> ApiResult<Vec<String>> {
     Ok(sqlx::query_scalar::<_, String>(
         r#"SELECT shop.shop_key FROM campus_ops.shop_user_assignments assignment
            JOIN campus_ops.shops shop ON shop.tenant_id=assignment.tenant_id AND shop.id=assignment.shop_id
-           WHERE assignment.tenant_id=$1 AND assignment.user_id=$2
+           WHERE assignment.tenant_id=$1
+             AND (assignment.user_id=$2 OR EXISTS (
+               SELECT 1 FROM identity.users assigned_user
+               WHERE assigned_user.id::text=assignment.user_id
+                 AND lower(assigned_user.email)=lower($3)))
              AND assignment.is_active AND shop.is_active ORDER BY shop.name"#,
     )
     .bind(tenant)
     .bind(user_id)
+    .bind(user_email)
     .fetch_all(pool)
     .await?)
 }
@@ -1184,6 +1196,7 @@ async fn require_assigned_shop(
     pool: &sqlx::PgPool,
     tenant: Uuid,
     user_id: &str,
+    user_email: &str,
     shop_key: &str,
     access: &EffectiveAccess,
 ) -> ApiResult<()> {
@@ -1193,9 +1206,13 @@ async fn require_assigned_shop(
     let assigned = sqlx::query_scalar::<_, bool>(r#"SELECT EXISTS(
       SELECT 1 FROM campus_ops.shop_user_assignments assignment
       JOIN campus_ops.shops shop ON shop.tenant_id=assignment.tenant_id AND shop.id=assignment.shop_id
-      WHERE assignment.tenant_id=$1 AND assignment.user_id=$2 AND shop.shop_key=$3
+      WHERE assignment.tenant_id=$1 AND shop.shop_key=$3
+        AND (assignment.user_id=$2 OR EXISTS (
+          SELECT 1 FROM identity.users assigned_user
+          WHERE assigned_user.id::text=assignment.user_id
+            AND lower(assigned_user.email)=lower($4)))
         AND assignment.is_active AND shop.is_active)"#)
-        .bind(tenant).bind(user_id).bind(shop_key).fetch_one(pool).await?;
+        .bind(tenant).bind(user_id).bind(shop_key).bind(user_email).fetch_one(pool).await?;
     if assigned {
         Ok(())
     } else {
@@ -1255,6 +1272,7 @@ async fn create_menu_item(
         db.pool(),
         tenant,
         &principal.student.id,
+        &principal.student.email,
         input.store.trim(),
         &access,
     )
@@ -1305,6 +1323,7 @@ async fn update_menu_item(
         db.pool(),
         tenant,
         &principal.student.id,
+        &principal.student.email,
         input.store.trim(),
         &access,
     )
@@ -1355,7 +1374,15 @@ async fn delete_menu_item(
     .fetch_optional(db.pool())
     .await?
     .ok_or_else(|| ApiError::NotFound("Menu item not found".into()))?;
-    require_assigned_shop(db.pool(), tenant, &principal.student.id, &store, &access).await?;
+    require_assigned_shop(
+        db.pool(),
+        tenant,
+        &principal.student.id,
+        &principal.student.email,
+        &store,
+        &access,
+    )
+    .await?;
     let result =
         sqlx::query("DELETE FROM campus_ops.canteen_menu_items WHERE tenant_id=$1 AND id=$2")
             .bind(tenant)
@@ -1661,6 +1688,7 @@ async fn update_laundry_settings(
         db.pool(),
         tenant,
         &principal.student.id,
+        &principal.student.email,
         "mec-laundry",
         &access,
     )
@@ -1715,6 +1743,7 @@ async fn create_laundry_charge(
         db.pool(),
         tenant,
         &principal.student.id,
+        &principal.student.email,
         "mec-laundry",
         &access,
     )
@@ -1964,6 +1993,7 @@ async fn update_order_status(
         db.pool(),
         tenant,
         &principal.student.id,
+        &principal.student.email,
         &current.3,
         &access,
     )
@@ -2060,6 +2090,7 @@ async fn scan_order(
         db.pool(),
         tenant,
         &principal.student.id,
+        &principal.student.email,
         &current.4,
         &access,
     )
@@ -2446,14 +2477,25 @@ async fn update_canteen_staff_state(
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    if assigned_shop_keys(db.pool(), tenant, &principal.student.id)
-        .await?
-        .is_empty()
+    if assigned_shop_keys(
+        db.pool(),
+        tenant,
+        &principal.student.id,
+        &principal.student.email,
+    )
+    .await?
+    .is_empty()
     {
         return Err(ApiError::Forbidden);
     }
     if let Some(shop_open) = input.shop_open {
-        let assigned = assigned_shop_keys(db.pool(), tenant, &principal.student.id).await?;
+        let assigned = assigned_shop_keys(
+            db.pool(),
+            tenant,
+            &principal.student.id,
+            &principal.student.email,
+        )
+        .await?;
         sqlx::query("UPDATE campus_ops.shops SET shop_open=$3,updated_at=now() WHERE tenant_id=$1 AND shop_key = ANY($2) AND is_active")
             .bind(tenant).bind(&assigned).bind(shop_open).execute(db.pool()).await?;
     }

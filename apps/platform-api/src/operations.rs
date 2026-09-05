@@ -844,8 +844,9 @@ async fn canteen_store(
     .bind(tenant)
     .fetch_one(db.pool())
     .await?;
-    let laundry_charges = if can_manage && assigned_shop_keys.iter().any(|key| key == "mec-laundry")
-    {
+    let can_manage_laundry = assigned_shop_keys.iter().any(|key| key == "mec-laundry")
+        && (access.allows("canteen.menu.create") || access.allows("canteen.menu.update"));
+    let laundry_charges = if can_manage_laundry {
         sqlx::query_scalar::<_, Value>(
             r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
                  'id',id,'serviceType',service_type,'name',name,'description',description,

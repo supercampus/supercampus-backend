@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
         "apply-student-assessments" => apply_student_assessments().await,
         "apply-push-notification-foundation" => apply_push_notification_foundation().await,
         "apply-parent-warden-gatepass-portals" => apply_parent_warden_gatepass_portals().await,
+        "apply-anna-student-numbers" => apply_anna_student_numbers().await,
         "apply-stationery-inventory-pricing" => apply_stationery_inventory_pricing().await,
         "apply-leave-pass-approval-matrix" => apply_leave_pass_approval_matrix().await,
         "apply-librarian-operations" => apply_librarian_operations().await,
@@ -55,9 +56,17 @@ async fn main() -> anyhow::Result<()> {
             provision_tenant(tenant_slug, database_name).await
         }
         command => bail!(
-            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, apply-parent-warden-gatepass-portals, apply-canteen-shop-availability, align-mec-canteen-owner, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
+            "unknown command {command}; expected migrate, apply-mec-advisors, apply-mec-original-faculty, apply-mec-faculty-matrix, apply-student-assessments, apply-push-notification-foundation, apply-parent-warden-gatepass-portals, apply-anna-student-numbers, apply-canteen-shop-availability, align-mec-canteen-owner, repair-mec-geofence, inspect-source, split-control-plane, sync-control-plane, route-existing, or provision"
         ),
     }
+}
+
+/// Replaces MEC's temporary MEC25... roll values with the official Anna
+/// University registration numbers without changing student or user IDs.
+async fn apply_anna_student_numbers() -> anyhow::Result<()> {
+    const SQL: &str =
+        include_str!("../../../migrations/runtime/0082_anna_university_student_numbers.sql");
+    apply_to_control_and_tenants(SQL, "Anna University student numbers").await
 }
 
 async fn apply_laundry_charge_workflow() -> anyhow::Result<()> {

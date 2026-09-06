@@ -1141,9 +1141,10 @@ async fn login(
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::BadRequest("The tenant ID is required".into()))?;
+        .ok_or_else(|| ApiError::BadRequest("The tenant ID is required".into()))?
+        .to_ascii_lowercase();
     let identity = state
-        .authenticate_credentials(&request.email, &request.password, Some(tenant_id))
+        .authenticate_credentials(&request.email, &request.password, Some(&tenant_id))
         .await?;
     let Some(identity) = identity else {
         return Err(ApiError::InvalidCredentials);

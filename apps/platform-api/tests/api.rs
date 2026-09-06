@@ -215,7 +215,7 @@ async fn login_rejects_a_mismatched_pre_auth_tenant_header() {
 }
 
 #[tokio::test]
-async fn login_tenant_id_is_case_sensitive() {
+async fn login_tenant_id_is_case_insensitive_and_resolves_to_mec() {
     let app = app(AppState::default().with_memory_identity(
         TEST_EMAIL,
         TEST_PASSWORD,
@@ -223,7 +223,7 @@ async fn login_tenant_id_is_case_sensitive() {
         vec!["student".into()],
     ));
 
-    for tenant_id in ["MEC", "Mec", "mEC"] {
+    for tenant_id in ["MEC", "mec", "Mec", "mEC"] {
         let response = app
             .clone()
             .oneshot(
@@ -237,14 +237,14 @@ async fn login_tenant_id_is_case_sensitive() {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     let response = app
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
-                .header("x-tenant-id", "mec")
+                .header("x-tenant-id", "another-campus")
                 .body(Body::from(format!(
                     r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}"}}"#,
                 )))
@@ -252,7 +252,7 @@ async fn login_tenant_id_is_case_sensitive() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

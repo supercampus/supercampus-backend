@@ -8,7 +8,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -27,7 +28,7 @@ use crate::{
     realtime::RealtimePublication,
     state::{
         AccessTokenAuthentication, AppState, AuthPrincipal, CreatedAuthSession, EffectiveAccess,
-        MINIMUM_PASSWORD_LENGTH, RefreshSessionResult,
+        MINIMUM_PASSWORD_LENGTH, MaintenanceWindow, RefreshSessionResult,
     },
 };
 
@@ -90,6 +91,10 @@ pub fn router(state: AppState) -> Router {
             put(set_student_residency),
         )
         .route(
+            "/admin/maintenance",
+            get(get_maintenance_window).put(put_maintenance_window),
+        )
+        .route(
             "/payments/razorpay/orders",
             post(crate::razorpay::create_order),
         )
@@ -121,6 +126,7 @@ pub fn router(state: AppState) -> Router {
         );
 
     let api = Router::new()
+        .route("/maintenance", get(public_maintenance_status))
         .route("/auth/login", post(login))
         .route("/auth/forgot-password", post(forgot_password))
         .route("/auth/reset-password", post(reset_password))
@@ -161,6 +167,85 @@ async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         "status": "ready",
         "checks": { "runtime": "ok", "storage": state.storage_kind() }
     })))
+}
+
+const DEFAULT_MAINTENANCE_MESSAGE: &str =
+    "SuperCampus is temporarily unavailable while scheduled maintenance is completed.";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PutMaintenanceWindowRequest {
+    enabled: bool,
+    starts_at: DateTime<Utc>,
+    ends_at: DateTime<Utc>,
+    #[serde(default)]
+    message: String,
+}
+
+async fn public_maintenance_status(
+    State(state): State<AppState>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let window = state.active_maintenance_window().await?;
+    Ok(Json(ApiResponse::new(match window {
+        Some(window) => json!({
+            "active": true,
+            "startsAt": window.starts_at,
+            "endsAt": window.ends_at,
+            "message": window.message,
+        }),
+        None => json!({"active": false}),
+    })))
+}
+
+async fn get_maintenance_window(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_maintenance_admin(&access)?;
+    let window = state
+        .maintenance_window(&principal.student.tenant_id)
+        .await?;
+    Ok(Json(ApiResponse::new(match window {
+        Some(window) => json!(window),
+        None => json!({"enabled": false, "active": false}),
+    })))
+}
+
+async fn put_maintenance_window(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(request): Json<PutMaintenanceWindowRequest>,
+) -> ApiResult<Json<ApiResponse<MaintenanceWindow>>> {
+    require_maintenance_admin(&access)?;
+    if request.ends_at <= request.starts_at {
+        return Err(ApiError::BadRequest(
+            "Maintenance end time must be after its start time".into(),
+        ));
+    }
+    if request.enabled && request.ends_at <= Utc::now() {
+        return Err(ApiError::BadRequest(
+            "An enabled maintenance window must end in the future".into(),
+        ));
+    }
+    let message = request.message.trim();
+    let saved = state
+        .save_maintenance_window(MaintenanceWindow {
+            tenant_id: principal.student.tenant_id,
+            enabled: request.enabled,
+            starts_at: request.starts_at,
+            ends_at: request.ends_at,
+            message: if message.is_empty() {
+                DEFAULT_MAINTENANCE_MESSAGE.into()
+            } else {
+                message.chars().take(280).collect()
+            },
+            updated_by: principal.student.email,
+            updated_at: Utc::now(),
+        })
+        .await?;
+    Ok(Json(ApiResponse::new(saved)))
 }
 
 async fn upload_media(
@@ -628,6 +713,31 @@ fn require_effective_permission(access: &EffectiveAccess, permission: &str) -> A
     }
 }
 
+fn is_maintenance_admin(roles: &[String]) -> bool {
+    roles.iter().any(|role| {
+        matches!(
+            role.trim().to_ascii_lowercase().as_str(),
+            "tenant_admin" | "admin" | "administrator" | "super_admin"
+        )
+    })
+}
+
+fn require_maintenance_admin(access: &EffectiveAccess) -> ApiResult<()> {
+    if is_maintenance_admin(&access.roles) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+fn maintenance_error(window: &MaintenanceWindow) -> ApiError {
+    ApiError::ServiceUnavailable(format!(
+        "{} Maintenance is scheduled until {}.",
+        window.message,
+        window.ends_at.format("%d %b %Y, %I:%M %p UTC")
+    ))
+}
+
 fn valid_role_key(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty()
@@ -1031,6 +1141,14 @@ async fn login(
     let Some(identity) = identity else {
         return Err(ApiError::InvalidCredentials);
     };
+    if !is_maintenance_admin(&identity.roles)
+        && let Some(window) = state
+            .maintenance_window(&identity.student.tenant_id)
+            .await?
+            .filter(MaintenanceWindow::is_active)
+    {
+        return Err(maintenance_error(&window));
+    }
     let session = state.create_session(identity).await?;
     Ok(login_response(
         session,
@@ -1118,7 +1236,18 @@ async fn refresh(
         .or_else(|| cookie_value(&headers, "sc_session"))
         .ok_or(ApiError::InvalidRefreshToken)?;
     match state.refresh_session(&token).await? {
-        RefreshSessionResult::Rotated(session) => Ok(login_response(*session, token_mode)),
+        RefreshSessionResult::Rotated(session) => {
+            if !is_maintenance_admin(&session.roles)
+                && let Some(window) = state
+                    .maintenance_window(&session.student.tenant_id)
+                    .await?
+                    .filter(MaintenanceWindow::is_active)
+            {
+                state.revoke_session(session.session_id).await?;
+                return Err(maintenance_error(&window));
+            }
+            Ok(login_response(*session, token_mode))
+        }
         RefreshSessionResult::ConcurrentRefresh => Err(ApiError::Conflict(
             "A refresh is already in progress; use the token returned by the first request".into(),
         )),
@@ -1367,6 +1496,14 @@ pub async fn authorize_request(
     let access = state
         .effective_access_for_surface(&principal.student.tenant_id, &principal.student.id, surface)
         .await?;
+    if !is_maintenance_admin(&access.roles)
+        && let Some(window) = state
+            .maintenance_window(&principal.student.tenant_id)
+            .await?
+            .filter(MaintenanceWindow::is_active)
+    {
+        return Err(maintenance_error(&window));
+    }
     principal.roles = access.roles.clone();
     principal.student.role = access.roles.first().cloned().unwrap_or_default();
     principal.student.access = access.permissions.clone();

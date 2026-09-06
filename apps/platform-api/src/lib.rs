@@ -253,6 +253,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to grant student residency management access")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0091_platform_maintenance_windows.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply platform maintenance windows")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");

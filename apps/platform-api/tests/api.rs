@@ -3,8 +3,12 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
+use chrono::{Duration, Utc};
 use serde_json::Value;
-use supercampus_platform_api::{app, state::AppState};
+use supercampus_platform_api::{
+    app,
+    state::{AppState, MaintenanceWindow},
+};
 use tower::ServiceExt;
 
 struct TestSession {
@@ -116,6 +120,77 @@ async fn login_rejects_client_selected_tenant() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn maintenance_blocks_users_but_keeps_admin_access() {
+    let state = AppState::default()
+        .with_memory_identity(
+            TEST_EMAIL,
+            TEST_PASSWORD,
+            "tenant-local",
+            vec!["student".into()],
+        )
+        .with_memory_identity(
+            "admin@tenant.local",
+            TEST_PASSWORD,
+            "tenant-local",
+            vec!["tenant_admin".into()],
+        );
+    state
+        .save_maintenance_window(MaintenanceWindow {
+            tenant_id: "tenant-local".into(),
+            enabled: true,
+            starts_at: Utc::now() - Duration::minutes(1),
+            ends_at: Utc::now() + Duration::hours(1),
+            message: "Scheduled upgrade in progress.".into(),
+            updated_by: "admin@tenant.local".into(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let app = app(state);
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::get("/api/maintenance")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["data"]["active"], true);
+
+    let user_login = app
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}"}}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_login.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let admin_login = app
+        .oneshot(
+            Request::post("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"email":"admin@tenant.local","password":"{TEST_PASSWORD}"}}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_login.status(), StatusCode::OK);
 }
 
 #[tokio::test]

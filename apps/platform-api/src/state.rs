@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
@@ -125,6 +126,24 @@ pub struct EffectiveAccess {
     pub scopes: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceWindow {
+    pub tenant_id: String,
+    pub enabled: bool,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub message: String,
+    pub updated_by: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl MaintenanceWindow {
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.starts_at <= Utc::now() && self.ends_at > Utc::now()
+    }
+}
+
 impl EffectiveAccess {
     /// Exact match, the global `*`, or a `namespace.*` grant.
     ///
@@ -203,6 +222,7 @@ pub struct AppState {
     app_states: Arc<RwLock<HashMap<String, StoredAppState>>>,
     validated_principals: Arc<RwLock<HashMap<Uuid, CachedValue<AuthPrincipal>>>>,
     effective_access_cache: Arc<RwLock<HashMap<String, CachedValue<EffectiveAccess>>>>,
+    maintenance_windows: Arc<RwLock<HashMap<String, MaintenanceWindow>>>,
     realtime: RealtimeHub,
 }
 
@@ -224,6 +244,7 @@ impl Default for AppState {
             app_states: Arc::new(RwLock::new(HashMap::new())),
             validated_principals: Arc::new(RwLock::new(HashMap::new())),
             effective_access_cache: Arc::new(RwLock::new(HashMap::new())),
+            maintenance_windows: Arc::new(RwLock::new(HashMap::new())),
             realtime: RealtimeHub::default(),
         }
     }
@@ -549,6 +570,103 @@ impl AppState {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(json!(students))
+    }
+
+    pub async fn maintenance_window(
+        &self,
+        tenant_slug: &str,
+    ) -> anyhow::Result<Option<MaintenanceWindow>> {
+        if let Some(database) = &self.database {
+            let row = sqlx::query(
+                r#"SELECT tenant.slug AS tenant_slug, window.enabled, window.starts_at,
+                          window.ends_at, window.message, window.updated_by, window.updated_at
+                   FROM platform.maintenance_windows window
+                   JOIN platform.tenants tenant ON tenant.id = window.tenant_id
+                   WHERE tenant.slug = $1"#,
+            )
+            .bind(tenant_slug)
+            .fetch_optional(database.pool())
+            .await
+            .context("failed to load maintenance window")?;
+            return row.map(row_to_maintenance_window).transpose();
+        }
+        Ok(self
+            .maintenance_windows
+            .read()
+            .await
+            .get(tenant_slug)
+            .cloned())
+    }
+
+    pub async fn active_maintenance_window(&self) -> anyhow::Result<Option<MaintenanceWindow>> {
+        if let Some(database) = &self.database {
+            let row = sqlx::query(
+                r#"SELECT tenant.slug AS tenant_slug, window.enabled, window.starts_at,
+                          window.ends_at, window.message, window.updated_by, window.updated_at
+                   FROM platform.maintenance_windows window
+                   JOIN platform.tenants tenant ON tenant.id = window.tenant_id
+                   WHERE window.enabled AND window.starts_at <= now() AND window.ends_at > now()
+                   ORDER BY window.ends_at DESC
+                   LIMIT 1"#,
+            )
+            .fetch_optional(database.pool())
+            .await
+            .context("failed to load active maintenance window")?;
+            return row.map(row_to_maintenance_window).transpose();
+        }
+        Ok(self
+            .maintenance_windows
+            .read()
+            .await
+            .values()
+            .find(|window| window.is_active())
+            .cloned())
+    }
+
+    pub async fn save_maintenance_window(
+        &self,
+        window: MaintenanceWindow,
+    ) -> anyhow::Result<MaintenanceWindow> {
+        if let Some(database) = &self.database {
+            let row = sqlx::query(
+                r#"INSERT INTO platform.maintenance_windows
+                       (tenant_id, enabled, starts_at, ends_at, message, updated_by, updated_at)
+                   SELECT id, $2, $3, $4, $5, $6, now()
+                   FROM platform.tenants WHERE slug = $1
+                   ON CONFLICT (tenant_id) DO UPDATE SET
+                       enabled = EXCLUDED.enabled,
+                       starts_at = EXCLUDED.starts_at,
+                       ends_at = EXCLUDED.ends_at,
+                       message = EXCLUDED.message,
+                       updated_by = EXCLUDED.updated_by,
+                       updated_at = now()
+                   RETURNING enabled, starts_at, ends_at, message, updated_by, updated_at"#,
+            )
+            .bind(&window.tenant_id)
+            .bind(window.enabled)
+            .bind(window.starts_at)
+            .bind(window.ends_at)
+            .bind(&window.message)
+            .bind(&window.updated_by)
+            .fetch_optional(database.pool())
+            .await
+            .context("failed to save maintenance window")?
+            .context("tenant was not found")?;
+            return Ok(MaintenanceWindow {
+                tenant_id: window.tenant_id,
+                enabled: row.try_get("enabled")?,
+                starts_at: row.try_get("starts_at")?,
+                ends_at: row.try_get("ends_at")?,
+                message: row.try_get("message")?,
+                updated_by: row.try_get("updated_by")?,
+                updated_at: row.try_get("updated_at")?,
+            });
+        }
+        self.maintenance_windows
+            .write()
+            .await
+            .insert(window.tenant_id.clone(), window.clone());
+        Ok(window)
     }
 
     pub async fn set_student_residency(
@@ -2763,6 +2881,18 @@ fn row_to_tenant(row: &PgRow) -> anyhow::Result<TenantSummary> {
         city: row
             .try_get::<Option<String>, _>("city")?
             .unwrap_or_default(),
+    })
+}
+
+fn row_to_maintenance_window(row: PgRow) -> anyhow::Result<MaintenanceWindow> {
+    Ok(MaintenanceWindow {
+        tenant_id: row.try_get("tenant_slug")?,
+        enabled: row.try_get("enabled")?,
+        starts_at: row.try_get("starts_at")?,
+        ends_at: row.try_get("ends_at")?,
+        message: row.try_get("message")?,
+        updated_by: row.try_get("updated_by")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 

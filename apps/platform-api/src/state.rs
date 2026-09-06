@@ -578,10 +578,10 @@ impl AppState {
     ) -> anyhow::Result<Option<MaintenanceWindow>> {
         if let Some(database) = &self.database {
             let row = sqlx::query(
-                r#"SELECT tenant.slug AS tenant_slug, window.enabled, window.starts_at,
-                          window.ends_at, window.message, window.updated_by, window.updated_at
-                   FROM platform.maintenance_windows window
-                   JOIN platform.tenants tenant ON tenant.id = window.tenant_id
+                r#"SELECT tenant.slug AS tenant_slug, mw.enabled, mw.starts_at,
+                          mw.ends_at, mw.message, mw.updated_by, mw.updated_at
+                   FROM platform.maintenance_windows mw
+                   JOIN platform.tenants tenant ON tenant.id = mw.tenant_id
                    WHERE tenant.slug = $1"#,
             )
             .bind(tenant_slug)
@@ -601,12 +601,12 @@ impl AppState {
     pub async fn active_maintenance_window(&self) -> anyhow::Result<Option<MaintenanceWindow>> {
         if let Some(database) = &self.database {
             let row = sqlx::query(
-                r#"SELECT tenant.slug AS tenant_slug, window.enabled, window.starts_at,
-                          window.ends_at, window.message, window.updated_by, window.updated_at
-                   FROM platform.maintenance_windows window
-                   JOIN platform.tenants tenant ON tenant.id = window.tenant_id
-                   WHERE window.enabled AND window.starts_at <= now() AND window.ends_at > now()
-                   ORDER BY window.ends_at DESC
+                r#"SELECT tenant.slug AS tenant_slug, mw.enabled, mw.starts_at,
+                          mw.ends_at, mw.message, mw.updated_by, mw.updated_at
+                   FROM platform.maintenance_windows mw
+                   JOIN platform.tenants tenant ON tenant.id = mw.tenant_id
+                   WHERE mw.enabled AND mw.starts_at <= now() AND mw.ends_at > now()
+                   ORDER BY mw.ends_at DESC
                    LIMIT 1"#,
             )
             .fetch_optional(database.pool())

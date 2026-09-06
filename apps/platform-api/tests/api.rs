@@ -61,6 +61,7 @@ async fn login_session(app: &Router, tenant_id: &str) -> TestSession {
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", tenant_id)
                 .body(Body::from(format!(
                     r#"{{"email":"{email}","password":"{TEST_PASSWORD}"}}"#,
                 )))
@@ -112,6 +113,7 @@ async fn login_rejects_client_selected_tenant() {
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", "tenant-local")
                 .body(Body::from(format!(
                     r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}","tenantId":"tenant-b"}}"#,
                 )))
@@ -170,6 +172,7 @@ async fn maintenance_blocks_users_but_keeps_admin_access() {
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", "tenant-local")
                 .body(Body::from(format!(
                     r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}"}}"#,
                 )))
@@ -183,6 +186,7 @@ async fn maintenance_blocks_users_but_keeps_admin_access() {
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", "tenant-local")
                 .body(Body::from(format!(
                     r#"{{"email":"admin@tenant.local","password":"{TEST_PASSWORD}"}}"#,
                 )))
@@ -194,12 +198,53 @@ async fn maintenance_blocks_users_but_keeps_admin_access() {
 }
 
 #[tokio::test]
-async fn login_ignores_pre_auth_tenant_header() {
+async fn login_rejects_a_mismatched_pre_auth_tenant_header() {
     let response = test_app()
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-tenant-id", "tenant-b")
+                .body(Body::from(format!(
+                    r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}"}}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn login_tenant_id_is_case_sensitive() {
+    let app = app(AppState::default().with_memory_identity(
+        TEST_EMAIL,
+        TEST_PASSWORD,
+        "mec",
+        vec!["student".into()],
+    ));
+
+    for tenant_id in ["MEC", "Mec", "mEC"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-tenant-id", tenant_id)
+                    .body(Body::from(format!(
+                        r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}"}}"#,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let response = app
+        .oneshot(
+            Request::post("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", "mec")
                 .body(Body::from(format!(
                     r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}"}}"#,
                 )))
@@ -576,6 +621,7 @@ async fn native_token_sessions_refresh_and_logout_without_cookies() {
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", "tenant-local")
                 .body(Body::from(format!(
                     r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}","sessionMode":"token"}}"#,
                 )))
@@ -689,6 +735,7 @@ async fn jwt_claims_override_spoofed_crm_identity_headers() {
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", "tenant-local")
                 .body(Body::from(format!(
                     r#"{{"email":"{TEST_EMAIL}","password":"{TEST_PASSWORD}","sessionMode":"token"}}"#,
                 )))

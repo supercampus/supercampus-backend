@@ -73,6 +73,7 @@ async fn postgres_state_survives_app_state_recreation() {
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", &tenant)
                 .body(Body::from(format!(
                     r#"{{"email":"{email}","password":"{password}","sessionMode":"token"}}"#,
                 )))
@@ -233,6 +234,7 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", &tenant)
                 .body(Body::from(format!(
                     r#"{{"email":"{admin_email}","password":"{admin_password}","sessionMode":"token"}}"#,
                 )))
@@ -411,6 +413,7 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", &tenant)
                 .body(Body::from(format!(
                     r#"{{"email":"{reader_email}","password":"{refreshed_password}","sessionMode":"token"}}"#,
                 )))
@@ -562,6 +565,7 @@ async fn password_reset_replaces_the_password_and_revokes_existing_sessions() {
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", &tenant)
                 .body(Body::from(format!(
                     r#"{{"email":"{email}","password":"{old_password}"}}"#
                 )))
@@ -636,6 +640,7 @@ async fn password_reset_replaces_the_password_and_revokes_existing_sessions() {
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", &tenant)
                 .body(Body::from(format!(
                     r#"{{"email":"{email}","password":"{old_password}"}}"#
                 )))
@@ -651,6 +656,7 @@ async fn password_reset_replaces_the_password_and_revokes_existing_sessions() {
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tenant-id", &tenant)
                 .body(Body::from(format!(
                     r#"{{"email":"{email}","password":"{new_password}"}}"#
                 )))

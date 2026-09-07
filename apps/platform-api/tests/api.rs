@@ -577,6 +577,45 @@ async fn native_token_sessions_refresh_and_logout_without_cookies() {
 }
 
 #[tokio::test]
+async fn a_second_device_cannot_replace_an_active_login() {
+    let app = test_app();
+    let login = |device_id: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::post("/api/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "email": TEST_EMAIL,
+                            "password": TEST_PASSWORD,
+                            "sessionMode": "token",
+                            "deviceId": device_id,
+                            "deviceName": "Test device"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    assert_eq!(login("device-a").await.status(), StatusCode::OK);
+    let blocked = login("device-b").await;
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(blocked.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["code"], "conflict");
+    assert!(body["error"].as_str().unwrap().contains("another device"));
+
+    // Re-authenticating from the same persisted device is allowed and replaces
+    // only that device's prior session.
+    assert_eq!(login("device-a").await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn bearer_failures_return_machine_readable_no_store_errors() {
     let response = test_app()
         .oneshot(

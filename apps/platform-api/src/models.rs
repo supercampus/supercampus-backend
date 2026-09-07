@@ -297,6 +297,8 @@ pub struct LoginRequest {
     pub password: String,
     #[serde(default)]
     pub session_mode: SessionMode,
+    pub device_id: Option<String>,
+    pub device_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]

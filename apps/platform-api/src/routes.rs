@@ -994,7 +994,22 @@ async fn login(
     let Some(identity) = identity else {
         return Err(ApiError::InvalidCredentials);
     };
-    let session = state.create_session(identity).await?;
+    let session = match state
+        .create_session(
+            identity,
+            request.device_id.as_deref(),
+            request.device_name.as_deref(),
+        )
+        .await?
+    {
+        crate::state::CreateSessionResult::Created(session) => *session,
+        crate::state::CreateSessionResult::ActiveOnAnotherDevice => {
+            return Err(ApiError::Conflict(
+                "This account is already signed in on another device. Sign out there before trying again."
+                    .into(),
+            ));
+        }
+    };
     Ok(login_response(
         session,
         request.session_mode == SessionMode::Token,

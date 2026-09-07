@@ -1173,6 +1173,14 @@ async fn login(
             ));
         }
     };
+    state.publish_realtime(
+        RealtimePublication::tenant(
+            &session.student.tenant_id,
+            "identity.session.replaced",
+            json!({"sessionId": session.session_id}),
+        )
+        .for_user(&session.student.id),
+    );
     Ok(login_response(
         session,
         request.session_mode == SessionMode::Token,

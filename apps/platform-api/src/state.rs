@@ -78,6 +78,7 @@ struct StoredAuthSession {
     rotated_at: Option<DateTime<Utc>>,
     expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
+    device_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +196,12 @@ pub enum RefreshSessionResult {
     ConcurrentRefresh,
     Invalid,
     ReuseDetected,
+}
+
+#[derive(Debug, Clone)]
+pub enum CreateSessionResult {
+    Created(Box<CreatedAuthSession>),
+    ActiveOnAnotherDevice,
 }
 
 #[derive(Debug, Clone)]
@@ -2089,7 +2096,9 @@ impl AppState {
     pub async fn create_session(
         &self,
         identity: AuthenticatedIdentity,
-    ) -> anyhow::Result<CreatedAuthSession> {
+        device_id: Option<&str>,
+        device_name: Option<&str>,
+    ) -> anyhow::Result<CreateSessionResult> {
         let session_id = Uuid::new_v4();
         let student = identity.student;
         let roles = identity.roles;
@@ -2104,10 +2113,49 @@ impl AppState {
         if let Some(database) = &self.database {
             let tenant_uuid = ensure_tenant(database, &student.tenant_id).await?;
             let profile = serde_json::to_value(&student).context("serialize local student")?;
+            let mut transaction = database.pool().begin().await?;
+            if let Some(device_id) = device_id {
+                let lock_key = format!("{tenant_uuid}:{}", student.id);
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(lock_key)
+                    .execute(&mut *transaction)
+                    .await
+                    .context("lock account login sessions")?;
+                let other_device_exists: bool = sqlx::query_scalar(
+                    r#"SELECT EXISTS (
+                         SELECT 1 FROM identity.auth_sessions
+                         WHERE tenant_id = $1 AND user_id = $2
+                           AND revoked_at IS NULL AND expires_at > now()
+                           AND device_id IS NOT NULL AND device_id <> $3
+                       )"#,
+                )
+                .bind(tenant_uuid)
+                .bind(&student.id)
+                .bind(device_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .context("check active device session")?;
+                if other_device_exists {
+                    transaction.commit().await?;
+                    return Ok(CreateSessionResult::ActiveOnAnotherDevice);
+                }
+                sqlx::query(
+                    r#"UPDATE identity.auth_sessions SET revoked_at = now()
+                       WHERE tenant_id = $1 AND user_id = $2 AND revoked_at IS NULL
+                         AND (device_id IS NULL OR device_id = $3)"#,
+                )
+                .bind(tenant_uuid)
+                .bind(&student.id)
+                .bind(device_id)
+                .execute(&mut *transaction)
+                .await
+                .context("replace this device login session")?;
+            }
             sqlx::query(
                 r#"INSERT INTO identity.auth_sessions
-                   (id, tenant_id, user_id, roles, profile, refresh_token_hash, expires_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+                   (id, tenant_id, user_id, roles, profile, refresh_token_hash, expires_at,
+                    device_id, device_name)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
             )
             .bind(session_id)
             .bind(tenant_uuid)
@@ -2116,11 +2164,39 @@ impl AppState {
             .bind(profile)
             .bind(refresh_token_hash.to_vec())
             .bind(refresh_expires_at)
-            .execute(database.pool())
+            .bind(device_id)
+            .bind(device_name)
+            .execute(&mut *transaction)
             .await
             .context("failed to create login session")?;
+            transaction.commit().await?;
         } else {
-            self.sessions.write().await.insert(
+            let mut sessions = self.sessions.write().await;
+            if let Some(device_id) = device_id {
+                if sessions.values().any(|session| {
+                    session.student.id == student.id
+                        && session.student.tenant_id == student.tenant_id
+                        && session.revoked_at.is_none()
+                        && session.expires_at > Utc::now()
+                        && session
+                            .device_id
+                            .as_deref()
+                            .is_some_and(|id| id != device_id)
+                }) {
+                    return Ok(CreateSessionResult::ActiveOnAnotherDevice);
+                }
+                for session in sessions.values_mut() {
+                    if session.student.id == student.id
+                        && session.student.tenant_id == student.tenant_id
+                        && session.revoked_at.is_none()
+                        && (session.device_id.is_none()
+                            || session.device_id.as_deref() == Some(device_id))
+                    {
+                        session.revoked_at = Some(Utc::now());
+                    }
+                }
+            }
+            sessions.insert(
                 session_id,
                 StoredAuthSession {
                     id: session_id,
@@ -2131,11 +2207,12 @@ impl AppState {
                     rotated_at: None,
                     expires_at: refresh_expires_at,
                     revoked_at: None,
+                    device_id: device_id.map(str::to_owned),
                 },
             );
         }
 
-        Ok(CreatedAuthSession {
+        Ok(CreateSessionResult::Created(Box::new(CreatedAuthSession {
             session_id,
             student,
             roles,
@@ -2143,7 +2220,7 @@ impl AppState {
             access_expires_at: access.expires_at,
             refresh_token,
             refresh_expires_at,
-        })
+        })))
     }
 
     pub async fn authenticate_access_token(

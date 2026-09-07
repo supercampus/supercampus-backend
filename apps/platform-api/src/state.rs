@@ -79,6 +79,7 @@ struct StoredAuthSession {
     expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
     device_id: Option<String>,
+    revocation_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +197,7 @@ pub enum RefreshSessionResult {
     ConcurrentRefresh,
     Invalid,
     ReuseDetected,
+    ReplacedByAnotherDevice,
 }
 
 #[derive(Debug, Clone)]
@@ -2127,30 +2129,20 @@ impl AppState {
                     .execute(&mut *transaction)
                     .await
                     .context("lock account login sessions")?;
-                let other_device_exists: bool = sqlx::query_scalar(
-                    r#"SELECT EXISTS (
-                         SELECT 1 FROM identity.auth_sessions
-                         WHERE tenant_id = $1 AND user_id = $2
-                           AND revoked_at IS NULL AND expires_at > now()
-                           AND profile ->> '_sessionDeviceId' IS NOT NULL
-                           AND profile ->> '_sessionDeviceId' <> $3
-                       )"#,
-                )
-                .bind(tenant_uuid)
-                .bind(&student.id)
-                .bind(device_id)
-                .fetch_one(&mut *transaction)
-                .await
-                .context("check active device session")?;
-                if other_device_exists {
-                    transaction.commit().await?;
-                    return Ok(CreateSessionResult::ActiveOnAnotherDevice);
-                }
                 sqlx::query(
-                    r#"UPDATE identity.auth_sessions SET revoked_at = now()
+                    r#"UPDATE identity.auth_sessions
+                       SET revoked_at = now(),
+                           profile = jsonb_set(
+                             profile,
+                             '{_sessionRevokedReason}',
+                             CASE WHEN profile ->> '_sessionDeviceId' IS DISTINCT FROM $3
+                               THEN '"signed_in_elsewhere"'::jsonb
+                               ELSE '"replaced"'::jsonb
+                             END,
+                             true
+                           )
                        WHERE tenant_id = $1 AND user_id = $2 AND revoked_at IS NULL
-                         AND (profile ->> '_sessionDeviceId' IS NULL
-                              OR profile ->> '_sessionDeviceId' = $3)"#,
+                         AND expires_at > now()"#,
                 )
                 .bind(tenant_uuid)
                 .bind(&student.id)
@@ -2178,26 +2170,21 @@ impl AppState {
         } else {
             let mut sessions = self.sessions.write().await;
             if let Some(device_id) = device_id {
-                if sessions.values().any(|session| {
-                    session.student.id == student.id
-                        && session.student.tenant_id == student.tenant_id
-                        && session.revoked_at.is_none()
-                        && session.expires_at > Utc::now()
-                        && session
-                            .device_id
-                            .as_deref()
-                            .is_some_and(|id| id != device_id)
-                }) {
-                    return Ok(CreateSessionResult::ActiveOnAnotherDevice);
-                }
                 for session in sessions.values_mut() {
                     if session.student.id == student.id
                         && session.student.tenant_id == student.tenant_id
                         && session.revoked_at.is_none()
-                        && (session.device_id.is_none()
-                            || session.device_id.as_deref() == Some(device_id))
+                        && session.expires_at > Utc::now()
                     {
                         session.revoked_at = Some(Utc::now());
+                        session.revocation_reason = Some(
+                            if session.device_id.as_deref() == Some(device_id) {
+                                "replaced"
+                            } else {
+                                "signed_in_elsewhere"
+                            }
+                            .into(),
+                        );
                     }
                 }
             }
@@ -2213,6 +2200,7 @@ impl AppState {
                     expires_at: refresh_expires_at,
                     revoked_at: None,
                     device_id: device_id.map(str::to_owned),
+                    revocation_reason: None,
                 },
             );
         }
@@ -2322,14 +2310,13 @@ impl AppState {
             let row = sqlx::query(
                 r#"SELECT s.id, t.slug AS tenant_slug, s.user_id, s.roles, s.profile,
                           s.refresh_token_hash, s.previous_refresh_token_hash, s.rotated_at,
-                          s.expires_at
+                          s.expires_at, s.revoked_at
                    FROM identity.auth_sessions s
                    JOIN platform.tenants t ON t.id = s.tenant_id
                    JOIN identity.users u ON u.id::text = s.user_id AND u.active
                    JOIN identity.tenant_memberships m
                      ON m.tenant_id = s.tenant_id AND m.user_id = u.id AND m.active
                    WHERE (s.refresh_token_hash = $1 OR s.previous_refresh_token_hash = $1)
-                     AND s.revoked_at IS NULL
                      AND t.status = 'active'
                    FOR UPDATE OF s"#,
             )
@@ -2342,6 +2329,20 @@ impl AppState {
                 return Ok(RefreshSessionResult::Invalid);
             };
             let session_id: Uuid = row.try_get("id")?;
+            let profile: Value = row.try_get("profile")?;
+            let revoked_at: Option<DateTime<Utc>> = row.try_get("revoked_at")?;
+            if revoked_at.is_some() {
+                transaction.commit().await?;
+                return Ok(
+                    if profile.get("_sessionRevokedReason").and_then(Value::as_str)
+                        == Some("signed_in_elsewhere")
+                    {
+                        RefreshSessionResult::ReplacedByAnotherDevice
+                    } else {
+                        RefreshSessionResult::Invalid
+                    },
+                );
+            }
             let current_hash: Vec<u8> = row.try_get("refresh_token_hash")?;
             let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
             if current_hash.as_slice() != supplied_hash || expires_at <= Utc::now() {
@@ -2374,8 +2375,8 @@ impl AppState {
                 });
             }
 
-            let student: AuthStudent = serde_json::from_value(row.try_get("profile")?)
-                .context("deserialize login profile")?;
+            let student: AuthStudent =
+                serde_json::from_value(profile).context("deserialize login profile")?;
             let roles: Vec<String> = row.try_get("roles")?;
             let new_refresh_token = generate_refresh_token();
             let new_refresh_hash = hash_refresh_token(&new_refresh_token);
@@ -2421,8 +2422,13 @@ impl AppState {
             return Ok(RefreshSessionResult::Invalid);
         };
         if session.revoked_at.is_some() || session.expires_at <= Utc::now() {
-            session.revoked_at = Some(Utc::now());
-            return Ok(RefreshSessionResult::Invalid);
+            return Ok(
+                if session.revocation_reason.as_deref() == Some("signed_in_elsewhere") {
+                    RefreshSessionResult::ReplacedByAnotherDevice
+                } else {
+                    RefreshSessionResult::Invalid
+                },
+            );
         }
         if session.refresh_token_hash != supplied_hash {
             if session.rotated_at.is_some_and(|value| {

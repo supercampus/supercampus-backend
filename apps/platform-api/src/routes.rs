@@ -1276,6 +1276,7 @@ async fn refresh(
         )),
         RefreshSessionResult::Invalid => Err(ApiError::InvalidRefreshToken),
         RefreshSessionResult::ReuseDetected => Err(ApiError::RefreshTokenReuse),
+        RefreshSessionResult::ReplacedByAnotherDevice => Err(ApiError::SessionReplaced),
     }
 }
 

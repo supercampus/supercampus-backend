@@ -704,7 +704,7 @@ async fn native_token_sessions_refresh_and_logout_without_cookies() {
 }
 
 #[tokio::test]
-async fn a_second_device_cannot_replace_an_active_login() {
+async fn latest_device_login_replaces_the_previous_session() {
     let app = test_app();
     let login = |device_id: &'static str| {
         let app = app.clone();
@@ -729,17 +729,29 @@ async fn a_second_device_cannot_replace_an_active_login() {
         }
     };
 
-    assert_eq!(login("device-a").await.status(), StatusCode::OK);
-    let blocked = login("device-b").await;
-    assert_eq!(blocked.status(), StatusCode::CONFLICT);
-    let body: Value =
-        serde_json::from_slice(&to_bytes(blocked.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["code"], "conflict");
-    assert!(body["error"].as_str().unwrap().contains("another device"));
+    let first = login("device-a").await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body: Value =
+        serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let first_refresh = first_body["data"]["refreshToken"].as_str().unwrap();
 
-    // Re-authenticating from the same persisted device is allowed and replaces
-    // only that device's prior session.
-    assert_eq!(login("device-a").await.status(), StatusCode::OK);
+    assert_eq!(login("device-b").await.status(), StatusCode::OK);
+
+    let replaced = app
+        .oneshot(
+            Request::post("/api/auth/refresh")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "refreshToken": first_refresh }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::UNAUTHORIZED);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(replaced.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["code"], "session_replaced");
 }
 
 #[tokio::test]

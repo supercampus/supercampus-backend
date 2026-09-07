@@ -14,6 +14,7 @@ pub enum ApiError {
     AccessTokenExpired,
     InvalidAccessToken,
     SessionInactive,
+    SessionReplaced,
     InvalidRefreshToken,
     RefreshTokenReuse,
     Forbidden,
@@ -64,6 +65,12 @@ impl IntoResponse for ApiError {
                 StatusCode::UNAUTHORIZED,
                 "session_inactive",
                 "The session is no longer active".into(),
+                Some("invalid_token"),
+            ),
+            Self::SessionReplaced => (
+                StatusCode::UNAUTHORIZED,
+                "session_replaced",
+                "This account was signed in on another device".into(),
                 Some("invalid_token"),
             ),
             Self::InvalidRefreshToken => (

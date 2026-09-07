@@ -1930,7 +1930,13 @@ impl AppState {
 
         if let Some(database) = &self.database {
             let tenant_uuid = ensure_tenant(database, &student.tenant_id).await?;
-            let profile = serde_json::to_value(&student).context("serialize local student")?;
+            let mut profile = serde_json::to_value(&student).context("serialize local student")?;
+            if let (Some(device_id), Some(profile)) = (device_id, profile.as_object_mut()) {
+                profile.insert("_sessionDeviceId".into(), json!(device_id));
+                if let Some(device_name) = device_name {
+                    profile.insert("_sessionDeviceName".into(), json!(device_name));
+                }
+            }
             let mut transaction = database.pool().begin().await?;
             if let Some(device_id) = device_id {
                 let lock_key = format!("{tenant_uuid}:{}", student.id);
@@ -1944,7 +1950,8 @@ impl AppState {
                          SELECT 1 FROM identity.auth_sessions
                          WHERE tenant_id = $1 AND user_id = $2
                            AND revoked_at IS NULL AND expires_at > now()
-                           AND device_id IS NOT NULL AND device_id <> $3
+                           AND profile ->> '_sessionDeviceId' IS NOT NULL
+                           AND profile ->> '_sessionDeviceId' <> $3
                        )"#,
                 )
                 .bind(tenant_uuid)
@@ -1960,7 +1967,8 @@ impl AppState {
                 sqlx::query(
                     r#"UPDATE identity.auth_sessions SET revoked_at = now()
                        WHERE tenant_id = $1 AND user_id = $2 AND revoked_at IS NULL
-                         AND (device_id IS NULL OR device_id = $3)"#,
+                         AND (profile ->> '_sessionDeviceId' IS NULL
+                              OR profile ->> '_sessionDeviceId' = $3)"#,
                 )
                 .bind(tenant_uuid)
                 .bind(&student.id)
@@ -1971,9 +1979,8 @@ impl AppState {
             }
             sqlx::query(
                 r#"INSERT INTO identity.auth_sessions
-                   (id, tenant_id, user_id, roles, profile, refresh_token_hash, expires_at,
-                    device_id, device_name)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+                   (id, tenant_id, user_id, roles, profile, refresh_token_hash, expires_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
             )
             .bind(session_id)
             .bind(tenant_uuid)
@@ -1982,8 +1989,6 @@ impl AppState {
             .bind(profile)
             .bind(refresh_token_hash.to_vec())
             .bind(refresh_expires_at)
-            .bind(device_id)
-            .bind(device_name)
             .execute(&mut *transaction)
             .await
             .context("failed to create login session")?;

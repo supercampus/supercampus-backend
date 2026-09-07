@@ -2023,6 +2023,11 @@ impl AppState {
             );
         }
 
+        // A newly accepted login is authoritative. Remove any short-lived
+        // principal cache entries so the replaced device is rejected as soon
+        // as it reacts to the realtime session event.
+        self.validated_principals.write().await.clear();
+
         Ok(CreateSessionResult::Created(Box::new(CreatedAuthSession {
             session_id,
             student,

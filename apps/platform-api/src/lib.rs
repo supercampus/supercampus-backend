@@ -3,6 +3,7 @@ pub mod dashboard;
 pub mod error;
 pub mod governance;
 pub mod guardian_link;
+pub mod library_lending;
 pub mod media;
 pub mod models;
 pub mod notification;

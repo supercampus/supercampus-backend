@@ -383,28 +383,21 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
     assert!(user_created_body["data"].get("password").is_none());
     assert!(user_created_body["data"].get("temporaryPassword").is_none());
 
-    let refreshed_password = format!("{reader_password}-updated");
-    let user_refreshed = application
+    let duplicate_password = format!("{reader_password}-should-not-replace");
+    let duplicate_user = application
         .clone()
         .oneshot(
             Request::post("/api/v1/authorization/users")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, &admin_authorization)
                 .body(Body::from(format!(
-                    r#"{{"name":"CRM Reader","email":"{reader_email}","password":"{refreshed_password}","roleIds":["{role_id}"]}}"#,
+                    r#"{{"name":"Wrong Student Name","email":"{reader_email}","password":"{duplicate_password}","roleIds":["{role_id}"]}}"#,
                 )))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(user_refreshed.status(), StatusCode::CREATED);
-    let user_refreshed_body: Value = serde_json::from_slice(
-        &to_bytes(user_refreshed.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(user_refreshed_body["data"]["created"], false);
+    assert_eq!(duplicate_user.status(), StatusCode::CONFLICT);
 
     let reader_login = application
         .clone()
@@ -412,7 +405,7 @@ async fn role_permission_changes_apply_on_the_next_request_without_a_new_token()
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"email":"{reader_email}","password":"{refreshed_password}"}}"#,
+                    r#"{{"email":"{reader_email}","password":"{reader_password}"}}"#,
                 )))
                 .unwrap(),
         )

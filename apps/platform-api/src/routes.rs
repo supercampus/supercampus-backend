@@ -495,7 +495,8 @@ async fn create_tenant_user(
         .await?
         .ok_or_else(|| {
             ApiError::Conflict(
-                "a user with this email already belongs to the tenant; assign roles to the existing user instead".into(),
+                "an account with this email already exists; manage the existing account instead"
+                    .into(),
             )
         })?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(user))))

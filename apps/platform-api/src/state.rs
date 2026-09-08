@@ -1001,6 +1001,8 @@ impl AppState {
             student.role = roles.first().cloned().unwrap_or_default();
             student.portal_families = access.portal_families;
             student.access = access.permissions;
+            self.hydrate_identity_from_master_record(&mut student)
+                .await?;
             return Ok(Some(AuthenticatedIdentity { student, roles }));
         }
 
@@ -1015,6 +1017,118 @@ impl AppState {
                 student: identity.student.clone(),
                 roles: identity.roles.clone(),
             }))
+    }
+
+    /// Authentication data grants access; tenant master records own the
+    /// person's display identity. Resolve by immutable user UUID so one stale
+    /// membership profile can never label unrelated accounts with its name.
+    async fn hydrate_identity_from_master_record(
+        &self,
+        identity: &mut AuthStudent,
+    ) -> anyhow::Result<()> {
+        let database = self.tenant_database(&identity.tenant_id).await?;
+        let user_id = &identity.id;
+
+        if identity
+            .portal_families
+            .iter()
+            .any(|family| family == "student")
+        {
+            let row = sqlx::query(
+                r#"SELECT student.full_name, student.student_number, student.profile,
+                          COALESCE(department.code, NULLIF(student.department_id, ''), '') AS department
+                   FROM core.students student
+                   JOIN platform.tenants tenant ON tenant.id = student.tenant_id
+                   LEFT JOIN core.departments department
+                     ON department.tenant_id = student.tenant_id
+                    AND department.id::text = student.department_id
+                   WHERE tenant.slug = $1
+                     AND student.user_account_id::text = $2
+                     AND student.status IN ('provisional', 'active')
+                   LIMIT 1"#,
+            )
+            .bind(&identity.tenant_id)
+            .bind(user_id)
+            .fetch_optional(database.pool())
+            .await
+            .context("failed to resolve authenticated Student Master identity")?;
+            if let Some(row) = row {
+                apply_master_identity(
+                    identity,
+                    row.try_get("full_name")?,
+                    row.try_get("student_number")?,
+                    row.try_get("department")?,
+                    row.try_get("profile")?,
+                );
+                return Ok(());
+            }
+        }
+
+        if identity
+            .portal_families
+            .iter()
+            .any(|family| family == "staff" || family == "admin")
+        {
+            let row = sqlx::query(
+                r#"SELECT employee.full_name, employee.employee_number, employee.profile,
+                          COALESCE(department.code, '') AS department
+                   FROM core.employees employee
+                   JOIN platform.tenants tenant ON tenant.id = employee.tenant_id
+                   LEFT JOIN core.departments department
+                     ON department.tenant_id = employee.tenant_id
+                    AND department.id = employee.department_id
+                   WHERE tenant.slug = $1
+                     AND employee.user_id::text = $2
+                     AND employee.status IN ('provisional', 'active')
+                   LIMIT 1"#,
+            )
+            .bind(&identity.tenant_id)
+            .bind(user_id)
+            .fetch_optional(database.pool())
+            .await
+            .context("failed to resolve authenticated Employee Master identity")?;
+            if let Some(row) = row {
+                apply_master_identity(
+                    identity,
+                    row.try_get("full_name")?,
+                    row.try_get("employee_number")?,
+                    row.try_get("department")?,
+                    row.try_get("profile")?,
+                );
+                identity.year.clear();
+                return Ok(());
+            }
+        }
+
+        if identity
+            .portal_families
+            .iter()
+            .any(|family| family == "parent")
+        {
+            let row = sqlx::query(
+                r#"SELECT guardian.full_name, guardian.profile
+                   FROM core.guardians guardian
+                   JOIN platform.tenants tenant ON tenant.id = guardian.tenant_id
+                   WHERE tenant.slug = $1 AND guardian.user_id::text = $2
+                   LIMIT 1"#,
+            )
+            .bind(&identity.tenant_id)
+            .bind(user_id)
+            .fetch_optional(database.pool())
+            .await
+            .context("failed to resolve authenticated Guardian Master identity")?;
+            if let Some(row) = row {
+                apply_master_identity(
+                    identity,
+                    row.try_get("full_name")?,
+                    String::new(),
+                    String::new(),
+                    row.try_get("profile")?,
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn effective_access(
@@ -1712,42 +1826,25 @@ impl AppState {
             bail!("one or more roles do not belong to this tenant");
         }
 
-        let existing_user: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM identity.users WHERE email = $1")
-                .bind(&email)
-                .fetch_optional(&mut *transaction)
-                .await?;
-        let created = existing_user.is_none();
-        let user_id = if let Some(user_id) = existing_user {
-            sqlx::query(
-                r#"UPDATE identity.users
-                   SET password_hash = crypt($2, gen_salt('bf', 12)),
-                       display_name = $3,
-                       initials = $4,
-                       active = true,
-                       updated_at = now()
-                   WHERE id = $1"#,
-            )
-            .bind(user_id)
-            .bind(password)
-            .bind(request.name.trim())
-            .bind(initials(request.name.trim()))
-            .execute(&mut *transaction)
-            .await?;
-            user_id
-        } else {
-            sqlx::query_scalar(
-                r#"INSERT INTO identity.users
-                   (email, password_hash, display_name, initials, account_type)
-                   VALUES ($1, crypt($2, gen_salt('bf', 12)), $3, $4, 'staff')
-                   RETURNING id"#,
-            )
-            .bind(&email)
-            .bind(password)
-            .bind(request.name.trim())
-            .bind(initials(request.name.trim()))
-            .fetch_one(&mut *transaction)
-            .await?
+        // Create-only: existing accounts have dedicated role and password
+        // endpoints. An upsert here previously allowed one person's name and
+        // credentials to overwrite another account.
+        let user_id: Option<Uuid> = sqlx::query_scalar(
+            r#"INSERT INTO identity.users
+               (email, password_hash, display_name, initials, account_type)
+               VALUES ($1, crypt($2, gen_salt('bf', 12)), $3, $4, 'staff')
+               ON CONFLICT (email) DO NOTHING
+               RETURNING id"#,
+        )
+        .bind(&email)
+        .bind(password)
+        .bind(request.name.trim())
+        .bind(initials(request.name.trim()))
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(user_id) = user_id else {
+            transaction.rollback().await?;
+            return Ok(None);
         };
 
         sqlx::query(
@@ -1780,7 +1877,7 @@ impl AppState {
             "email": email,
             "name": request.name.trim(),
             "roleIds": request.role_ids,
-            "created": created,
+            "created": true,
         })))
     }
 
@@ -3370,6 +3467,28 @@ fn identity_student(input: IdentityStudentInput) -> AuthStudent {
         photo_url: profile_string("photoUrl", ""),
         full_college: profile_string("fullCollege", &tenant_name),
         tenant,
+    }
+}
+
+fn apply_master_identity(
+    identity: &mut AuthStudent,
+    name: String,
+    id_number: String,
+    department: String,
+    profile: Value,
+) {
+    identity.initials = initials(&name);
+    identity.name = name;
+    identity.roll = id_number;
+    identity.dept = department;
+    if let Some(team) = profile.get("team").and_then(Value::as_str) {
+        identity.team = team.to_owned();
+    }
+    if let Some(year) = profile.get("year").and_then(Value::as_str) {
+        identity.year = year.to_owned();
+    }
+    if let Some(photo_url) = profile.get("photoUrl").and_then(Value::as_str) {
+        identity.photo_url = photo_url.to_owned();
     }
 }
 

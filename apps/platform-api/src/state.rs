@@ -1825,6 +1825,66 @@ impl AppState {
         Ok(json!({ "userId": user_id, "roleIds": request.role_ids }))
     }
 
+    pub async fn set_tenant_user_password(
+        &self,
+        tenant_slug: &str,
+        actor_id: &str,
+        user_id: Uuid,
+        password: &str,
+    ) -> anyhow::Result<bool> {
+        let database = self.database.as_ref().context("PostgreSQL is required")?;
+        let tenant_id = ensure_tenant(database, tenant_slug).await?;
+        let mut transaction = database.pool().begin().await?;
+        let updated = sqlx::query(
+            r#"UPDATE identity.users user_account
+               SET password_hash = crypt($3, gen_salt('bf', 12)), updated_at = now()
+               WHERE user_account.id = $2 AND user_account.active
+                 AND EXISTS (
+                     SELECT 1 FROM identity.tenant_memberships membership
+                     WHERE membership.tenant_id = $1
+                       AND membership.user_id = user_account.id
+                       AND membership.active
+                 )"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(password)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to update the tenant user's password")?;
+        if updated.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            r#"UPDATE identity.password_reset_tokens
+               SET consumed_at = now()
+               WHERE user_id = $1 AND consumed_at IS NULL"#,
+        )
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to invalidate outstanding password reset links")?;
+        sqlx::query(
+            r#"UPDATE identity.auth_sessions
+               SET revoked_at = now()
+               WHERE user_id = $1 AND revoked_at IS NULL"#,
+        )
+        .bind(user_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .context("failed to revoke sessions after the administrator password change")?;
+        transaction.commit().await?;
+        self.validated_principals.write().await.clear();
+        tracing::info!(
+            %user_id,
+            actor_id,
+            tenant_slug,
+            "tenant administrator changed a user password and revoked active sessions"
+        );
+        Ok(true)
+    }
+
     pub async fn seed_test_identities_from_environment(&self) -> anyhow::Result<usize> {
         if !environment_flag("SEED_TEST_USERS") {
             return Ok(0);

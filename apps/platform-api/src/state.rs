@@ -1131,6 +1131,117 @@ impl AppState {
         Ok(())
     }
 
+    /// Restores accidentally duplicated control-plane profile snapshots from
+    /// each tenant database.
+    ///
+    /// Tenant databases retain the institution-owned identity record while the
+    /// control database owns authentication. Keeping this copy one-way avoids a
+    /// damaged control-plane display name being fanned back out to every user.
+    pub async fn reconcile_control_identities_from_tenants(&self) -> anyhow::Result<u64> {
+        let control = self.database.as_ref().context("PostgreSQL is required")?;
+        let mut repaired = 0_u64;
+
+        for tenant_slug in self.registered_tenant_slugs().await? {
+            let tenant = self.tenant_database(&tenant_slug).await?;
+            let profiles = sqlx::query(
+                r#"SELECT account.id, account.display_name, account.initials,
+                          account.account_type, account.profile AS account_profile,
+                          membership.profile AS membership_profile
+                   FROM identity.users account
+                   JOIN identity.tenant_memberships membership
+                     ON membership.user_id = account.id
+                   JOIN platform.tenants tenant ON tenant.id = membership.tenant_id
+                   WHERE tenant.slug = $1"#,
+            )
+            .bind(&tenant_slug)
+            .fetch_all(tenant.pool())
+            .await
+            .with_context(|| {
+                format!("failed to read canonical identities for tenant {tenant_slug}")
+            })?;
+
+            let tenant_id =
+                sqlx::query_scalar::<_, Uuid>("SELECT id FROM platform.tenants WHERE slug = $1")
+                    .bind(&tenant_slug)
+                    .fetch_optional(control.pool())
+                    .await?
+                    .with_context(|| {
+                        format!("tenant {tenant_slug} is missing from the control plane")
+                    })?;
+            let mut transaction = control.pool().begin().await?;
+            let mut repaired_users = Vec::new();
+
+            for profile in profiles {
+                let user_id: Uuid = profile.try_get("id")?;
+                let display_name: String = profile.try_get("display_name")?;
+                let initials: String = profile.try_get("initials")?;
+                let account_type: String = profile.try_get("account_type")?;
+                let account_profile: Value = profile.try_get("account_profile")?;
+                let membership_profile: Value = profile.try_get("membership_profile")?;
+                let result = sqlx::query(
+                    r#"UPDATE identity.users account
+                       SET display_name = $3,
+                           initials = $4,
+                           account_type = $5,
+                           profile = $6,
+                           updated_at = now()
+                       WHERE account.id = $2
+                         AND EXISTS (
+                             SELECT 1 FROM identity.tenant_memberships membership
+                             WHERE membership.tenant_id = $1
+                               AND membership.user_id = account.id
+                         )
+                         AND lower(trim(account.display_name)) = 'preethi s'
+                         AND lower(trim($3)) <> 'preethi s'
+                         AND (account.display_name, account.initials,
+                              account.account_type, account.profile)
+                             IS DISTINCT FROM ($3, $4, $5, $6)"#,
+                )
+                .bind(tenant_id)
+                .bind(user_id)
+                .bind(display_name)
+                .bind(initials)
+                .bind(account_type)
+                .bind(account_profile)
+                .execute(&mut *transaction)
+                .await?;
+
+                if result.rows_affected() > 0 {
+                    repaired += result.rows_affected();
+                    repaired_users.push(user_id.to_string());
+                    sqlx::query(
+                        r#"UPDATE identity.tenant_memberships
+                           SET profile = $3, updated_at = now()
+                           WHERE tenant_id = $1 AND user_id = $2
+                             AND profile IS DISTINCT FROM $3"#,
+                    )
+                    .bind(tenant_id)
+                    .bind(user_id)
+                    .bind(membership_profile)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+            }
+
+            if !repaired_users.is_empty() {
+                sqlx::query(
+                    r#"UPDATE identity.auth_sessions
+                       SET revoked_at = now()
+                       WHERE tenant_id = $1
+                         AND user_id = ANY($2)
+                         AND revoked_at IS NULL"#,
+                )
+                .bind(tenant_id)
+                .bind(&repaired_users)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
+        }
+
+        Ok(repaired)
+    }
+
     pub async fn effective_access(
         &self,
         tenant_slug: &str,

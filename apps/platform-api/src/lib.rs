@@ -218,6 +218,13 @@ pub async fn run() -> anyhow::Result<()> {
     } else {
         tenant_databases.ping_registered().await?;
     }
+    let repaired_identities = state.reconcile_control_identities_from_tenants().await?;
+    if repaired_identities > 0 {
+        tracing::warn!(
+            count = repaired_identities,
+            "restored control-plane identities from tenant databases"
+        );
+    }
     tracing::info!(storage = "postgresql", "SuperCampus storage connected");
     let host = std::env::var("HTTP_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port = std::env::var("HTTP_PORT").unwrap_or_else(|_| "4000".into());

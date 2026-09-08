@@ -20,6 +20,7 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(crate::library_lending::router())
         .route("/changes", get(changes))
         .route("/notifications", get(notifications))
         .route("/canteen/store", get(canteen_store))

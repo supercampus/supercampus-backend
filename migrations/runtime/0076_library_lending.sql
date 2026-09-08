@@ -95,7 +95,7 @@ ON CONFLICT (permission_key) DO UPDATE SET
     active = true,
     updated_at = now();
 
-INSERT INTO authz.permissions
+INSERT INTO authz.permission_definitions
     (tenant_id, permission_key, module_key, feature_key, action, display_name, description, crud_actions, active)
 SELECT tenant.id, template.permission_key, template.module_key, template.feature_key,
        template.action, template.display_name, template.description, template.crud_actions, true

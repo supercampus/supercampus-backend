@@ -260,6 +260,18 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to apply platform maintenance windows")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0093_library_lending.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply library lending authorization")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0094_library_lending_app_access.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to grant library lending app access")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");
@@ -386,6 +398,18 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to configure student residency management")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0093_library_lending.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to configure MEC library lending")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0094_library_lending_app_access.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to grant MEC library lending app access")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;

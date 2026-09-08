@@ -62,6 +62,28 @@ BEGIN
                AND membership.tenant_id = mec_tenant_id
                AND membership.user_id = student.user_account_id;
 
+            -- Active sessions contain a profile snapshot. Revoke only a
+            -- session that still carries the temporary roll so its next login
+            -- is rebuilt from the corrected identity record. Because the
+            -- snapshot is also updated, this is a one-time operation.
+            UPDATE identity.auth_sessions auth_session
+               SET profile = COALESCE(auth_session.profile, '{}'::jsonb) || jsonb_build_object(
+                       'roll', roster_row->>'number',
+                       'dept', roster_row->>'abbreviation',
+                       'departmentCode', roster_row->>'code',
+                       'department', roster_row->>'department',
+                       'gender', lower(roster_row->>'gender'),
+                       'sportsHouse', roster_row->>'house'
+                   ),
+                   revoked_at = COALESCE(auth_session.revoked_at, now()),
+                   last_seen_at = now()
+              FROM core.students student
+             WHERE student.id = matched_student_id
+               AND auth_session.tenant_id = mec_tenant_id
+               AND auth_session.user_id = student.user_account_id::text
+               AND upper(COALESCE(auth_session.profile->>'roll', '')) =
+                   upper(roster_row->>'oldNumber');
+
             UPDATE application_desk.cases desk_case
                SET student_number = CASE
                        WHEN upper(COALESCE(desk_case.student_number, '')) = upper(roster_row->>'oldNumber')

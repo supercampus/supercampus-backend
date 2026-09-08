@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod admin_users;
 mod student_accounts;
 
 use crate::{
@@ -66,6 +67,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/authorization/users/{user_id}/roles",
             put(assign_tenant_user_roles),
+        )
+        .route(
+            "/authorization/users/{user_id}/password",
+            put(admin_users::set_tenant_user_password),
         )
         .route(
             "/authorization/users/{user_id}/access",

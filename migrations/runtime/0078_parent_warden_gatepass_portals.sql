@@ -121,10 +121,10 @@ BEGIN
      WHERE student.tenant_id = mec_tenant
        AND student.user_account_id IS NOT NULL
        AND (
-         upper(student.student_number) = 'MEC25AD48'
+         student.student_number = '413225243049'
          OR lower(student.full_name) IN ('vishnu s', 'vishnu sudharshan')
        )
-     ORDER BY CASE WHEN upper(student.student_number) = 'MEC25AD48' THEN 0 ELSE 1 END
+     ORDER BY CASE WHEN student.student_number = '413225243049' THEN 0 ELSE 1 END
      LIMIT 1;
 
     IF child_user_id IS NOT NULL THEN

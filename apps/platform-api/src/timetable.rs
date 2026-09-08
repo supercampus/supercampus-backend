@@ -1,20 +1,20 @@
 use anyhow::Context;
 use axum::{
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post, put},
-    Extension, Json, Router,
 };
 use chrono::{NaiveDate, NaiveTime};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::{
     error::{ApiError, ApiResult},
-    governance::{any_role_may_perform, GovernedCapability},
+    governance::{GovernedCapability, any_role_may_perform},
     models::ApiResponse,
     state::{AppState, AuthPrincipal, EffectiveAccess},
 };
@@ -1327,9 +1327,10 @@ async fn generate_version(
         });
     }
 
-    let existing = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Uuid, i16)>(
+    let existing = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Uuid, i16, Uuid, String, Uuid)>(
         r#"SELECT entry.slot_id, offering.section_id,
-        assignment.faculty_user_id, entry.room_id, slot.day_of_week
+        assignment.faculty_user_id, entry.room_id, slot.day_of_week,
+        entry.subject_offering_id, entry.delivery_type, entry.session_block_id
         FROM core.timetable_entries entry
         JOIN core.subject_offerings offering ON offering.id = entry.subject_offering_id
         JOIN core.teaching_assignments assignment ON assignment.id = entry.teaching_assignment_id
@@ -1342,24 +1343,43 @@ async fn generate_version(
     let mut faculty_busy = HashSet::new();
     let mut room_busy = HashSet::new();
     let mut faculty_daily: HashMap<(Uuid, i16), i16> = HashMap::new();
-    for (slot, section, faculty, room, day) in existing {
+    let mut existing_workload_periods: HashMap<(Uuid, String), i16> = HashMap::new();
+    let mut existing_subject_blocks: HashSet<(Uuid, String, i16, Uuid)> = HashSet::new();
+    for (slot, section, faculty, room, day, subject, delivery, block) in existing {
         section_busy.insert((section, slot));
         faculty_busy.insert((faculty, slot));
         room_busy.insert((room, slot));
         *faculty_daily.entry((faculty, day)).or_default() += 1;
+        *existing_workload_periods
+            .entry((subject, delivery.clone()))
+            .or_default() += 1;
+        existing_subject_blocks.insert((subject, delivery, day, block));
     }
-    let mut subject_day_blocks: HashMap<(Uuid, i16), i16> = HashMap::new();
+    let mut subject_day_blocks: HashMap<(Uuid, String, i16), i16> = HashMap::new();
+    for (subject, delivery, day, _) in existing_subject_blocks {
+        *subject_day_blocks
+            .entry((subject, delivery, day))
+            .or_default() += 1;
+    }
     let mut scheduled = 0_i32;
     let mut unscheduled = Vec::new();
 
     for workload in workloads {
-        let mut remaining = workload.periods_per_week;
+        let existing_periods = existing_workload_periods
+            .get(&(workload.subject_offering_id, workload.delivery_type.clone()))
+            .copied()
+            .unwrap_or(0);
+        let mut remaining = (workload.periods_per_week - existing_periods).max(0);
         while remaining > 0 {
             let length = workload.block_size.min(remaining).max(1);
             let mut placed = false;
             for day in 1_i16..=7 {
                 if subject_day_blocks
-                    .get(&(workload.subject_offering_id, day))
+                    .get(&(
+                        workload.subject_offering_id,
+                        workload.delivery_type.clone(),
+                        day,
+                    ))
                     .copied()
                     .unwrap_or(0)
                     >= workload.max_blocks_per_day
@@ -1422,7 +1442,11 @@ async fn generate_version(
                         .entry((workload.faculty_user_id, day))
                         .or_default() += length;
                     *subject_day_blocks
-                        .entry((workload.subject_offering_id, day))
+                        .entry((
+                            workload.subject_offering_id,
+                            workload.delivery_type.clone(),
+                            day,
+                        ))
                         .or_default() += 1;
                     scheduled += i32::from(length);
                     remaining -= length;
@@ -1468,9 +1492,7 @@ async fn publish_version(
     let conflicts =
         publication_conflicts(&mut tx, &principal.student.tenant_id, version_id).await?;
     if conflicts.as_array().is_some_and(|items| !items.is_empty()) {
-        return Err(ApiError::Conflict(format!(
-            "timetable has conflicts: {conflicts}"
-        )));
+        return Err(ApiError::Conflict(publication_conflict_message(&conflicts)));
     }
     let configuration_id = sqlx::query_scalar::<_, Uuid>(r#"SELECT version.configuration_id
         FROM core.timetable_versions version JOIN platform.tenants tenant ON tenant.id = version.tenant_id
@@ -1496,6 +1518,49 @@ async fn publish_version(
     Ok(Json(ApiResponse::new(
         json!({"revision": revision, "version": payload}),
     )))
+}
+
+fn publication_conflict_message(conflicts: &Value) -> String {
+    let items = conflicts.as_array().map(Vec::as_slice).unwrap_or_default();
+    let count = |kind: &str| {
+        items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some(kind))
+            .count()
+    };
+    let workload = count("workload_periods") + count("workload_not_configured");
+    let daily = count("daily_block_limit");
+    let collisions = count("room") + count("faculty") + count("section");
+    let mut details = Vec::new();
+    if workload > 0 {
+        details.push(format!(
+            "{workload} subject workload{} do not match the configured weekly periods",
+            if workload == 1 { "" } else { "s" }
+        ));
+    }
+    if daily > 0 {
+        details.push(format!(
+            "{daily} subject placement{} exceed the daily block limit",
+            if daily == 1 { "" } else { "s" }
+        ));
+    }
+    if collisions > 0 {
+        details.push(format!(
+            "{collisions} room, faculty, or class collision{} remain",
+            if collisions == 1 { "" } else { "s" }
+        ));
+    }
+    let known = workload + daily + collisions;
+    if items.len() > known {
+        details.push(format!(
+            "{} other schedule rule conflicts remain",
+            items.len() - known
+        ));
+    }
+    format!(
+        "Timetable is not ready to publish. {}. Open each affected class, regenerate its timetable, and publish again.",
+        details.join("; ")
+    )
 }
 
 async fn publication_conflicts(
@@ -2025,11 +2090,13 @@ mod tests {
         assert!(require_timetable_manager(&principal("principal"), &allowed).is_ok());
         assert!(require_timetable_manager(&principal("academic_administrator"), &allowed).is_ok());
         assert!(require_timetable_manager(&principal("hod"), &allowed).is_err());
-        assert!(require_timetable_manager(
-            &principal("principal"),
-            &access("academics.timetable.manage", "department")
-        )
-        .is_err());
+        assert!(
+            require_timetable_manager(
+                &principal("principal"),
+                &access("academics.timetable.manage", "department")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2048,5 +2115,17 @@ mod tests {
             assert!(valid_room_type(room_type));
         }
         assert!(!valid_room_type("department_room_1"));
+    }
+
+    #[test]
+    fn publication_conflicts_are_explained_without_internal_ids() {
+        let conflicts = json!([
+            {"type":"workload_periods","resourceId":"subject-uuid:class"},
+            {"type":"daily_block_limit","resourceId":"subject-uuid:class"}
+        ]);
+        let message = publication_conflict_message(&conflicts);
+        assert!(message.contains("1 subject workload"));
+        assert!(message.contains("1 subject placement"));
+        assert!(!message.contains("subject-uuid"));
     }
 }

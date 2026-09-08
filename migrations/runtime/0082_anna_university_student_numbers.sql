@@ -61,8 +61,104 @@ BEGIN
              WHERE student.id = matched_student_id
                AND membership.tenant_id = mec_tenant_id
                AND membership.user_id = student.user_account_id;
+
+            UPDATE application_desk.cases desk_case
+               SET student_number = CASE
+                       WHEN upper(COALESCE(desk_case.student_number, '')) = upper(roster_row->>'oldNumber')
+                           THEN roster_row->>'number'
+                       ELSE desk_case.student_number
+                   END,
+                   document = regexp_replace(
+                       desk_case.document::text,
+                       roster_row->>'oldNumber',
+                       roster_row->>'number',
+                       'gi'
+                   )::jsonb,
+                   updated_at = now()
+             WHERE desk_case.tenant_id = mec_tenant_id
+               AND (
+                   upper(COALESCE(desk_case.student_number, '')) = upper(roster_row->>'oldNumber')
+                   OR upper(desk_case.document::text) LIKE '%' || upper(roster_row->>'oldNumber') || '%'
+               );
+
+            IF to_regclass('library.book_loans') IS NOT NULL THEN
+                EXECUTE
+                    'UPDATE library.book_loans
+                        SET roll_number = $3, updated_at = now()
+                      WHERE tenant_id = $1 AND upper(roll_number) = upper($2)'
+                    USING mec_tenant_id, roster_row->>'oldNumber', roster_row->>'number';
+            END IF;
+
+            IF to_regclass('campus_ops.events') IS NOT NULL THEN
+                EXECUTE
+                    'UPDATE campus_ops.events
+                        SET payload = regexp_replace(payload::text, $2, $3, ''gi'')::jsonb
+                      WHERE tenant_id = $1
+                        AND upper(payload::text) LIKE ''%'' || upper($2) || ''%'''
+                    USING mec_tenant_id, roster_row->>'oldNumber', roster_row->>'number';
+            END IF;
         END IF;
     END LOOP;
+
+    -- Official registration numbers are the only accepted student identifiers.
+    -- Remove any unmatched temporary values so a legacy seed cannot surface in
+    -- authentication or a downstream operation again.
+    UPDATE identity.users
+       SET profile = profile - 'roll', updated_at = now()
+     WHERE upper(COALESCE(profile->>'roll', '')) LIKE 'MEC25%';
+
+    UPDATE identity.tenant_memberships
+       SET profile = profile - 'roll', updated_at = now()
+     WHERE tenant_id = mec_tenant_id
+       AND upper(COALESCE(profile->>'roll', '')) LIKE 'MEC25%';
+
+    UPDATE application_desk.cases
+       SET student_number = NULL,
+           document = regexp_replace(document::text, 'MEC25[A-Z0-9]+', '', 'gi')::jsonb,
+           updated_at = now()
+     WHERE tenant_id = mec_tenant_id
+       AND (
+           upper(COALESCE(student_number, '')) LIKE 'MEC25%'
+           OR upper(document::text) ~ 'MEC25[A-Z0-9]+'
+       );
+
+    IF to_regclass('library.book_loans') IS NOT NULL THEN
+        EXECUTE
+            'DELETE FROM library.book_loans
+              WHERE tenant_id = $1 AND upper(roll_number) LIKE ''MEC25%'''
+            USING mec_tenant_id;
+    END IF;
+
+    IF to_regclass('campus_ops.events') IS NOT NULL THEN
+        EXECUTE
+            'UPDATE campus_ops.events
+                SET payload = regexp_replace(payload::text, ''MEC25[A-Z0-9]+'', '''', ''gi'')::jsonb
+              WHERE tenant_id = $1 AND upper(payload::text) ~ ''MEC25[A-Z0-9]+'''
+            USING mec_tenant_id;
+    END IF;
+
+    UPDATE application_desk.cases desk_case
+       SET student_id = NULL, updated_at = now()
+     WHERE desk_case.tenant_id = mec_tenant_id
+       AND desk_case.student_id IN (
+           SELECT student.id
+             FROM core.students student
+            WHERE student.tenant_id = mec_tenant_id
+              AND upper(student.student_number) LIKE 'MEC25%'
+       );
+
+    DELETE FROM core.academic_enrollments enrollment
+     WHERE enrollment.tenant_id = mec_tenant_id
+       AND enrollment.student_id IN (
+           SELECT student.id
+             FROM core.students student
+            WHERE student.tenant_id = mec_tenant_id
+              AND upper(student.student_number) LIKE 'MEC25%'
+       );
+
+    DELETE FROM core.students
+     WHERE tenant_id = mec_tenant_id
+       AND upper(student_number) LIKE 'MEC25%';
 
     preethi_profile := jsonb_build_object(
         'roll', '413225205021', 'dept', 'IT', 'departmentCode', '205',

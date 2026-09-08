@@ -272,6 +272,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to grant library lending app access")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0082_anna_university_student_numbers.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to replace legacy MEC student numbers in the control plane")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");
@@ -369,12 +375,6 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .context("failed to apply the MEC class advisor attendance scope")?;
         sqlx::raw_sql(include_str!(
-            "../../../migrations/runtime/0082_anna_university_student_numbers.sql"
-        ))
-        .execute(mec_database.pool())
-        .await
-        .context("failed to apply the MEC Anna University student roster")?;
-        sqlx::raw_sql(include_str!(
             "../../../migrations/runtime/0086_mec_hod_department_authorities.sql"
         ))
         .execute(mec_database.pool())
@@ -410,6 +410,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to grant MEC library lending app access")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0082_anna_university_student_numbers.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to replace legacy MEC student numbers in every operation")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;

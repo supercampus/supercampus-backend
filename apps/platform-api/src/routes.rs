@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod student_accounts;
+
 use crate::{
     error::{ApiError, ApiResult},
     models::{
@@ -85,6 +87,10 @@ pub fn router(state: AppState) -> Router {
         .route("/student-master", get(list_student_master))
         .route("/student/fees", get(list_own_student_fee_records))
         .route("/student-master/import", post(import_student_master))
+        .route(
+            "/student-master/accounts/import",
+            post(student_accounts::import),
+        )
         .route("/student-master/{student_id}/photo", put(set_student_photo))
         .route(
             "/student-master/{student_id}/residency",

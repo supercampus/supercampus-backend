@@ -278,6 +278,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to replace legacy MEC student numbers in the control plane")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0095_restore_mec_user_identities.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to restore canonical MEC identities in the control plane")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");
@@ -416,6 +422,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to replace legacy MEC student numbers in every operation")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0095_restore_mec_user_identities.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to restore canonical MEC identities in the tenant database")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;

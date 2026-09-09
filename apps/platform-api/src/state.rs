@@ -699,6 +699,12 @@ impl AppState {
                           ''
                       ) AS department,
                       student.phone, student.email, student.status,
+                      COALESCE(
+                          NULLIF(student.profile ->> 'yearOfStudy', ''),
+                          NULLIF(student.profile ->> 'year', ''),
+                          NULLIF(student.academic_year, '')
+                      ) AS year_of_study,
+                      NULLIF(student.profile ->> 'section', '') AS section,
                       NULLIF(student.profile ->> 'photoUrl', '') AS photo_url,
                       CASE lower(COALESCE(student.profile ->> 'residency', ''))
                         WHEN 'hosteller' THEN 'hosteller'
@@ -730,6 +736,8 @@ impl AppState {
                     "mobileNumber": row.try_get::<Option<String>, _>("phone")?.unwrap_or_default(),
                     "email": row.try_get::<Option<String>, _>("email")?.unwrap_or_default(),
                     "status": row.try_get::<String, _>("status")?,
+                    "yearOfStudy": row.try_get::<Option<String>, _>("year_of_study")?,
+                    "section": row.try_get::<Option<String>, _>("section")?,
                     "photoUrl": row.try_get::<Option<String>, _>("photo_url")?,
                     "residency": row.try_get::<String, _>("residency")?,
                     "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?,
@@ -1990,6 +1998,10 @@ impl AppState {
         let rows = sqlx::query(
             r#"SELECT user_account.id, user_account.email, user_account.display_name,
                       user_account.initials, user_account.account_type, user_account.active,
+                      COALESCE(
+                          NULLIF(membership.profile ->> 'yearOfStudy', ''),
+                          NULLIF(membership.profile ->> 'year', '')
+                      ) AS year_of_study,
                       COALESCE((
                           SELECT jsonb_agg(jsonb_build_object(
                               'id', role.id, 'key', role.role_key, 'name', role.name,
@@ -2021,6 +2033,7 @@ impl AppState {
                     "initials": row.try_get::<String, _>("initials")?,
                     "accountType": row.try_get::<String, _>("account_type")?,
                     "active": row.try_get::<bool, _>("active")?,
+                    "yearOfStudy": row.try_get::<Option<String>, _>("year_of_study")?,
                     "roles": row.try_get::<Value, _>("roles")?,
                 }))
             })

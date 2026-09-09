@@ -2286,6 +2286,11 @@ async fn wallet_directory(
             'studentName', student.full_name,
             'email', student.email,
             'department', COALESCE(department.code, student.department_id, ''),
+            'yearOfStudy', COALESCE(
+              NULLIF(student.profile->>'yearOfStudy',''),
+              NULLIF(student.profile->>'year',''),
+              NULLIF(student.academic_year,'')
+            ),
             'photoUrl', NULLIF(student.profile ->> 'photoUrl', ''),
             'balance', COALESCE(wallet.balance, 0)::float8,
             'updatedAt', wallet.updated_at,

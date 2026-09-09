@@ -12,7 +12,7 @@ Students page has Bulk upload. Both download a header-only CSV template:
 
 Use Year 1 for first year. Department must match an existing department code,
 name, or UUID. Roll numbers/mobile numbers should be text in Excel. Passwords
-must have at least 12 characters and at most 72 UTF-8 bytes. Keep the file private
+must have at least 8 characters and at most 72 UTF-8 bytes. Keep the file private
 and distribute passwords individually. Password reset on first login is not
 enforced by this change. Photographs are optional and can be added later through
 the existing profile flow or the admin Students photo-upload control.

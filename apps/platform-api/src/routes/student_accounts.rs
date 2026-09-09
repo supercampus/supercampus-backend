@@ -3,7 +3,7 @@
 use crate::{
     error::{ApiError, ApiResult},
     models::ApiResponse,
-    state::{AppState, AuthPrincipal, EffectiveAccess, MINIMUM_PASSWORD_LENGTH},
+    state::{AppState, AuthPrincipal, EffectiveAccess},
 };
 use axum::{Extension, Json, extract::State};
 use serde::Deserialize;
@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use std::collections::HashSet;
 use uuid::Uuid;
+
+const MINIMUM_PASSWORD_LENGTH: usize = 8;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -202,6 +204,16 @@ mod tests {
         assert!(validate(&[]).is_err());
         let mut r = row();
         r.password = "123".into();
+        assert!(validate(&[r]).is_err());
+    }
+
+    #[test]
+    fn accepts_eight_characters_but_not_seven() {
+        let mut r = row();
+        r.password = "Abcd1234".into();
+        assert!(validate(&[r]).is_ok());
+        let mut r = row();
+        r.password = "Abcd123".into();
         assert!(validate(&[r]).is_err());
     }
 }

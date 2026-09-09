@@ -273,12 +273,6 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .context("failed to grant library lending app access")?;
         sqlx::raw_sql(include_str!(
-            "../../../migrations/runtime/0082_anna_university_student_numbers.sql"
-        ))
-        .execute(control_database.pool())
-        .await
-        .context("failed to replace legacy MEC student numbers in the control plane")?;
-        sqlx::raw_sql(include_str!(
             "../../../migrations/runtime/0095_restore_mec_user_identities.sql"
         ))
         .execute(control_database.pool())
@@ -416,12 +410,6 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to grant MEC library lending app access")?;
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/runtime/0082_anna_university_student_numbers.sql"
-        ))
-        .execute(mec_database.pool())
-        .await
-        .context("failed to replace legacy MEC student numbers in every operation")?;
         sqlx::raw_sql(include_str!(
             "../../../migrations/runtime/0095_restore_mec_user_identities.sql"
         ))

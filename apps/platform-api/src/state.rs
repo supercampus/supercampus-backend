@@ -446,6 +446,165 @@ impl AppState {
         Ok(())
     }
 
+    /// Repairs identity snapshots from the tenant-owned Student and Employee
+    /// masters. Email is the stable match here: an earlier user-management
+    /// upsert could overwrite an existing account and leave its UUID attached
+    /// to a different person's master row.
+    pub async fn repair_duplicated_identity_names(&self) -> anyhow::Result<u64> {
+        let control = self.database.as_ref().context("PostgreSQL is required")?;
+        let mut repaired = 0_u64;
+
+        for tenant_slug in self.registered_tenant_slugs().await? {
+            let tenant = self.tenant_database(&tenant_slug).await?;
+            let canonical_people = sqlx::query(
+                r#"SELECT lower(student.email) AS email, student.full_name,
+                          'student'::text AS account_type,
+                          COALESCE(student.profile, '{}'::jsonb)
+                              || jsonb_build_object(
+                                  'roll', student.student_number,
+                                  'team', 'Students',
+                                  'dept', COALESCE(department.code,
+                                                   NULLIF(student.department_id, ''), '')
+                              ) AS profile
+                   FROM core.students student
+                   JOIN platform.tenants tenant ON tenant.id = student.tenant_id
+                   LEFT JOIN core.departments department
+                     ON department.tenant_id = student.tenant_id
+                    AND department.id::text = student.department_id
+                   WHERE tenant.slug = $1
+                     AND student.email IS NOT NULL
+                     AND student.status IN ('provisional', 'active')
+
+                   UNION ALL
+
+                   SELECT lower(employee.email), employee.full_name, 'staff'::text,
+                          (COALESCE(employee.profile, '{}'::jsonb)
+                              - 'roll' - 'year' - 'section' - 'residency' - 'gender')
+                              || jsonb_build_object(
+                                  'employeeNumber', employee.employee_number,
+                                  'dept', COALESCE(department.code, '')
+                              )
+                   FROM core.employees employee
+                   JOIN platform.tenants tenant ON tenant.id = employee.tenant_id
+                   LEFT JOIN core.departments department
+                     ON department.tenant_id = employee.tenant_id
+                    AND department.id = employee.department_id
+                   WHERE tenant.slug = $1
+                     AND employee.email IS NOT NULL
+                     AND employee.status IN ('provisional', 'active')
+
+                   UNION ALL
+
+                   SELECT lower(guardian.email), guardian.full_name, 'staff'::text,
+                          COALESCE(guardian.profile, '{}'::jsonb)
+                   FROM core.guardians guardian
+                   JOIN platform.tenants tenant ON tenant.id = guardian.tenant_id
+                   WHERE tenant.slug = $1 AND guardian.email IS NOT NULL"#,
+            )
+            .bind(&tenant_slug)
+            .fetch_all(tenant.pool())
+            .await
+            .with_context(|| format!("failed to load canonical people for tenant {tenant_slug}"))?;
+
+            let tenant_id =
+                sqlx::query_scalar::<_, Uuid>("SELECT id FROM platform.tenants WHERE slug = $1")
+                    .bind(&tenant_slug)
+                    .fetch_optional(control.pool())
+                    .await?
+                    .with_context(|| {
+                        format!("tenant {tenant_slug} is missing from the control plane")
+                    })?;
+            let mut transaction = control.pool().begin().await?;
+            let mut repaired_users = Vec::new();
+
+            for person in canonical_people {
+                let email: String = person.try_get("email")?;
+                let name: String = person.try_get("full_name")?;
+                let account_type: String = person.try_get("account_type")?;
+                let profile: Value = person.try_get("profile")?;
+                let repaired_user = sqlx::query_scalar::<_, Uuid>(
+                    r#"UPDATE identity.users account
+                       SET display_name = $3,
+                           initials = $4,
+                           account_type = $5,
+                           profile = $6,
+                           updated_at = now()
+                       WHERE lower(account.email) = $2
+                         AND lower(trim(account.display_name)) = 'preethi s'
+                         AND lower(trim($3)) <> 'preethi s'
+                         AND EXISTS (
+                             SELECT 1 FROM identity.tenant_memberships membership
+                             WHERE membership.tenant_id = $1
+                               AND membership.user_id = account.id
+                         )
+                       RETURNING account.id"#,
+                )
+                .bind(tenant_id)
+                .bind(&email)
+                .bind(&name)
+                .bind(initials(&name))
+                .bind(account_type)
+                .bind(&profile)
+                .fetch_optional(&mut *transaction)
+                .await?;
+
+                if let Some(user_id) = repaired_user {
+                    sqlx::query(
+                        r#"UPDATE identity.tenant_memberships
+                           SET profile = $3, updated_at = now()
+                           WHERE tenant_id = $1 AND user_id = $2"#,
+                    )
+                    .bind(tenant_id)
+                    .bind(user_id)
+                    .bind(profile)
+                    .execute(&mut *transaction)
+                    .await?;
+                    repaired += 1;
+                    repaired_users.push(user_id.to_string());
+                }
+            }
+
+            if tenant_slug == "mec" {
+                let vendor_id = sqlx::query_scalar::<_, Uuid>(
+                    r#"UPDATE identity.users account
+                       SET display_name = 'Akhil', initials = 'A',
+                           account_type = 'staff', updated_at = now()
+                       WHERE lower(account.email) = 'akhil@gmail.com'
+                         AND lower(trim(account.display_name)) = 'preethi s'
+                         AND EXISTS (
+                             SELECT 1 FROM identity.tenant_memberships membership
+                             WHERE membership.tenant_id = $1
+                               AND membership.user_id = account.id
+                         )
+                       RETURNING account.id"#,
+                )
+                .bind(tenant_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                if let Some(user_id) = vendor_id {
+                    repaired += 1;
+                    repaired_users.push(user_id.to_string());
+                }
+            }
+
+            if !repaired_users.is_empty() {
+                sqlx::query(
+                    r#"UPDATE identity.auth_sessions
+                       SET revoked_at = now()
+                       WHERE tenant_id = $1 AND user_id = ANY($2)
+                         AND revoked_at IS NULL"#,
+                )
+                .bind(tenant_id)
+                .bind(&repaired_users)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
+        }
+
+        Ok(repaired)
+    }
+
     pub async fn list_records(
         &self,
         tenant_id: &str,
@@ -1894,42 +2053,22 @@ impl AppState {
             bail!("one or more roles do not belong to this tenant");
         }
 
-        let existing_user: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM identity.users WHERE email = $1")
-                .bind(&email)
-                .fetch_optional(&mut *transaction)
-                .await?;
-        let created = existing_user.is_none();
-        let user_id = if let Some(user_id) = existing_user {
-            sqlx::query(
-                r#"UPDATE identity.users
-                   SET password_hash = crypt($2, gen_salt('bf', 12)),
-                       display_name = $3,
-                       initials = $4,
-                       active = true,
-                       updated_at = now()
-                   WHERE id = $1"#,
-            )
-            .bind(user_id)
-            .bind(password)
-            .bind(request.name.trim())
-            .bind(initials(request.name.trim()))
-            .execute(&mut *transaction)
-            .await?;
-            user_id
-        } else {
-            sqlx::query_scalar(
-                r#"INSERT INTO identity.users
-                   (email, password_hash, display_name, initials, account_type)
-                   VALUES ($1, crypt($2, gen_salt('bf', 12)), $3, $4, 'staff')
-                   RETURNING id"#,
-            )
-            .bind(&email)
-            .bind(password)
-            .bind(request.name.trim())
-            .bind(initials(request.name.trim()))
-            .fetch_one(&mut *transaction)
-            .await?
+        let user_id: Option<Uuid> = sqlx::query_scalar(
+            r#"INSERT INTO identity.users
+               (email, password_hash, display_name, initials, account_type)
+               VALUES ($1, crypt($2, gen_salt('bf', 12)), $3, $4, 'staff')
+               ON CONFLICT (email) DO NOTHING
+               RETURNING id"#,
+        )
+        .bind(&email)
+        .bind(password)
+        .bind(request.name.trim())
+        .bind(initials(request.name.trim()))
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(user_id) = user_id else {
+            transaction.rollback().await?;
+            return Ok(None);
         };
 
         sqlx::query(
@@ -1962,7 +2101,7 @@ impl AppState {
             "email": email,
             "name": request.name.trim(),
             "roleIds": request.role_ids,
-            "created": created,
+            "created": true,
         })))
     }
 

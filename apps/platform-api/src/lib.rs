@@ -441,6 +441,13 @@ pub async fn run() -> anyhow::Result<()> {
     } else {
         tenant_databases.ping_registered().await?;
     }
+    let repaired_identities = state.repair_duplicated_identity_names().await?;
+    if repaired_identities > 0 {
+        tracing::warn!(
+            count = repaired_identities,
+            "restored duplicated user names from tenant master records"
+        );
+    }
     tracing::info!(storage = "postgresql", "SuperCampus storage connected");
     let host = std::env::var("HTTP_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port = std::env::var("HTTP_PORT").unwrap_or_else(|_| "4000".into());

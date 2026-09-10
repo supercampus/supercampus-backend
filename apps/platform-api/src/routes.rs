@@ -1194,18 +1194,12 @@ async fn validate_workflow_transition(
 
 async fn login(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let tenant_id = headers
-        .get("x-tenant-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::BadRequest("The tenant ID is required".into()))?
-        .to_ascii_lowercase();
     let identity = state
-        .authenticate_credentials(&request.email, &request.password, Some(&tenant_id))
+        // Email addresses are globally unique in identity.users. The selected
+        // primary membership supplies the tenant; clients never choose one.
+        .authenticate_credentials(&request.email, &request.password, None)
         .await?;
     let Some(identity) = identity else {
         return Err(ApiError::InvalidCredentials);

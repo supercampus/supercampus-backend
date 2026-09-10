@@ -156,7 +156,12 @@ fn is_allowed_cors_origin(origin: &str, configured: &[HeaderValue], allow_local:
     // The Flutter web build is deployed as the mobile application test surface.
     // Keep this exact origin narrow: credentials are enabled, so a wildcard is
     // intentionally not used here.
-    if origin == "https://supercampusapplication-e0miwj-dcd788-200-141-5-86.sslip.io" {
+    if matches!(
+        origin,
+        "https://supercampusapplication-e0miwj-dcd788-200-141-5-86.sslip.io"
+            | "https://supercampus.ai"
+            | "https://www.supercampus.ai"
+    ) {
         return true;
     }
     if configured

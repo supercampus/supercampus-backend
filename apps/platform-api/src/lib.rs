@@ -284,6 +284,18 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to apply the geofence QR lifecycle release patch")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0098_hostel_services_and_meals.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the hostel services release patch")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0098_hostel_services_and_meals.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the hostel services release patch")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");
@@ -428,6 +440,18 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to configure the geofence QR lifecycle")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0098_hostel_services_and_meals.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to configure hostel services and meal access")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0098_hostel_services_and_meals.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to configure hostel services and meals")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;

@@ -93,6 +93,14 @@ pub fn router() -> Router<AppState> {
             "/library/announcements/{announcement_id}/decision",
             post(decide_library_announcement),
         )
+        .route("/hostel/overview", get(hostel_overview))
+        .route("/hostel/requests", post(create_hostel_service_request))
+        .route(
+            "/hostel/dining-settings",
+            put(update_hostel_dining_settings),
+        )
+        .route("/hostel/fee-entitlements", post(mark_hostel_fee_paid))
+        .route("/hostel/meal-tokens/redeem", post(redeem_hostel_meal))
         .route("/gatepass/overview", get(gatepass_overview))
         .route("/gatepass/requests", post(create_gatepass_request))
         .route(
@@ -159,6 +167,308 @@ pub fn router() -> Router<AppState> {
             "/attendance/reports/{report_id}/submit",
             post(submit_attendance_report),
         )
+}
+
+// ---------------------------------------------------------------- hostel services
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostelServiceRequestInput {
+    kind: String,
+    #[serde(default)]
+    details: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostelDiningSettingsInput {
+    menu_enabled: bool,
+    mess_enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostelFeeEntitlementInput {
+    student_user_id: String,
+    valid_from: NaiveDate,
+    valid_until: NaiveDate,
+    payment_reference: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostelMealRedeemInput {
+    qr_payload: String,
+}
+
+async fn hostel_overview(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let user_id = &principal.student.id;
+    let student = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+             'userId',student.user_account_id::text,
+             'studentId',student.id,
+             'name',student.full_name,
+             'rollNumber',student.student_number,
+             'programme',COALESCE(student.profile->>'programme',''),
+             'academicYear',COALESCE(student.academic_year,student.profile->>'year',''),
+             'residency',CASE lower(COALESCE(student.profile->>'residency',''))
+               WHEN 'hosteller' THEN 'hosteller'
+               WHEN 'day_scholar' THEN 'day_scholar'
+               ELSE CASE WHEN NULLIF(student.profile->>'hostel','') IS NOT NULL
+                 THEN 'hosteller' ELSE 'day_scholar' END END,
+             'hostel',NULLIF(student.profile->>'hostel',''),
+             'block',NULLIF(student.profile->>'block',''),
+             'floor',NULLIF(student.profile->>'floor',''),
+             'room',NULLIF(student.profile->>'room',''),
+             'bed',NULLIF(student.profile->>'bed',''))
+           FROM core.students student
+           WHERE student.tenant_id=$1
+             AND (student.user_account_id::text=$2 OR lower(student.email)=lower($3))
+           LIMIT 1"#,
+    )
+    .bind(tenant)
+    .bind(user_id)
+    .bind(&principal.student.email)
+    .fetch_optional(db.pool())
+    .await?
+    .unwrap_or_else(|| {
+        json!({
+            "userId": user_id,
+            "name": principal.student.name,
+            "rollNumber": principal.student.roll,
+            "residency": "day_scholar"
+        })
+    });
+
+    let is_hosteller = student.get("residency").and_then(Value::as_str) == Some("hosteller");
+    let settings = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object('menuEnabled',menu_enabled,'messEnabled',mess_enabled,
+               'updatedAt',updated_at)
+           FROM campus_ops.hostel_dining_settings WHERE tenant_id=$1"#,
+    )
+    .bind(tenant)
+    .fetch_optional(db.pool())
+    .await?
+    .unwrap_or_else(|| json!({"menuEnabled": true, "messEnabled": true}));
+    let entitlement = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object('id',id,'validFrom',valid_from,'validUntil',valid_until,
+               'paymentReference',payment_reference,'status',status)
+           FROM campus_ops.hostel_fee_entitlements
+           WHERE tenant_id=$1 AND student_user_id=$2 AND status='paid'
+             AND (now() AT TIME ZONE 'Asia/Kolkata')::date BETWEEN valid_from AND valid_until
+           ORDER BY valid_until DESC LIMIT 1"#,
+    )
+    .bind(tenant)
+    .bind(user_id)
+    .fetch_optional(db.pool())
+    .await?;
+
+    let mess_enabled = settings
+        .get("messEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if is_hosteller && mess_enabled && entitlement.is_some() {
+        for (meal_type, start, end) in [
+            ("breakfast", "07:30:00", "09:30:00"),
+            ("lunch", "12:30:00", "14:30:00"),
+            ("dinner", "19:30:00", "21:30:00"),
+        ] {
+            let token = format!("SC-MEAL:{}", Uuid::new_v4());
+            sqlx::query(
+                r#"INSERT INTO campus_ops.hostel_meal_tokens
+                   (tenant_id,student_user_id,service_date,meal_type,qr_payload,valid_from,valid_until)
+                   VALUES($1,$2,(now() AT TIME ZONE 'Asia/Kolkata')::date,$3,$4,
+                     (((now() AT TIME ZONE 'Asia/Kolkata')::date + $5::time) AT TIME ZONE 'Asia/Kolkata'),
+                     (((now() AT TIME ZONE 'Asia/Kolkata')::date + $6::time) AT TIME ZONE 'Asia/Kolkata'))
+                   ON CONFLICT(tenant_id,student_user_id,service_date,meal_type) DO NOTHING"#,
+            )
+            .bind(tenant)
+            .bind(user_id)
+            .bind(meal_type)
+            .bind(token)
+            .bind(start)
+            .bind(end)
+            .execute(db.pool())
+            .await?;
+        }
+    }
+
+    let requests = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'id',id,'kind',request_kind,'status',status,'details',details,
+             'createdAt',created_at,'updatedAt',updated_at) ORDER BY created_at DESC),'[]'::jsonb)
+           FROM campus_ops.hostel_service_requests
+           WHERE tenant_id=$1 AND requester_user_id=$2"#,
+    )
+    .bind(tenant)
+    .bind(user_id)
+    .fetch_one(db.pool())
+    .await?;
+    let tokens = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'id',id,'mealType',meal_type,'serviceDate',service_date,
+             'qrPayload',qr_payload,'validFrom',valid_from,'validUntil',valid_until,
+             'status',CASE WHEN redeemed_at IS NOT NULL THEN 'used'
+                           WHEN now()>valid_until THEN 'expired' ELSE 'unused' END,
+             'redeemedAt',redeemed_at) ORDER BY valid_from),'[]'::jsonb)
+           FROM campus_ops.hostel_meal_tokens
+           WHERE tenant_id=$1 AND student_user_id=$2
+             AND service_date=(now() AT TIME ZONE 'Asia/Kolkata')::date"#,
+    )
+    .bind(tenant)
+    .bind(user_id)
+    .fetch_one(db.pool())
+    .await?;
+
+    Ok(Json(ApiResponse::new(json!({
+        "student": student,
+        "diningSettings": settings,
+        "feeEntitlement": entitlement,
+        "serviceRequests": requests,
+        "mealTokens": tokens,
+    }))))
+}
+
+async fn create_hostel_service_request(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(input): Json<HostelServiceRequestInput>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    let kind = input.kind.trim().to_ascii_lowercase();
+    if !matches!(
+        kind.as_str(),
+        "complaint" | "room_change" | "visitor" | "clearance"
+    ) {
+        return Err(ApiError::BadRequest(
+            "Unsupported hostel request type".into(),
+        ));
+    }
+    if !input.details.is_object() {
+        return Err(ApiError::BadRequest(
+            "Request details must be an object".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.hostel_service_requests
+           (tenant_id,requester_user_id,requester_name,request_kind,details)
+           VALUES($1,$2,$3,$4,$5)
+           RETURNING jsonb_build_object('id',id,'kind',request_kind,'status',status,
+             'details',details,'createdAt',created_at,'updatedAt',updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&principal.student.name)
+    .bind(kind)
+    .bind(input.details)
+    .fetch_one(db.pool())
+    .await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn update_hostel_dining_settings(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<HostelDiningSettingsInput>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(&access, &["hostel.records.update", "fees.records.update"])?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.hostel_dining_settings
+           (tenant_id,menu_enabled,mess_enabled,updated_by)
+           VALUES($1,$2,$3,$4)
+           ON CONFLICT(tenant_id) DO UPDATE SET menu_enabled=EXCLUDED.menu_enabled,
+             mess_enabled=EXCLUDED.mess_enabled,updated_by=EXCLUDED.updated_by,updated_at=now()
+           RETURNING jsonb_build_object('menuEnabled',menu_enabled,'messEnabled',mess_enabled,
+             'updatedAt',updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(input.menu_enabled)
+    .bind(input.mess_enabled)
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(value)))
+}
+
+async fn mark_hostel_fee_paid(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<HostelFeeEntitlementInput>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require_any(&access, &["hostel.records.update", "fees.records.update"])?;
+    if input.valid_until < input.valid_from || input.student_user_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "Choose a student and a valid coverage period".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM core.students WHERE tenant_id=$1 AND user_account_id::text=$2)",
+    )
+    .bind(tenant)
+    .bind(input.student_user_id.trim())
+    .fetch_one(db.pool())
+    .await?;
+    if !exists {
+        return Err(ApiError::NotFound("Student account not found".into()));
+    }
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.hostel_fee_entitlements
+           (tenant_id,student_user_id,valid_from,valid_until,payment_reference,marked_by)
+           VALUES($1,$2,$3,$4,$5,$6)
+           RETURNING jsonb_build_object('id',id,'studentUserId',student_user_id,
+             'validFrom',valid_from,'validUntil',valid_until,'status',status,
+             'paymentReference',payment_reference)"#,
+    )
+    .bind(tenant)
+    .bind(input.student_user_id.trim())
+    .bind(input.valid_from)
+    .bind(input.valid_until)
+    .bind(input.payment_reference.map(|value| value.trim().to_owned()))
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn redeem_hostel_meal(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<HostelMealRedeemInput>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(&access, &["hostel.records.update", "hostel.records.create"])?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.hostel_meal_tokens SET redeemed_at=now(),redeemed_by=$3
+           WHERE tenant_id=$1 AND qr_payload=$2 AND redeemed_at IS NULL
+             AND now() BETWEEN valid_from AND valid_until
+           RETURNING jsonb_build_object('id',id,'mealType',meal_type,'status','used',
+             'redeemedAt',redeemed_at)"#,
+    )
+    .bind(tenant)
+    .bind(input.qr_payload.trim())
+    .bind(&principal.student.id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| {
+        ApiError::Conflict(
+            "This meal QR is invalid, outside its meal window, or already used".into(),
+        )
+    })?;
+    Ok(Json(ApiResponse::new(value)))
 }
 
 // ---------------------------------------------------------------- campuses

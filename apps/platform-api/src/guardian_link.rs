@@ -90,6 +90,22 @@ pub async fn issue_guardian_link(
             body,
             media_url: None,
             template_variables: vec![student_name.to_owned(), link.clone()],
+            recipient_name: Some(guardian_name.to_owned()),
+            template_name: std::env::var("GALLABOX_TEMPLATE_GUARDIAN_APPROVAL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            template_values: [
+                ("GuardianName".to_owned(), guardian_name.to_owned()),
+                ("StudentName".to_owned(), student_name.to_owned()),
+                ("ActionUrl".to_owned(), link.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            button_values: vec![serde_json::json!({
+                "index": 0,
+                "sub_type": "url",
+                "parameters": {"type": "text", "text": link}
+            })],
         })
         .await;
 

@@ -10,7 +10,7 @@ use supercampus_notifications::{
     DisabledMailer, EmailMessage, Mailer,
     push::{DeliveryOutcome as PushOutcome, PushMessage, PushSender},
     sms::{DeliveryOutcome as SmsOutcome, LogSms, SmsMessage, SmsSender},
-    whatsapp::{DeliveryOutcome as WhatsAppOutcome, LogWhatsApp, WhatsAppMessage, WhatsAppSender},
+    whatsapp::{DeliveryOutcome as WhatsAppOutcome, WhatsAppMessage, WhatsAppSender},
 };
 use uuid::Uuid;
 
@@ -40,6 +40,22 @@ struct PushDeliveryJob {
     category: String,
     event_type: String,
     priority: String,
+    deep_link: Option<String>,
+    data: Value,
+    attempt_count: i32,
+}
+
+#[derive(Debug)]
+struct WhatsAppDeliveryJob {
+    id: Uuid,
+    tenant_id: Uuid,
+    notification_id: Uuid,
+    recipient_name: String,
+    phone: String,
+    title: String,
+    body: String,
+    category: String,
+    event_type: String,
     deep_link: Option<String>,
     data: Value,
     attempt_count: i32,
@@ -85,11 +101,9 @@ async fn main() -> anyhow::Result<()> {
         } else {
             supercampus_notifications::sms::sms_from_environment()?
         },
-        whatsapp: if push_only {
-            Arc::new(LogWhatsApp)
-        } else {
-            supercampus_notifications::whatsapp::whatsapp_from_environment()?
-        },
+        // Campus-event WhatsApp delivery is independent of the legacy CRM
+        // worker. `push_only` now disables only legacy CRM jobs.
+        whatsapp: supercampus_notifications::whatsapp::whatsapp_from_environment()?,
         push: supercampus_notifications::push::push_from_environment()?,
     };
     tracing::info!(
@@ -188,6 +202,332 @@ async fn process_tenant(
             record_push_result(database, &job, result).await?;
         }
     }
+    if transports.whatsapp.transport() != "log" {
+        enqueue_whatsapp_deliveries(database, tenant_id).await?;
+        let jobs = claim_whatsapp_batch(database, tenant_id).await?;
+        for job in jobs {
+            let result = deliver_notification_whatsapp(&job, transports.whatsapp.as_ref()).await;
+            record_whatsapp_result(database, &job, result).await?;
+        }
+    }
+    Ok(())
+}
+
+fn whatsapp_categories() -> Vec<String> {
+    std::env::var("WHATSAPP_EVENT_CATEGORIES")
+        .unwrap_or_else(|_| "attendance,gatepass,fees,examination,library,hostel,transport".into())
+        .split(',')
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+async fn enqueue_whatsapp_deliveries(database: &Database, tenant_id: Uuid) -> anyhow::Result<()> {
+    let mut transaction = database.pool().begin().await?;
+    set_tenant(&mut transaction, tenant_id).await?;
+    let lookback_hours = std::env::var("WHATSAPP_EVENT_LOOKBACK_HOURS")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(72)
+        .clamp(1, 720);
+    sqlx::query(
+        r#"WITH recipients AS (
+             SELECT notification.id AS notification_id,
+                    notification.recipient_user_id AS supplied_user_id
+             FROM campus_ops.notifications notification
+             WHERE notification.tenant_id=$1
+               AND notification.recipient_user_id IS NOT NULL
+               AND notification.category=ANY($2)
+               AND notification.created_at >= now()-make_interval(hours=>$3)
+               AND (notification.expires_at IS NULL OR notification.expires_at>now())
+             UNION ALL
+             SELECT notification.id,user_role.user_id::text
+             FROM campus_ops.notifications notification
+             JOIN authz.roles role
+               ON role.tenant_id=notification.tenant_id
+              AND role.role_key=notification.recipient_role AND role.active
+             JOIN authz.user_roles user_role
+               ON user_role.tenant_id=role.tenant_id AND user_role.role_id=role.id
+             WHERE notification.tenant_id=$1
+               AND notification.recipient_user_id IS NULL
+               AND notification.recipient_role IS NOT NULL
+               AND notification.category=ANY($2)
+               AND notification.created_at >= now()-make_interval(hours=>$3)
+               AND (notification.expires_at IS NULL OR notification.expires_at>now())
+           ), contacts AS (
+             SELECT recipient.notification_id,
+                    canonical.user_id,
+                    COALESCE(NULLIF(student.full_name,''),NULLIF(employee.full_name,''),
+                             NULLIF(guardian.full_name,''),NULLIF(account.display_name,''),
+                             'SuperCampus user') AS recipient_name,
+                    COALESCE(NULLIF(student.phone,''),NULLIF(employee.phone,''),
+                             NULLIF(guardian.phone,''),NULLIF(membership.profile->>'whatsapp',''),
+                             NULLIF(membership.profile->>'phone',''),
+                             NULLIF(account.profile->>'whatsapp',''),NULLIF(account.profile->>'phone','')) AS phone
+             FROM recipients recipient
+             LEFT JOIN identity.users direct_account ON direct_account.id::text=recipient.supplied_user_id
+             LEFT JOIN core.students student
+               ON student.tenant_id=$1
+              AND (student.id::text=recipient.supplied_user_id
+                   OR student.user_account_id::text=recipient.supplied_user_id)
+             LEFT JOIN core.employees employee
+               ON employee.tenant_id=$1
+              AND (employee.id::text=recipient.supplied_user_id
+                   OR employee.user_id::text=recipient.supplied_user_id)
+             LEFT JOIN core.guardians guardian
+               ON guardian.tenant_id=$1
+              AND (guardian.id::text=recipient.supplied_user_id
+                   OR guardian.user_id::text=recipient.supplied_user_id)
+             CROSS JOIN LATERAL (
+               SELECT COALESCE(direct_account.id,student.user_account_id,
+                               employee.user_id,guardian.user_id)::text AS user_id
+             ) canonical
+             JOIN identity.users account ON account.id::text=canonical.user_id AND account.active
+             LEFT JOIN identity.tenant_memberships membership
+               ON membership.tenant_id=$1 AND membership.user_id=account.id AND membership.active
+           )
+           INSERT INTO campus_ops.notification_whatsapp_deliveries
+             (tenant_id,notification_id,recipient_user_id,recipient_name,phone)
+           SELECT $1,contact.notification_id,contact.user_id,contact.recipient_name,contact.phone
+           FROM contacts contact
+           JOIN campus_ops.notifications notification
+             ON notification.tenant_id=$1 AND notification.id=contact.notification_id
+           JOIN campus_ops.notification_preferences preference
+             ON preference.tenant_id=$1 AND preference.user_id=contact.user_id
+            AND preference.category=notification.category
+            AND preference.whatsapp_enabled AND preference.whatsapp_opted_in_at IS NOT NULL
+           WHERE contact.user_id IS NOT NULL AND contact.phone IS NOT NULL
+           ON CONFLICT(tenant_id,notification_id,recipient_user_id) DO NOTHING"#,
+    )
+    .bind(tenant_id)
+    .bind(whatsapp_categories())
+    .bind(lookback_hours)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn claim_whatsapp_batch(
+    database: &Database,
+    tenant_id: Uuid,
+) -> anyhow::Result<Vec<WhatsAppDeliveryJob>> {
+    let mut transaction = database.pool().begin().await?;
+    set_tenant(&mut transaction, tenant_id).await?;
+    sqlx::query(
+        r#"UPDATE campus_ops.notification_whatsapp_deliveries
+           SET status='retrying',locked_at=NULL,next_attempt_at=now(),
+               last_error=COALESCE(last_error,'delivery lease expired'),updated_at=now()
+           WHERE tenant_id=$1 AND status='processing'
+             AND locked_at<now()-interval '10 minutes'"#,
+    )
+    .bind(tenant_id)
+    .execute(&mut *transaction)
+    .await?;
+    let rows = sqlx::query(
+        r#"WITH candidates AS (
+             SELECT id FROM campus_ops.notification_whatsapp_deliveries
+             WHERE tenant_id=$1 AND status IN ('queued','retrying')
+               AND next_attempt_at<=now()
+             ORDER BY next_attempt_at,created_at
+             FOR UPDATE SKIP LOCKED LIMIT $2
+           ), claimed AS (
+             UPDATE campus_ops.notification_whatsapp_deliveries delivery
+             SET status='processing',locked_at=now(),attempt_count=delivery.attempt_count+1,
+                 updated_at=now()
+             FROM candidates WHERE delivery.id=candidates.id RETURNING delivery.*
+           )
+           SELECT claimed.id,claimed.tenant_id,claimed.notification_id,
+                  claimed.recipient_name,claimed.phone,claimed.attempt_count,
+                  notification.title,notification.body,notification.category,
+                  notification.event_type,notification.deep_link,notification.data
+           FROM claimed
+           JOIN campus_ops.notifications notification ON notification.id=claimed.notification_id"#,
+    )
+    .bind(tenant_id)
+    .bind(BATCH_SIZE)
+    .fetch_all(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(WhatsAppDeliveryJob {
+                id: row.try_get("id")?,
+                tenant_id: row.try_get("tenant_id")?,
+                notification_id: row.try_get("notification_id")?,
+                recipient_name: row.try_get("recipient_name")?,
+                phone: row.try_get("phone")?,
+                title: row.try_get("title")?,
+                body: row.try_get("body")?,
+                category: row.try_get("category")?,
+                event_type: row.try_get("event_type")?,
+                deep_link: row.try_get("deep_link")?,
+                data: row.try_get("data")?,
+                attempt_count: row.try_get("attempt_count")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(Into::into)
+}
+
+fn event_template(category: &str) -> Option<String> {
+    let key = match category {
+        "attendance" => "GALLABOX_TEMPLATE_ATTENDANCE",
+        "gatepass" => "GALLABOX_TEMPLATE_GATEPASS",
+        "fees" => "GALLABOX_TEMPLATE_FEES",
+        "examination" => "GALLABOX_TEMPLATE_EXAMINATION",
+        "library" => "GALLABOX_TEMPLATE_LIBRARY",
+        "hostel" => "GALLABOX_TEMPLATE_HOSTEL",
+        "transport" => "GALLABOX_TEMPLATE_TRANSPORT",
+        _ => "GALLABOX_TEMPLATE_GENERAL",
+    };
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn action_url(deep_link: Option<&str>) -> Option<String> {
+    let base = std::env::var("SUPERCAMPUS_APP_URL").ok()?;
+    let deep_link = deep_link?;
+    Some(format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        if deep_link.starts_with('/') {
+            deep_link.to_owned()
+        } else {
+            format!("/{deep_link}")
+        }
+    ))
+}
+
+async fn deliver_notification_whatsapp(
+    job: &WhatsAppDeliveryJob,
+    sender: &dyn WhatsAppSender,
+) -> anyhow::Result<WhatsAppOutcome> {
+    let link = action_url(job.deep_link.as_deref());
+    let mut values = std::collections::BTreeMap::from([
+        ("RecipientName".into(), job.recipient_name.clone()),
+        ("Title".into(), job.title.clone()),
+        ("Message".into(), job.body.clone()),
+        ("EventType".into(), job.event_type.clone()),
+    ]);
+    if let Some(link) = link.as_ref() {
+        values.insert("ActionUrl".into(), link.clone());
+    }
+    if let Some(record) = job.data.get("record") {
+        for (source, target) in [
+            ("amount", "Amount"),
+            ("amountDue", "Amount"),
+            ("dueDate", "DueDate"),
+            ("status", "Status"),
+        ] {
+            if let Some(value) = record.get(source).and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| value.as_f64().map(|value| value.to_string()))
+            }) {
+                values.entry(target.into()).or_insert(value);
+            }
+        }
+    }
+    let button_values = if job.category == "fees" {
+        link.map(|url| {
+            vec![serde_json::json!({
+                "index": 0,
+                "sub_type": "url",
+                "parameters": {"type": "text", "text": url}
+            })]
+        })
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    sender
+        .send(WhatsAppMessage {
+            to: job.phone.clone(),
+            body: format!("{}\n{}", job.title, job.body),
+            media_url: None,
+            template_variables: vec![job.recipient_name.clone(), job.body.clone()],
+            recipient_name: Some(job.recipient_name.clone()),
+            template_name: event_template(&job.category),
+            template_values: values,
+            button_values,
+        })
+        .await
+}
+
+async fn record_whatsapp_result(
+    database: &Database,
+    job: &WhatsAppDeliveryJob,
+    result: anyhow::Result<WhatsAppOutcome>,
+) -> anyhow::Result<()> {
+    let mut transaction = database.pool().begin().await?;
+    set_tenant(&mut transaction, job.tenant_id).await?;
+    match result {
+        Ok(WhatsAppOutcome::Sent { message_id }) => {
+            sqlx::query(
+                r#"UPDATE campus_ops.notification_whatsapp_deliveries
+                   SET status='sent',provider_message_id=$3,sent_at=now(),locked_at=NULL,
+                       last_error=NULL,updated_at=now()
+                   WHERE tenant_id=$1 AND id=$2 AND status='processing'"#,
+            )
+            .bind(job.tenant_id)
+            .bind(job.id)
+            .bind(message_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        Ok(WhatsAppOutcome::NotConfigured) => {
+            sqlx::query(
+                r#"UPDATE campus_ops.notification_whatsapp_deliveries
+                   SET status='retrying',locked_at=NULL,last_error='WhatsApp is not configured',
+                       next_attempt_at=now()+interval '15 minutes',updated_at=now()
+                   WHERE tenant_id=$1 AND id=$2 AND status='processing'"#,
+            )
+            .bind(job.tenant_id)
+            .bind(job.id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        Err(error) => {
+            let terminal = job.attempt_count >= MAX_ATTEMPTS;
+            sqlx::query(
+                r#"UPDATE campus_ops.notification_whatsapp_deliveries
+                   SET status=$3,locked_at=NULL,last_error=$4,
+                       next_attempt_at=now()+make_interval(secs=>$5),updated_at=now()
+                   WHERE tenant_id=$1 AND id=$2 AND status='processing'"#,
+            )
+            .bind(job.tenant_id)
+            .bind(job.id)
+            .bind(if terminal { "failed" } else { "retrying" })
+            .bind(safe_error(&error))
+            .bind(retry_delay_seconds(job.attempt_count))
+            .execute(&mut *transaction)
+            .await?;
+            tracing::warn!(notification_id=%job.notification_id, attempt=job.attempt_count, terminal, "WhatsApp delivery failed");
+        }
+    }
+    sqlx::query(
+        r#"UPDATE campus_ops.notifications notification
+           SET whatsapp_sent_at=CASE WHEN EXISTS(
+                 SELECT 1 FROM campus_ops.notification_whatsapp_deliveries delivery
+                 WHERE delivery.notification_id=notification.id AND delivery.status='sent'
+               ) THEN COALESCE(notification.whatsapp_sent_at,now()) ELSE notification.whatsapp_sent_at END,
+               whatsapp_attempt_count=(SELECT COALESCE(MAX(attempt_count),0)
+                 FROM campus_ops.notification_whatsapp_deliveries WHERE notification_id=notification.id),
+               whatsapp_last_error=(SELECT last_error
+                 FROM campus_ops.notification_whatsapp_deliveries
+                 WHERE notification_id=notification.id AND last_error IS NOT NULL
+                 ORDER BY updated_at DESC LIMIT 1)
+           WHERE notification.tenant_id=$1 AND notification.id=$2"#,
+    )
+    .bind(job.tenant_id)
+    .bind(job.notification_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -470,6 +810,12 @@ async fn deliver(
                     body,
                     media_url: None,
                     template_variables: variables,
+                    recipient_name: None,
+                    template_name: std::env::var("GALLABOX_TEMPLATE_CRM")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty()),
+                    template_values: std::collections::BTreeMap::new(),
+                    button_values: Vec::new(),
                 })
                 .await?
             {

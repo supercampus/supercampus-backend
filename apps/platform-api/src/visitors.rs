@@ -315,6 +315,22 @@ pub async fn decide_visitor_pass(
             // cannot carry freeform text and a trial account cannot carry an
             // attachment at all.
             template_variables: vec![visitor_name.clone(), image_url.clone()],
+            recipient_name: Some(visitor_name.clone()),
+            template_name: std::env::var("GALLABOX_TEMPLATE_VISITOR_PASS")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            template_values: [
+                ("VisitorName".to_owned(), visitor_name.clone()),
+                ("HostName".to_owned(), host_name.clone()),
+                ("PassUrl".to_owned(), image_url.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            button_values: vec![serde_json::json!({
+                "index": 0,
+                "sub_type": "url",
+                "parameters": {"type": "text", "text": image_url.clone()}
+            })],
         })
         .await;
 

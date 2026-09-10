@@ -519,6 +519,10 @@ async fn read_all_notifications(
 struct NotificationPreferenceInput {
     category: String,
     push_enabled: bool,
+    /// `None` preserves the current WhatsApp consent when older clients update
+    /// push settings. Only an explicit `true` records opt-in.
+    #[serde(default)]
+    whatsapp_enabled: Option<bool>,
     #[serde(default)]
     digest_enabled: bool,
     quiet_hours_start: Option<String>,
@@ -535,6 +539,8 @@ async fn notification_preferences(
     let rows = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
              'category', category, 'pushEnabled', push_enabled,
+             'whatsappEnabled', whatsapp_enabled,
+             'whatsappOptedInAt', whatsapp_opted_in_at,
              'digestEnabled', digest_enabled,
              'quietHoursStart', quiet_hours_start,
              'quietHoursEnd', quiet_hours_end
@@ -569,11 +575,18 @@ async fn update_notification_preferences(
         )?;
         sqlx::query(
             r#"INSERT INTO campus_ops.notification_preferences
-                 (tenant_id,user_id,category,push_enabled,digest_enabled,
-                  quiet_hours_start,quiet_hours_end)
-               VALUES($1,$2,$3,$4,$5,$6::time,$7::time)
+                 (tenant_id,user_id,category,push_enabled,whatsapp_enabled,
+                  whatsapp_opted_in_at,digest_enabled,quiet_hours_start,quiet_hours_end)
+               VALUES($1,$2,$3,$4,COALESCE($5,false),
+                  CASE WHEN $5 IS TRUE THEN now() ELSE NULL END,$6,$7::time,$8::time)
                ON CONFLICT(tenant_id,user_id,category) DO UPDATE SET
                  push_enabled=EXCLUDED.push_enabled,
+                 whatsapp_enabled=COALESCE($5,notification_preferences.whatsapp_enabled),
+                 whatsapp_opted_in_at=CASE
+                   WHEN $5 IS TRUE THEN COALESCE(notification_preferences.whatsapp_opted_in_at,now())
+                   WHEN $5 IS FALSE THEN NULL
+                   ELSE notification_preferences.whatsapp_opted_in_at
+                 END,
                  digest_enabled=EXCLUDED.digest_enabled,
                  quiet_hours_start=EXCLUDED.quiet_hours_start,
                  quiet_hours_end=EXCLUDED.quiet_hours_end,
@@ -583,6 +596,7 @@ async fn update_notification_preferences(
         .bind(&notification_user_id)
         .bind(category)
         .bind(item.push_enabled)
+        .bind(item.whatsapp_enabled)
         .bind(item.digest_enabled)
         .bind(item.quiet_hours_start.as_deref())
         .bind(item.quiet_hours_end.as_deref())
@@ -5625,6 +5639,34 @@ async fn publish_attendance_session(
             &value,
         )
         .await?;
+        if status == "absent" {
+            let parents = sqlx::query_scalar::<_, String>(
+                r#"SELECT parent_user_id
+                   FROM campus_ops.parent_student_links
+                   WHERE tenant_id=$1 AND student_user_id=$2 AND active"#,
+            )
+            .bind(tenant)
+            .bind(student)
+            .fetch_all(&mut *tx)
+            .await?;
+            for parent in parents {
+                let parent_body = format!(
+                    "Your student was marked absent for {}",
+                    value["subjectName"].as_str().unwrap_or("class")
+                );
+                notify_tx(
+                    &mut tx,
+                    tenant,
+                    Some(&parent),
+                    None,
+                    "attendance",
+                    "Student absence recorded",
+                    &parent_body,
+                    &value,
+                )
+                .await?;
+            }
+        }
     }
     notify_tx(
         &mut tx,
@@ -6185,6 +6227,7 @@ async fn notify_tx(
         "Outpass approved by warden" => "gatepass.request.approved",
         "Outpass rejected by warden" => "gatepass.request.rejected",
         "Attendance marked" => "attendance.marked",
+        "Student absence recorded" => "attendance.absence.recorded",
         "Attendance ready for review" => "attendance.ready_for_review",
         "Attendance report submitted" => "attendance.report.submitted",
         "Library visit request" => "library.request.created",

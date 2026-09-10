@@ -3866,21 +3866,21 @@ pub(crate) struct StepOutcome {
     pub requester_user_id: String,
 }
 
-fn four_digit_candidate(minimum: u16, maximum: u16) -> String {
+fn six_digit_candidate(minimum: u32, maximum: u32) -> String {
     let bytes = Uuid::new_v4().into_bytes();
-    let random = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let random = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let span = maximum - minimum + 1;
-    format!("{:04}", minimum + random % span)
+    format!("{:06}", minimum + random % span)
 }
 
 async fn unique_gate_code(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: Uuid,
-    minimum: u16,
-    maximum: u16,
+    minimum: u32,
+    maximum: u32,
 ) -> ApiResult<String> {
     for _ in 0..64 {
-        let code = four_digit_candidate(minimum, maximum);
+        let code = six_digit_candidate(minimum, maximum);
         let hash = token_hash(&code);
         let available = sqlx::query_scalar::<_, bool>(
             r#"SELECT NOT EXISTS(
@@ -3953,7 +3953,7 @@ pub(crate) async fn advance_gatepass_step(
             _ => (
                 "approved".into(),
                 Some(Uuid::new_v4().to_string()),
-                Some(unique_gate_code(tx, tenant, 1000, 4999).await?),
+                Some(unique_gate_code(tx, tenant, 100_000, 499_999).await?),
             ),
         }
     };
@@ -4371,7 +4371,7 @@ async fn activate_daily_access(
         .await?;
     let raw = Uuid::new_v4().to_string();
     let hash = token_hash(&raw);
-    let manual_code = unique_gate_code(&mut tx, tenant, 5000, 9999).await?;
+    let manual_code = unique_gate_code(&mut tx, tenant, 500_000, 999_999).await?;
     let manual_hash = token_hash(&manual_code);
     let mut value = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.daily_access_passes
@@ -6754,12 +6754,12 @@ mod tests {
     }
 
     #[test]
-    fn gate_fallback_codes_are_always_four_digits_in_the_requested_range() {
+    fn gate_fallback_codes_are_always_six_digits_in_the_requested_range() {
         for _ in 0..100 {
-            let code = four_digit_candidate(1000, 4999);
-            assert_eq!(code.len(), 4);
-            let value = code.parse::<u16>().expect("numeric gate code");
-            assert!((1000..=4999).contains(&value));
+            let code = six_digit_candidate(100_000, 499_999);
+            assert_eq!(code.len(), 6);
+            let value = code.parse::<u32>().expect("numeric gate code");
+            assert!((100_000..=499_999).contains(&value));
         }
     }
 }

@@ -3578,7 +3578,7 @@ async fn unique_gate_code(
                   WHERE tenant_id=$1 AND manual_code_hash=$2 AND state='approved'
                  UNION ALL
                  SELECT 1 FROM campus_ops.daily_access_passes
-                  WHERE tenant_id=$1 AND manual_code_hash=$2 AND valid_on=CURRENT_DATE
+                  WHERE tenant_id=$1 AND manual_code_hash=$2
                )"#,
         )
         .bind(tenant)
@@ -4003,7 +4003,7 @@ async fn activate_daily_access(
         // the old QR valid at the scanner until another token replaced it.
         sqlx::query(
             "DELETE FROM campus_ops.daily_access_passes \
-             WHERE tenant_id = $1 AND user_id = $2 AND valid_on = CURRENT_DATE",
+             WHERE tenant_id = $1 AND user_id = $2",
         )
         .bind(tenant)
         .bind(&principal.student.id)
@@ -4011,14 +4011,101 @@ async fn activate_daily_access(
         .await?;
         return Err(ApiError::Forbidden);
     }
+    let mut tx = db.pool().begin().await?;
+    // Browser location streams can deliver fixes many times per second. Lock
+    // this member's lifecycle so simultaneous checks cannot create competing
+    // tokens, then return the existing in-fence credential unchanged.
+    let lifecycle_lock = format!("{tenant}:{}", principal.student.id);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lifecycle_lock)
+        .execute(&mut *tx)
+        .await?;
+    let existing = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+             'id',id,'validOn',valid_on,'validFrom',activated_at,
+             'validUntil',activated_at + interval '100 years',
+             'qrPayload',qr_payload,'manualCode',manual_code)
+           FROM campus_ops.daily_access_passes
+           WHERE tenant_id=$1 AND user_id=$2 AND qr_payload IS NOT NULL
+           ORDER BY activated_at DESC
+           LIMIT 1
+           FOR UPDATE"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(mut value) = existing {
+        sqlx::query(
+            r#"UPDATE campus_ops.daily_access_passes
+               SET activated_latitude=$3,activated_longitude=$4
+               WHERE tenant_id=$1 AND user_id=$2"#,
+        )
+        .bind(tenant)
+        .bind(&principal.student.id)
+        .bind(input.latitude)
+        .bind(input.longitude)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        attach_daily_access_location(&mut value, &input, &fence_check);
+        return Ok((StatusCode::OK, Json(ApiResponse::new(value))));
+    }
+
+    // A legacy row has only a one-way token hash, so it cannot be returned.
+    // Replace it once; every later in-fence check follows the stable path above.
+    sqlx::query("DELETE FROM campus_ops.daily_access_passes WHERE tenant_id=$1 AND user_id=$2")
+        .bind(tenant)
+        .bind(&principal.student.id)
+        .execute(&mut *tx)
+        .await?;
     let raw = Uuid::new_v4().to_string();
     let hash = token_hash(&raw);
-    let mut tx = db.pool().begin().await?;
     let manual_code = unique_gate_code(&mut tx, tenant, 5000, 9999).await?;
     let manual_hash = token_hash(&manual_code);
-    let mut value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.daily_access_passes(tenant_id,user_id,valid_on,qr_token_hash,manual_code_hash,manual_code,activated_latitude,activated_longitude) VALUES($1,$2,CURRENT_DATE,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,user_id,valid_on) DO UPDATE SET qr_token_hash=EXCLUDED.qr_token_hash,manual_code_hash=EXCLUDED.manual_code_hash,manual_code=EXCLUDED.manual_code,activated_latitude=EXCLUDED.activated_latitude,activated_longitude=EXCLUDED.activated_longitude,activated_at=now() RETURNING jsonb_build_object('id',id,'validOn',valid_on,'validFrom',activated_at,'validUntil',(valid_on+1)::timestamptz,'qrPayload',$8::text,'manualCode',$5::text)")
- .bind(tenant).bind(&principal.student.id).bind(hash).bind(manual_hash).bind(&manual_code).bind(input.latitude).bind(input.longitude).bind(&raw).fetch_one(&mut *tx).await?;
+    let mut value = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.daily_access_passes
+             (tenant_id,user_id,valid_on,qr_token_hash,qr_payload,
+              manual_code_hash,manual_code,activated_latitude,activated_longitude)
+           VALUES($1,$2,CURRENT_DATE,$3,$4,$5,$6,$7,$8)
+           RETURNING jsonb_build_object(
+             'id',id,'validOn',valid_on,'validFrom',activated_at,
+             'validUntil',activated_at + interval '100 years',
+             'qrPayload',qr_payload,'manualCode',manual_code)"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(hash)
+    .bind(&raw)
+    .bind(manual_hash)
+    .bind(&manual_code)
+    .bind(input.latitude)
+    .bind(input.longitude)
+    .fetch_one(&mut *tx)
+    .await?;
     tx.commit().await?;
+    attach_daily_access_location(&mut value, &input, &fence_check);
+    emit(
+        &state,
+        &principal.student.tenant_id,
+        db.pool(),
+        tenant,
+        "gatepass",
+        "daily_access",
+        &principal.student.id,
+        "daily_access.activated",
+        &principal.student.id,
+        &json!({"validOn":value["validOn"]}),
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+fn attach_daily_access_location(
+    value: &mut Value,
+    input: &DailyAccessRequest,
+    fence_check: &CampusFenceCheck,
+) {
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "location".into(),
@@ -4039,20 +4126,6 @@ async fn activate_daily_access(
             );
         }
     }
-    emit(
-        &state,
-        &principal.student.tenant_id,
-        db.pool(),
-        tenant,
-        "gatepass",
-        "daily_access",
-        &principal.student.id,
-        "daily_access.activated",
-        &principal.student.id,
-        &json!({"validOn":value["validOn"]}),
-    )
-    .await?;
-    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
 }
 
 #[derive(Deserialize)]
@@ -4122,10 +4195,11 @@ async fn scan_gatepass(
           UNION ALL
           SELECT pass.user_id,NULL::uuid,NULL::uuid,
                  COALESCE(member.display_name,pass.user_id) holder_name,
-                 'daily_access' pass_type,(pass.valid_on+1)::timestamptz valid_until
+                 'daily_access' pass_type,
+                 pass.activated_at + interval '100 years' valid_until
             FROM campus_ops.daily_access_passes pass
             LEFT JOIN identity.users member ON member.id::text=pass.user_id
-           WHERE pass.tenant_id=$1 AND pass.valid_on=CURRENT_DATE
+           WHERE pass.tenant_id=$1
              AND (pass.qr_token_hash=$2 OR pass.manual_code_hash=$2)
           UNION ALL
           -- A visitor pass is only good inside the window it was approved for.

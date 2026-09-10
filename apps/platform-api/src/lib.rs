@@ -278,6 +278,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to restore canonical MEC identities in the control plane")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0097_geofence_qr_lifecycle.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the geofence QR lifecycle release patch")?;
     } else {
         control_database.migrate().await?;
         tracing::info!("control database migration check completed");
@@ -416,6 +422,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to restore canonical MEC identities in the tenant database")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0097_geofence_qr_lifecycle.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to configure the geofence QR lifecycle")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;

@@ -14,9 +14,11 @@ pub mod sms;
 pub mod whatsapp;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
+use serde::Serialize;
 
 pub const CRATE_NAME: &str = "supercampus-notifications";
 
@@ -91,6 +93,95 @@ pub struct SmtpConfig {
 pub struct SmtpMailer {
     transport: lettre::AsyncSmtpTransport<lettre::Tokio1Executor>,
     from: lettre::message::Mailbox,
+}
+
+/// Brevo's transactional-email HTTP transport.
+///
+/// Brevo API keys (`xkeysib-...`) are not SMTP passwords. Supporting the API
+/// directly lets operators use the credential Brevo issues on its API Keys page
+/// without misconfiguring the SMTP relay username/password pair.
+pub struct BrevoMailer {
+    client: reqwest::Client,
+    api_key: String,
+    sender: BrevoSender,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BrevoSender {
+    email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrevoRecipient<'a> {
+    email: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrevoEmailRequest<'a> {
+    sender: &'a BrevoSender,
+    to: [BrevoRecipient<'a>; 1],
+    subject: &'a str,
+    text_content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    html_content: Option<&'a str>,
+}
+
+impl BrevoMailer {
+    pub fn new(api_key: String, from: String) -> anyhow::Result<Self> {
+        let api_key = api_key.trim().to_owned();
+        if api_key.is_empty() {
+            bail!("BREVO_API_KEY cannot be empty");
+        }
+
+        let from = from
+            .parse::<lettre::message::Mailbox>()
+            .with_context(|| format!("MAIL_FROM is not a valid mailbox: {from}"))?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .context("failed to build the Brevo email client")?;
+
+        Ok(Self {
+            client,
+            api_key,
+            sender: BrevoSender {
+                email: from.email.to_string(),
+                name: from.name,
+            },
+        })
+    }
+}
+
+#[async_trait]
+impl Mailer for BrevoMailer {
+    async fn send(&self, message: EmailMessage) -> anyhow::Result<()> {
+        let request = BrevoEmailRequest {
+            sender: &self.sender,
+            to: [BrevoRecipient { email: &message.to }],
+            subject: &message.subject,
+            text_content: &message.text_body,
+            html_content: message.html_body.as_deref(),
+        };
+
+        self.client
+            .post("https://api.brevo.com/v3/smtp/email")
+            .header("api-key", &self.api_key)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&request)
+            .send()
+            .await
+            .context("Brevo email request failed")?
+            .error_for_status()
+            .context("Brevo rejected the email request")?;
+        Ok(())
+    }
+
+    fn transport(&self) -> &'static str {
+        "brevo"
+    }
 }
 
 impl SmtpMailer {
@@ -177,6 +268,15 @@ pub fn mailer_from_environment() -> anyhow::Result<Arc<dyn Mailer>> {
         return Ok(Arc::new(DisabledMailer));
     }
 
+    if let Some(api_key) = std::env::var("BREVO_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let from = std::env::var("MAIL_FROM")
+            .context("MAIL_FROM is required when BREVO_API_KEY is set")?;
+        return Ok(Arc::new(BrevoMailer::new(api_key, from)?));
+    }
+
     let host = std::env::var("SMTP_HOST")
         .ok()
         .filter(|v| !v.trim().is_empty());
@@ -243,6 +343,24 @@ mod tests {
             implicit_tls: false,
         };
         assert!(SmtpMailer::new(config).is_err());
+    }
+
+    #[test]
+    fn brevo_parses_named_sender_mailbox() {
+        let mailer = BrevoMailer::new(
+            "test-api-key".into(),
+            "SuperCampus <no-reply@example.com>".into(),
+        )
+        .expect("valid Brevo config");
+
+        assert_eq!(mailer.sender.name.as_deref(), Some("SuperCampus"));
+        assert_eq!(mailer.sender.email, "no-reply@example.com");
+        assert_eq!(mailer.transport(), "brevo");
+    }
+
+    #[test]
+    fn brevo_rejects_an_invalid_sender_mailbox() {
+        assert!(BrevoMailer::new("test-api-key".into(), "not a mailbox".into()).is_err());
     }
 
     #[tokio::test]

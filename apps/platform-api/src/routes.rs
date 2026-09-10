@@ -25,7 +25,8 @@ use crate::{
         NavigationItem, PutConfigurationRequest, RefreshRequest, ResetPasswordRequest,
         SaveAppStateRequest, SessionData, SessionMode, SetRolePermissionsRequest,
         SetUserAccessRequest, StudentPhotoRequest, StudentResidencyRequest,
-        UpdateAuthorizationRoleRequest, UpdateRecordRequest, ValidateWorkflowTransitionRequest,
+        UpdateAuthorizationRoleRequest, UpdateRecordRequest, UpdateStudentMasterRequest,
+        ValidateWorkflowTransitionRequest,
     },
     realtime::RealtimePublication,
     state::{
@@ -85,6 +86,7 @@ pub fn router(state: AppState) -> Router {
         .route("/navigation", get(get_navigation))
         .route("/dashboard/effective", get(get_effective_dashboard))
         .route("/student-master", get(list_student_master))
+        .route("/student-master/{student_id}", put(update_student_master))
         .route("/student/fees", get(list_own_student_fee_records))
         .route("/student-master/import", post(import_student_master))
         .route(
@@ -828,6 +830,58 @@ async fn set_student_residency(
     state.publish_realtime(RealtimePublication::tenant(
         principal.student.tenant_id,
         "student.residency.updated",
+        updated.clone(),
+    ));
+    Ok(Json(ApiResponse::new(updated)))
+}
+
+async fn update_student_master(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(student_id): Path<Uuid>,
+    Json(request): Json<UpdateStudentMasterRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "students.directory.update")?;
+
+    if request.name.trim().is_empty()
+        || request.roll_no.trim().is_empty()
+        || request.department.trim().is_empty()
+        || request.email.trim().is_empty()
+    {
+        return Err(ApiError::BadRequest(
+            "Name, roll number, department and email are required".into(),
+        ));
+    }
+    if !request.email.contains('@') || request.email.len() > 254 {
+        return Err(ApiError::BadRequest("Enter a valid email address".into()));
+    }
+    if !(1..=6).contains(&request.year_of_study) {
+        return Err(ApiError::BadRequest(
+            "Year of study must be between 1 and 6".into(),
+        ));
+    }
+    if !matches!(
+        request.status.as_str(),
+        "active" | "inactive" | "suspended" | "withdrawn" | "graduated"
+    ) {
+        return Err(ApiError::BadRequest(
+            "Status must be active, inactive, suspended, withdrawn or graduated".into(),
+        ));
+    }
+    if !matches!(request.residency.as_str(), "day_scholar" | "hosteller") {
+        return Err(ApiError::BadRequest(
+            "Residency must be day_scholar or hosteller".into(),
+        ));
+    }
+
+    let updated = state
+        .update_student_master(&principal.student.tenant_id, student_id, &request)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Student not found".into()))?;
+    state.publish_realtime(RealtimePublication::tenant(
+        principal.student.tenant_id,
+        "student.directory.updated",
         updated.clone(),
     ));
     Ok(Json(ApiResponse::new(updated)))

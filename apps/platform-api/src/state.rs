@@ -26,8 +26,8 @@ use crate::models::{
     AssignUserRolesRequest, AuthStudent, ConfigurationDocument, CreateAuthorizationRoleRequest,
     CreateTenantUserRequest, DynamicRecord, ModuleDescriptor, PermissionGrantRequest,
     ServiceDescriptor, SetUserAccessRequest, StoredAppState, StudentImportRow, TenantSummary,
-    UpdateAuthorizationRoleRequest, WorkflowDefinition, WorkflowState, WorkflowStateStatus,
-    WorkflowTransition,
+    UpdateAuthorizationRoleRequest, UpdateStudentMasterRequest, WorkflowDefinition, WorkflowState,
+    WorkflowStateStatus, WorkflowTransition,
 };
 use crate::realtime::{RealtimeHub, RealtimePublication};
 
@@ -901,6 +901,245 @@ impl AppState {
             "id": student.try_get::<Uuid, _>("id")?,
             "name": student.try_get::<String, _>("full_name")?,
             "residency": residency,
+        })))
+    }
+
+    pub async fn update_student_master(
+        &self,
+        tenant_slug: &str,
+        student_id: Uuid,
+        request: &UpdateStudentMasterRequest,
+    ) -> ApiResult<Option<Value>> {
+        let database = self.tenant_database(tenant_slug).await?;
+        let mut transaction = database.pool().begin().await?;
+        let tenant_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM platform.tenants WHERE slug = $1")
+                .bind(tenant_slug)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        let Some(tenant_id) = tenant_id else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+
+        let user_id: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT user_account_id FROM core.students WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(student_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(user_id) = user_id else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+
+        let name = request.name.trim();
+        let roll_no = request.roll_no.trim();
+        let department = request.department.trim();
+        let mobile_number = request.mobile_number.trim();
+        let email = request.email.trim().to_ascii_lowercase();
+        let section = request.section.trim();
+        let academic_year = format!("Year {}", request.year_of_study);
+
+        // Serialize changes to institutional identifiers before checking them.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "student-update:{tenant_id}:{}",
+                roll_no.to_ascii_lowercase()
+            ))
+            .execute(&mut *transaction)
+            .await?;
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM core.students WHERE tenant_id = $1 AND id <> $2 AND lower(student_number) = lower($3))",
+        )
+        .bind(tenant_id)
+        .bind(student_id)
+        .bind(roll_no)
+        .fetch_one(&mut *transaction)
+        .await?
+        {
+            transaction.rollback().await?;
+            return Err(ApiError::Conflict(
+                "That roll number already belongs to another student".into(),
+            ));
+        }
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM core.students WHERE tenant_id = $1 AND id <> $2 AND lower(COALESCE(email, '')) = lower($3))",
+        )
+        .bind(tenant_id)
+        .bind(student_id)
+        .bind(&email)
+        .fetch_one(&mut *transaction)
+        .await?
+        {
+            transaction.rollback().await?;
+            return Err(ApiError::Conflict(
+                "That email address already belongs to another student".into(),
+            ));
+        }
+        if let Some(user_id) = user_id {
+            if sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM identity.users WHERE id <> $1 AND lower(email) = lower($2))",
+            )
+            .bind(user_id)
+            .bind(&email)
+            .fetch_one(&mut *transaction)
+            .await?
+            {
+                transaction.rollback().await?;
+                return Err(ApiError::Conflict(
+                    "That email address already belongs to another account".into(),
+                ));
+            }
+            if let Some(control) = &self.database
+                && sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM identity.users WHERE id <> $1 AND lower(email) = lower($2))",
+                )
+                .bind(user_id)
+                .bind(&email)
+                .fetch_one(control.pool())
+                .await?
+            {
+                transaction.rollback().await?;
+                return Err(ApiError::Conflict(
+                    "That email address already belongs to another account".into(),
+                ));
+            }
+        }
+
+        let profile = json!({
+            "name": name,
+            "roll": roll_no,
+            "rollNumber": roll_no,
+            "department": department,
+            "dept": department,
+            "phone": mobile_number,
+            "email": email,
+            "year": academic_year,
+            "yearOfStudy": request.year_of_study,
+            "section": section,
+            "residency": request.residency,
+        });
+        let student = sqlx::query(
+            r#"UPDATE core.students
+               SET student_number = $3,
+                   full_name = $4,
+                   email = $5,
+                   phone = NULLIF($6, ''),
+                   department_id = COALESCE(
+                       (SELECT id::text FROM core.departments
+                        WHERE tenant_id = $1
+                          AND (lower(code) = lower($7) OR lower(name) = lower($7) OR id::text = $7)
+                        LIMIT 1),
+                       $7
+                   ),
+                   section_id = NULLIF($8, ''),
+                   academic_year = $9,
+                   status = $10,
+                   profile = COALESCE(profile, '{}'::jsonb) || $11,
+                   updated_at = now()
+               WHERE tenant_id = $1 AND id = $2
+               RETURNING id, user_account_id, created_at, updated_at,
+                         NULLIF(profile ->> 'photoUrl', '') AS photo_url"#,
+        )
+        .bind(tenant_id)
+        .bind(student_id)
+        .bind(roll_no)
+        .bind(name)
+        .bind(&email)
+        .bind(mobile_number)
+        .bind(department)
+        .bind(section)
+        .bind(&academic_year)
+        .bind(&request.status)
+        .bind(&profile)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        if let Some(user_id) = user_id {
+            sqlx::query(
+                r#"UPDATE identity.users
+                   SET email = $2, display_name = $3, initials = $4,
+                       active = $5, profile = COALESCE(profile, '{}'::jsonb) || $6,
+                       updated_at = now()
+                   WHERE id = $1"#,
+            )
+            .bind(user_id)
+            .bind(&email)
+            .bind(name)
+            .bind(initials(name))
+            .bind(request.status == "active")
+            .bind(&profile)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                r#"UPDATE identity.tenant_memberships
+                   SET active = $3,
+                       profile = COALESCE(profile, '{}'::jsonb) || $4,
+                       updated_at = now()
+                   WHERE tenant_id = $1 AND user_id = $2"#,
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(request.status == "active")
+            .bind(&profile)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        if let (Some(user_id), Some(control)) = (user_id, &self.database) {
+            let mut control_transaction = control.pool().begin().await?;
+            sqlx::query(
+                r#"UPDATE identity.users
+                   SET email = $2, display_name = $3, initials = $4,
+                       active = $5, profile = COALESCE(profile, '{}'::jsonb) || $6,
+                       updated_at = now()
+                   WHERE id = $1"#,
+            )
+            .bind(user_id)
+            .bind(&email)
+            .bind(name)
+            .bind(initials(name))
+            .bind(request.status == "active")
+            .bind(&profile)
+            .execute(&mut *control_transaction)
+            .await?;
+            sqlx::query(
+                r#"UPDATE identity.tenant_memberships membership
+                   SET active = $3,
+                       profile = COALESCE(membership.profile, '{}'::jsonb) || $4,
+                       updated_at = now()
+                   FROM platform.tenants tenant
+                   WHERE membership.tenant_id = tenant.id
+                     AND tenant.slug = $1
+                     AND membership.user_id = $2"#,
+            )
+            .bind(tenant_slug)
+            .bind(user_id)
+            .bind(request.status == "active")
+            .bind(&profile)
+            .execute(&mut *control_transaction)
+            .await?;
+            control_transaction.commit().await?;
+            self.invalidate_effective_access().await;
+        }
+        Ok(Some(json!({
+            "id": student.try_get::<Uuid, _>("id")?,
+            "userId": student.try_get::<Option<Uuid>, _>("user_account_id")?,
+            "rollNo": roll_no,
+            "name": name,
+            "department": department,
+            "mobileNumber": mobile_number,
+            "email": email,
+            "status": request.status,
+            "yearOfStudy": request.year_of_study,
+            "section": section,
+            "photoUrl": student.try_get::<Option<String>, _>("photo_url")?,
+            "residency": request.residency,
+            "createdAt": student.try_get::<DateTime<Utc>, _>("created_at")?,
+            "updatedAt": student.try_get::<DateTime<Utc>, _>("updated_at")?,
         })))
     }
 

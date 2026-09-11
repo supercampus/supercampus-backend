@@ -2,7 +2,8 @@
 -- advisor (department-scoped directory) but outside the Section A attendance
 -- roster (section UUID-scoped). Build the repair from the independently known
 -- 51-student cohort and fail loudly unless each affected 48-row snapshot has
--- exactly the expected three missing students.
+-- exactly the expected three missing students. Zero rows is a valid no-op on
+-- later application restarts after the repair has already been applied.
 CREATE TEMP TABLE attendance_repair_0105 ON COMMIT DROP AS
 WITH target_sessions AS (
     SELECT session.tenant_id,
@@ -93,9 +94,9 @@ BEGIN
       INTO repair_sessions, repair_rows
       FROM attendance_repair_0105;
 
-    IF repair_sessions < 5 OR repair_rows <> repair_sessions * 3 THEN
+    IF repair_sessions > 0 AND repair_rows <> repair_sessions * 3 THEN
         RAISE EXCEPTION
-          'Attendance repair safety check failed: expected at least 5 sessions and exactly 3 missing students per session; found % sessions and % rows',
+          'Attendance repair safety check failed: expected exactly 3 missing students per affected session; found % sessions and % rows',
           repair_sessions,
           repair_rows;
     END IF;

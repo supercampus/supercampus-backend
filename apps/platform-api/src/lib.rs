@@ -478,6 +478,16 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to configure guardian WhatsApp workflows")?;
+        // Production currently opts out of the embedded SQLx migrator. Keep
+        // this idempotent cohort repair in the compatibility path so the three
+        // students restored to AIDS Year 2 are also restored to Section A and
+        // to the already-submitted attendance snapshot.
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0105_repair_mec_aids_section_a_attendance.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to repair the MEC AIDS Section A attendance cohort")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;

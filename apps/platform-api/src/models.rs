@@ -130,6 +130,10 @@ pub struct UpdateStudentMasterRequest {
     pub section: String,
     pub residency: String,
     #[serde(default)]
+    pub department_id: Option<Uuid>,
+    #[serde(default)]
+    pub section_id: Option<Uuid>,
+    #[serde(default)]
     pub guardian_name: Option<String>,
     #[serde(default)]
     pub guardian_phone: Option<String>,

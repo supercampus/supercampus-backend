@@ -692,6 +692,8 @@ impl AppState {
         let rows = sqlx::query(
             r#"SELECT student.id, student.user_account_id AS user_id,
                       student.student_number, student.full_name,
+                      student.department_id AS department_id,
+                      student.section_id AS section_id,
                       COALESCE(
                           department.name,
                           NULLIF(student.profile ->> 'department', ''),
@@ -704,7 +706,11 @@ impl AppState {
                           NULLIF(student.profile ->> 'year', ''),
                           NULLIF(student.academic_year, '')
                       ) AS year_of_study,
-                      NULLIF(student.profile ->> 'section', '') AS section,
+                      COALESCE(
+                          section.code,
+                          NULLIF(student.profile ->> 'section', ''),
+                          ''
+                      ) AS section,
                       NULLIF(student.profile ->> 'photoUrl', '') AS photo_url,
                       CASE lower(COALESCE(student.profile ->> 'residency', ''))
                         WHEN 'hosteller' THEN 'hosteller'
@@ -719,6 +725,9 @@ impl AppState {
                LEFT JOIN core.departments department
                  ON department.tenant_id = student.tenant_id
                 AND department.id::text = student.department_id::text
+               LEFT JOIN core.sections section
+                 ON section.tenant_id = student.tenant_id
+                AND section.id::text = student.section_id::text
                LEFT JOIN LATERAL (
                  SELECT candidate.full_name,candidate.phone,
                         COALESCE(candidate.relationship,link.relationship) AS relationship
@@ -750,6 +759,8 @@ impl AppState {
                     "rollNo": row.try_get::<String, _>("student_number")?,
                     "name": row.try_get::<String, _>("full_name")?,
                     "department": row.try_get::<String, _>("department")?,
+                    "departmentId": row.try_get::<Option<String>, _>("department_id")?,
+                    "sectionId": row.try_get::<Option<String>, _>("section_id")?,
                     "mobileNumber": row.try_get::<Option<String>, _>("phone")?.unwrap_or_default(),
                     "email": row.try_get::<Option<String>, _>("email")?.unwrap_or_default(),
                     "status": row.try_get::<String, _>("status")?,
@@ -1049,18 +1060,21 @@ impl AppState {
                    phone = NULLIF($6, ''),
                    department_id = COALESCE(
                        (SELECT id::text FROM core.departments
-                        WHERE tenant_id = $1
-                          AND (lower(code) = lower($7) OR lower(name) = lower($7) OR id::text = $7)
-                        LIMIT 1),
-                       $7
+                        WHERE tenant_id = $1 AND id = $12),
+                       student.department_id
                    ),
-                   section_id = NULLIF($8, ''),
+                   section_id = COALESCE(
+                       (SELECT id::text FROM core.sections
+                        WHERE tenant_id = $1 AND id = $13),
+                       student.section_id
+                   ),
                    academic_year = $9,
                    status = $10,
                    profile = COALESCE(profile, '{}'::jsonb) || $11,
                    updated_at = now()
                WHERE tenant_id = $1 AND id = $2
-               RETURNING id, user_account_id, created_at, updated_at,
+               RETURNING id, user_account_id, department_id, section_id,
+                         created_at, updated_at,
                          NULLIF(profile ->> 'photoUrl', '') AS photo_url"#,
         )
         .bind(tenant_id)
@@ -1074,6 +1088,8 @@ impl AppState {
         .bind(&academic_year)
         .bind(&request.status)
         .bind(&profile)
+        .bind(request.department_id)
+        .bind(request.section_id)
         .fetch_one(&mut *transaction)
         .await?;
 
@@ -1243,6 +1259,8 @@ impl AppState {
             "rollNo": roll_no,
             "name": name,
             "department": department,
+            "departmentId": student.try_get::<Option<String>, _>("department_id")?,
+            "sectionId": student.try_get::<Option<String>, _>("section_id")?,
             "mobileNumber": mobile_number,
             "email": email,
             "status": request.status,

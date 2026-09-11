@@ -2976,16 +2976,10 @@ async fn library_announcements(
     Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    require_any(
-        &access,
-        &[
-            "library.announcement.create",
-            "library.announcement.approve",
-        ],
-    )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let can_approve = access.allows("library.announcement.approve");
+    let can_create = access.allows("library.announcement.create");
     let rows = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
              'id',id,'announcementType',announcement_type,
@@ -2997,11 +2991,13 @@ async fn library_announcements(
              'decidedBy',decided_by,'decidedAt',decided_at,'createdAt',created_at)
              ORDER BY created_at DESC),'[]'::jsonb)
            FROM campus_ops.library_announcements
-           WHERE tenant_id=$1 AND ($3 OR created_by=$2)"#,
+           WHERE tenant_id=$1
+             AND (status='approved' OR $3 OR ($4 AND created_by=$2))"#,
     )
     .bind(tenant)
     .bind(&principal.student.id)
     .bind(can_approve)
+    .bind(can_create)
     .fetch_one(db.pool())
     .await?;
     Ok(Json(ApiResponse::new(json!({"announcements":rows}))))
@@ -3013,7 +3009,13 @@ async fn create_library_announcement(
     Extension(access): Extension<EffectiveAccess>,
     Json(input): Json<LibraryAnnouncementRequest>,
 ) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
-    require(&access, "library.announcement.create")?;
+    require_any(
+        &access,
+        &[
+            "library.announcement.create",
+            "library.announcement.approve",
+        ],
+    )?;
     if input.announcement_type.trim().is_empty()
         || input.title.trim().len() < 4
         || input.message.trim().len() < 8
@@ -3024,17 +3026,26 @@ async fn create_library_announcement(
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let publishes_immediately = access.allows("library.announcement.approve");
+    let initial_status = if publishes_immediately {
+        "approved"
+    } else {
+        "pending"
+    };
     let mut tx = db.pool().begin().await?;
     let value = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.library_announcements
            (tenant_id,announcement_type,announcement_date,title,message,
-            book_title,author,attachment_name,attachment_url,created_by,created_by_name)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+             book_title,author,attachment_name,attachment_url,created_by,created_by_name,
+             status,decided_by,decided_at)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+             CASE WHEN $12='approved' THEN now() ELSE NULL END)
            RETURNING jsonb_build_object('id',id,'announcementType',announcement_type,
              'announcementDate',announcement_date,'title',title,'message',message,
              'bookTitle',book_title,'author',author,'status',status,
              'attachmentName',attachment_name,'attachmentUrl',attachment_url,
-             'createdBy',created_by,'createdByName',created_by_name,'createdAt',created_at)"#,
+             'createdBy',created_by,'createdByName',created_by_name,
+             'decidedBy',decided_by,'decidedAt',decided_at,'createdAt',created_at)"#,
     )
     .bind(tenant)
     .bind(input.announcement_type.trim())
@@ -3071,32 +3082,36 @@ async fn create_library_announcement(
     )
     .bind(&principal.student.id)
     .bind(&principal.student.name)
+    .bind(initial_status)
+    .bind(publishes_immediately.then_some(principal.student.id.as_str()))
     .fetch_one(&mut *tx)
     .await?;
-    let admin_ids = sqlx::query_scalar::<_, String>(
-        r#"SELECT membership.user_id::text FROM identity.tenant_memberships membership
-           WHERE membership.tenant_id=$1 AND membership.active
-             AND membership.roles && ARRAY['tenant_admin','admin','administrator','super_admin']::text[]"#,
-    )
-    .bind(tenant)
-    .fetch_all(&mut *tx)
-    .await?;
-    for admin_id in admin_ids {
-        notify_tx(
-            &mut tx,
-            tenant,
-            Some(&admin_id),
-            None,
-            "library",
-            "Library announcement needs approval",
-            &format!(
-                "{} submitted: {}",
-                principal.student.name,
-                input.title.trim()
-            ),
-            &value,
+    if !publishes_immediately {
+        let admin_ids = sqlx::query_scalar::<_, String>(
+            r#"SELECT membership.user_id::text FROM identity.tenant_memberships membership
+               WHERE membership.tenant_id=$1 AND membership.active
+                 AND membership.roles && ARRAY['tenant_admin','admin','administrator','super_admin']::text[]"#,
         )
+        .bind(tenant)
+        .fetch_all(&mut *tx)
         .await?;
+        for admin_id in admin_ids {
+            notify_tx(
+                &mut tx,
+                tenant,
+                Some(&admin_id),
+                None,
+                "library",
+                "Library announcement needs approval",
+                &format!(
+                    "{} submitted: {}",
+                    principal.student.name,
+                    input.title.trim()
+                ),
+                &value,
+            )
+            .await?;
+        }
     }
     emit_tx(
         &mut tx,
@@ -3104,7 +3119,11 @@ async fn create_library_announcement(
         "library",
         "announcement",
         value["id"].as_str().unwrap_or_default(),
-        "announcement.submitted",
+        if publishes_immediately {
+            "announcement.published"
+        } else {
+            "announcement.submitted"
+        },
         &principal.student.id,
         &value,
     )

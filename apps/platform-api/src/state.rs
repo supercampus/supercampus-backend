@@ -3085,6 +3085,22 @@ impl AppState {
         // the timing and status differences leak which addresses exist.
         if let Err(error) = self.mailer.send(message).await {
             tracing::error!(error = ?error, %user_id, "failed to deliver the password reset email");
+
+            // A provider rejection must not consume one of the account's reset attempts.
+            // Removing only this request's token lets the user retry immediately after a
+            // transient provider/configuration issue is corrected.
+            if let Err(cleanup_error) =
+                sqlx::query("DELETE FROM identity.password_reset_tokens WHERE token_hash = $1")
+                    .bind(token_hash.to_vec())
+                    .execute(database.pool())
+                    .await
+            {
+                tracing::error!(
+                    error = ?cleanup_error,
+                    %user_id,
+                    "failed to discard an undelivered password reset token"
+                );
+            }
         }
         Ok(())
     }

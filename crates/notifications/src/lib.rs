@@ -166,21 +166,48 @@ impl Mailer for BrevoMailer {
             html_content: message.html_body.as_deref(),
         };
 
-        self.client
+        let response = self
+            .client
             .post("https://api.brevo.com/v3/smtp/email")
             .header("api-key", &self.api_key)
             .header(reqwest::header::ACCEPT, "application/json")
             .json(&request)
             .send()
             .await
-            .context("Brevo email request failed")?
-            .error_for_status()
-            .context("Brevo rejected the email request")?;
+            .context("Brevo email request failed")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let response_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unable to read Brevo response".to_owned());
+            bail!(
+                "Brevo rejected the email request ({status}): {}",
+                brevo_error_detail(&response_body)
+            );
+        }
+
         Ok(())
     }
 
     fn transport(&self) -> &'static str {
         "brevo"
+    }
+}
+
+fn brevo_error_detail(response_body: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(response_body)
+        && let Some(message) = value.get("message").and_then(serde_json::Value::as_str)
+    {
+        return message.chars().take(512).collect();
+    }
+
+    let detail: String = response_body.chars().take(512).collect();
+    if detail.trim().is_empty() {
+        "Brevo returned an empty error response".to_owned()
+    } else {
+        detail
     }
 }
 
@@ -361,6 +388,22 @@ mod tests {
     #[test]
     fn brevo_rejects_an_invalid_sender_mailbox() {
         assert!(BrevoMailer::new("test-api-key".into(), "not a mailbox".into()).is_err());
+    }
+
+    #[test]
+    fn brevo_error_detail_extracts_the_provider_message() {
+        let detail = brevo_error_detail(
+            r#"{"code":"unauthorized","message":"Key not found","ignored":"value"}"#,
+        );
+
+        assert_eq!(detail, "Key not found");
+    }
+
+    #[test]
+    fn brevo_error_detail_limits_non_json_responses() {
+        let detail = brevo_error_detail(&"x".repeat(700));
+
+        assert_eq!(detail.len(), 512);
     }
 
     #[tokio::test]

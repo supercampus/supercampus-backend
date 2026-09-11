@@ -16,12 +16,17 @@
 //! implementations of "what approval does to an outpass" would drift.
 
 use axum::{
-    Json,
+    Form, Json,
+    body::Bytes,
     extract::{Path, State},
+    http::HeaderMap,
+    response::Html,
 };
 use chrono::{DateTime, Duration, Utc};
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::{
@@ -78,11 +83,36 @@ pub async fn issue_guardian_link(
     .execute(pool)
     .await?;
 
-    let link = format!("{}/gatepass/approve/{raw}", crate::public_base_url());
+    let link = format!(
+        "{}/api/v1/public/gatepass/approvals/{raw}/page",
+        api_public_url().trim_end_matches('/')
+    );
     let body = format!(
         "{guardian_name}, {student_name} has requested an outpass. Approve or decline here: {link}"
     );
 
+    let quick_replies =
+        std::env::var("GALLABOX_WEBHOOK_SECRET").is_ok_and(|value| !value.trim().is_empty());
+    let button_values = if quick_replies {
+        vec![
+            json!({
+                "index": 0,
+                "sub_type": "quick_reply",
+                "parameters": {"type": "payload", "payload": format!("SC_OUTPASS:approved:{raw}")}
+            }),
+            json!({
+                "index": 1,
+                "sub_type": "quick_reply",
+                "parameters": {"type": "payload", "payload": format!("SC_OUTPASS:rejected:{raw}")}
+            }),
+        ]
+    } else {
+        vec![json!({
+            "index": 0,
+            "sub_type": "url",
+            "parameters": {"type": "text", "text": link}
+        })]
+    };
     let outcome = state
         .whatsapp()
         .send(WhatsAppMessage {
@@ -101,11 +131,7 @@ pub async fn issue_guardian_link(
             ]
             .into_iter()
             .collect(),
-            button_values: vec![serde_json::json!({
-                "index": 0,
-                "sub_type": "url",
-                "parameters": {"type": "text", "text": link}
-            })],
+            button_values,
         })
         .await;
 
@@ -158,13 +184,18 @@ pub async fn decide_as_guardian(
     Path(token): Path<String>,
     Json(input): Json<GuardianDecisionInput>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
+    let value = decide(&state, &token, input).await?;
+    Ok(Json(ApiResponse::new(value)))
+}
+
+async fn decide(state: &AppState, token: &str, input: GuardianDecisionInput) -> ApiResult<Value> {
     if !matches!(input.decision.as_str(), "approved" | "rejected") {
         return Err(ApiError::BadRequest(
             "A decision is either approved or rejected".into(),
         ));
     }
 
-    let (tenant_slug, token_row, _) = resolve(&state, &token).await?;
+    let (tenant_slug, token_row, _) = resolve(state, token).await?;
     let db = state.tenant_database(&tenant_slug).await?;
     let mut tx = db.pool().begin().await?;
 
@@ -200,11 +231,174 @@ pub async fn decide_as_guardian(
     .await?;
     tx.commit().await?;
 
-    Ok(Json(ApiResponse::new(json!({
+    Ok(json!({
         "state": outcome.next_state,
         "decision": input.decision,
         "guardianName": token_row.guardian_name,
-    }))))
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct GuardianPageDecision {
+    decision: String,
+}
+
+pub async fn show_guardian_page(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> ApiResult<Html<String>> {
+    let (_, _, value) = resolve(&state, &token).await?;
+    let student = html_escape(value["studentName"].as_str().unwrap_or("Student"));
+    let destination = html_escape(value["destination"].as_str().unwrap_or(""));
+    let reason = html_escape(value["reason"].as_str().unwrap_or(""));
+    Ok(Html(format!(
+        r#"<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Outpass approval</title><style>body{{font-family:system-ui,sans-serif;background:#f7f4fb;margin:0;display:grid;min-height:100vh;place-items:center;color:#211b2e}}main{{width:min(92vw,420px);background:#fff;border:1px solid #e6dcf7;border-radius:22px;padding:28px;box-sizing:border-box;box-shadow:0 18px 50px #45208018}}h1{{font-size:24px;margin:0 0 8px}}p{{color:#615970;line-height:1.5}}dl{{background:#f8f5fc;border-radius:14px;padding:16px}}dt{{font-size:12px;color:#766d83;margin-top:10px}}dd{{margin:3px 0 0;font-weight:600}}button{{border-radius:12px;padding:14px 18px;font-size:16px;font-weight:700;cursor:pointer}}.actions{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:20px}}.approve{{background:#1a6b3c;color:white;border:0}}.reject{{background:#fff0f0;color:#a51d2d;border:1px solid #efb7bd}}</style></head><body><main><p>SuperCampus guardian action</p><h1>{student}'s outpass</h1><dl><dt>Destination</dt><dd>{destination}</dd><dt>Reason</dt><dd>{reason}</dd></dl><form method="post"><div class="actions"><button class="reject" name="decision" value="rejected">Reject</button><button class="approve" name="decision" value="approved">Approve</button></div></form></main></body></html>"#
+    )))
+}
+
+pub async fn decide_guardian_page(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Form(input): Form<GuardianPageDecision>,
+) -> ApiResult<Html<String>> {
+    let approved = input.decision == "approved";
+    let value = decide(
+        &state,
+        &token,
+        GuardianDecisionInput {
+            decision: input.decision,
+            note: None,
+        },
+    )
+    .await?;
+    let state_label = value["state"].as_str().unwrap_or("updated");
+    let (title, message) = if approved {
+        (
+            "Outpass approved",
+            format!("The request is now {state_label}."),
+        )
+    } else {
+        ("Outpass rejected", "The student has been notified.".into())
+    };
+    Ok(Html(result_page(title, &message)))
+}
+
+/// Accepts Gallabox's signed interaction event for an approved/rejected quick
+/// reply. The action token still authorises only one outpass, and the sender
+/// phone must match the guardian snapshot attached to that token.
+pub async fn gallabox_interaction(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    verify_gallabox_signature(&headers, &body)?;
+    let payload: Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("Invalid Gallabox webhook body".into()))?;
+    let action = find_action(&payload)
+        .ok_or_else(|| ApiError::BadRequest("No SuperCampus action was found".into()))?;
+    let phone = find_phone(&payload)
+        .ok_or_else(|| ApiError::BadRequest("Gallabox sender phone was not supplied".into()))?;
+    let mut parts = action.splitn(3, ':');
+    if parts.next() != Some("SC_OUTPASS") {
+        return Err(ApiError::BadRequest("Unsupported Gallabox action".into()));
+    }
+    let decision = parts.next().unwrap_or_default();
+    let token = parts.next().unwrap_or_default();
+    if !matches!(decision, "approved" | "rejected") {
+        return Err(ApiError::BadRequest("Unsupported outpass decision".into()));
+    }
+    let (_, token_row, _) = resolve(&state, token).await?;
+    if !phones_match(&token_row.guardian_phone, &phone) {
+        return Err(ApiError::Forbidden);
+    }
+    let value = decide(
+        &state,
+        token,
+        GuardianDecisionInput {
+            decision: decision.into(),
+            note: Some("Answered from the guardian WhatsApp chat".into()),
+        },
+    )
+    .await?;
+    Ok(Json(json!({"ok": true, "data": value})))
+}
+
+fn verify_gallabox_signature(headers: &HeaderMap, body: &[u8]) -> ApiResult<()> {
+    let secret = std::env::var("GALLABOX_WEBHOOK_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::ServiceUnavailable("Gallabox webhook is not configured".into()))?;
+    let supplied = headers
+        .get("x-gallabox-signature")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().strip_prefix("sha256=").unwrap_or(value.trim()))
+        .and_then(|value| hex::decode(value).ok())
+        .ok_or(ApiError::Forbidden)?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| ApiError::Internal)?;
+    mac.update(body);
+    mac.verify_slice(&supplied).map_err(|_| ApiError::Forbidden)
+}
+
+fn find_action(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if value.starts_with("SC_OUTPASS:") => Some(value.clone()),
+        Value::Array(values) => values.iter().find_map(find_action),
+        Value::Object(values) => values.values().find_map(find_action),
+        _ => None,
+    }
+}
+
+fn find_phone(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(values) => {
+            for key in ["phone", "from", "waId", "wa_id", "contactPhone"] {
+                if let Some(phone) = values.get(key).and_then(Value::as_str)
+                    && phone_digits(phone).len() >= 8
+                {
+                    return Some(phone.into());
+                }
+            }
+            values.values().find_map(find_phone)
+        }
+        Value::Array(values) => values.iter().find_map(find_phone),
+        _ => None,
+    }
+}
+
+fn phone_digits(value: &str) -> String {
+    value.chars().filter(char::is_ascii_digit).collect()
+}
+
+fn phones_match(left: &str, right: &str) -> bool {
+    let left = phone_digits(left);
+    let right = phone_digits(right);
+    left == right
+        || (left.len() >= 10
+            && right.len() >= 10
+            && left[left.len() - 10..] == right[right.len() - 10..])
+}
+
+fn api_public_url() -> String {
+    std::env::var("API_PUBLIC_URL").unwrap_or_else(|_| "https://api.supercampus.ai".into())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn result_page(title: &str, message: &str) -> String {
+    format!(
+        r#"<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{}</title><style>body{{font-family:system-ui,sans-serif;background:#f7f4fb;margin:0;display:grid;min-height:100vh;place-items:center;color:#211b2e}}main{{width:min(92vw,420px);background:white;border:1px solid #e6dcf7;border-radius:22px;padding:30px;text-align:center;box-shadow:0 18px 50px #45208018}}h1{{font-size:25px}}p{{color:#615970;line-height:1.5}}</style></head><body><main><h1>{}</h1><p>{}</p></main></body></html>"#,
+        html_escape(title),
+        html_escape(title),
+        html_escape(message)
+    )
 }
 
 struct TokenRow {
@@ -293,4 +487,31 @@ async fn resolve(state: &AppState, token: &str) -> ApiResult<(String, TokenRow, 
     }
 
     Err(ApiError::NotFound("This link is not valid".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guardian_phone_comparison_ignores_formatting_and_country_prefix() {
+        assert!(phones_match("+91 63791 73918", "916379173918"));
+        assert!(phones_match("63791-73918", "+91 63791 73918"));
+        assert!(!phones_match("63791 73918", "+91 90000 00000"));
+    }
+
+    #[test]
+    fn webhook_action_is_found_inside_nested_provider_payload() {
+        let payload = json!({
+            "event": "Message.WA.Interaction.Received",
+            "data": {"message": {"interactive": {"button_reply": {
+                "id": "SC_OUTPASS:approved:deadbeef",
+                "title": "Approve"
+            }}}}
+        });
+        assert_eq!(
+            find_action(&payload).as_deref(),
+            Some("SC_OUTPASS:approved:deadbeef")
+        );
+    }
 }

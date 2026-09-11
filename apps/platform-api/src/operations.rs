@@ -3706,34 +3706,31 @@ async fn create_gatepass_request(
 
     // An outpass waits on a guardian who has no account, so the link that lets
     // them answer is minted and sent here. The guardian's number comes from the
-    // student record when it is on file, and from the request only as a
-    // fallback — a student should not be able to nominate their own approver by
-    // typing a different number into the form.
+    // student record only. A number typed by the student is never an approval
+    // authority and is deliberately ignored.
     if input.pass_type == "outpass" {
         let on_file = sqlx::query_as::<_, (String, String)>(
             r#"SELECT guardian.full_name, guardian.phone
-               FROM core.guardians guardian
-               JOIN core.students student
-                 ON student.tenant_id = guardian.tenant_id AND student.id = guardian.student_id
-               WHERE guardian.tenant_id = $1
+               FROM core.students student
+               JOIN core.guardians guardian ON guardian.tenant_id=student.tenant_id
+               LEFT JOIN core.student_guardians link
+                 ON link.tenant_id=student.tenant_id AND link.student_id=student.id
+                AND link.guardian_id=guardian.id
+               WHERE student.tenant_id = $1
                  AND student.user_account_id::text = $2
-                 AND guardian.is_primary
-                 AND guardian.phone IS NOT NULL"#,
+                 AND (guardian.student_id=student.id OR link.student_id=student.id)
+                 AND (guardian.is_primary OR link.is_primary)
+                 AND NULLIF(guardian.phone,'') IS NOT NULL
+               ORDER BY CASE WHEN guardian.student_id=student.id AND guardian.is_primary THEN 0 ELSE 1 END,
+                        guardian.updated_at DESC
+               LIMIT 1"#,
         )
         .bind(tenant)
         .bind(&principal.student.id)
         .fetch_optional(db.pool())
         .await?;
 
-        let guardian = on_file.or_else(|| {
-            input
-                .guardian_phone
-                .clone()
-                .filter(|phone| phone.trim().len() >= 8)
-                .map(|phone| ("Guardian".to_string(), phone))
-        });
-
-        match guardian {
+        match on_file {
             Some((name, phone)) => {
                 let link = crate::guardian_link::issue_guardian_link(
                     &state,
@@ -3750,13 +3747,16 @@ async fn create_gatepass_request(
                 tracing::info!(request = %id, delivery = %link["deliveryState"], "guardian approval link issued");
             }
             None => {
-                // Recorded rather than rejected: an administrator can still
-                // approve the parent step by hand, and the student should not
-                // be blocked by a gap in their own record.
-                tracing::warn!(
-                    request = %id,
-                    "outpass raised with no guardian on file and no number supplied"
-                );
+                sqlx::query(
+                    "DELETE FROM campus_ops.gatepass_requests WHERE tenant_id=$1 AND id=$2",
+                )
+                .bind(tenant)
+                .bind(id)
+                .execute(db.pool())
+                .await?;
+                return Err(ApiError::Conflict(
+                    "A primary parent or guardian WhatsApp number must be added to the student record before requesting an outpass".into(),
+                ));
             }
         }
     }

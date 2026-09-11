@@ -117,6 +117,19 @@ pub fn router(state: AppState) -> Router {
             get(crate::guardian_link::show_guardian_request)
                 .post(crate::guardian_link::decide_as_guardian),
         )
+        .route(
+            "/public/gatepass/approvals/{token}/page",
+            get(crate::guardian_link::show_guardian_page)
+                .post(crate::guardian_link::decide_guardian_page),
+        )
+        .route(
+            "/public/fees/payment-links/callback",
+            get(crate::guardian_whatsapp::complete_payment_link),
+        )
+        .route(
+            "/public/gallabox/webhook",
+            post(crate::guardian_link::gallabox_interaction),
+        )
         .route("/realtime/ws", get(crate::realtime::websocket))
         .nest(
             "/academic-assignments",
@@ -874,6 +887,24 @@ async fn update_student_master(
             "Residency must be day_scholar or hosteller".into(),
         ));
     }
+    if request
+        .guardian_name
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+        || request
+            .guardian_phone
+            .as_deref()
+            .is_some_and(|value| value.trim().len() < 8)
+    {
+        return Err(ApiError::BadRequest(
+            "Guardian name and a valid WhatsApp phone number are required when guardian details are supplied".into(),
+        ));
+    }
+    if request.guardian_name.is_some() != request.guardian_phone.is_some() {
+        return Err(ApiError::BadRequest(
+            "Guardian name and WhatsApp phone number must be supplied together".into(),
+        ));
+    }
 
     let updated = state
         .update_student_master(&principal.student.tenant_id, student_id, &request)
@@ -923,6 +954,17 @@ async fn import_student_master(
         if !row.email.contains('@') {
             return Err(ApiError::BadRequest(format!(
                 "Row {} has an invalid email",
+                index + 2
+            )));
+        }
+        if row.guardian_name.is_some() != row.guardian_phone.is_some()
+            || row
+                .guardian_phone
+                .as_deref()
+                .is_some_and(|phone| phone.trim().chars().filter(char::is_ascii_digit).count() < 8)
+        {
+            return Err(ApiError::BadRequest(format!(
+                "Row {} must include both a guardian name and a valid WhatsApp number",
                 index + 2
             )));
         }
@@ -1002,14 +1044,21 @@ async fn create_record(
     if request.record_type.trim().is_empty() {
         return Err(ApiError::BadRequest("recordType is required".into()));
     }
+    let tenant = tenant_id(&headers);
     let record = state
         .create_record(
-            tenant_id(&headers),
-            module_key,
+            tenant.clone(),
+            module_key.clone(),
             request.record_type,
             request.data,
         )
         .await?;
+    if module_key == "fees"
+        && let Err(error) =
+            crate::guardian_whatsapp::send_fee_payment_request(&state, &tenant, &record).await
+    {
+        tracing::error!(fee_record=%record.id, error=?error, "guardian fee WhatsApp workflow failed");
+    }
     Ok((StatusCode::CREATED, Json(ApiResponse::new(json!(record)))))
 }
 
@@ -1037,10 +1086,17 @@ async fn update_record(
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     ensure_module(&state, &module_key)?;
     require_module_record_permission(&access, &module_key, "update")?;
+    let tenant = tenant_id(&headers);
     let record = state
-        .update_record(&tenant_id(&headers), &module_key, record_id, request.data)
+        .update_record(&tenant, &module_key, record_id, request.data)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Record not found: {record_id}")))?;
+    if module_key == "fees"
+        && let Err(error) =
+            crate::guardian_whatsapp::send_fee_payment_request(&state, &tenant, &record).await
+    {
+        tracing::error!(fee_record=%record.id, error=?error, "guardian fee WhatsApp workflow failed");
+    }
     Ok(Json(ApiResponse::new(json!(record))))
 }
 
@@ -1638,6 +1694,10 @@ fn requires_authorization(method: &Method, path: &str) -> bool {
     // credential, and it authorises exactly one decision on one request.
     let is_public_guardian_route = path.starts_with("/api/v1/public/gatepass/approvals/")
         && (*method == Method::GET || *method == Method::POST);
+    let is_public_fee_callback =
+        path == "/api/v1/public/fees/payment-links/callback" && *method == Method::GET;
+    let is_public_gallabox_webhook =
+        path == "/api/v1/public/gallabox/webhook" && *method == Method::POST;
 
     let is_public_crm_route = (*method == Method::GET && path == "/api/v1/crm/health")
         || (path.starts_with("/api/v1/crm/public/applications/")
@@ -1649,6 +1709,8 @@ fn requires_authorization(method: &Method, path: &str) -> bool {
 
     !is_public_crm_route
         && !is_public_guardian_route
+        && !is_public_fee_callback
+        && !is_public_gallabox_webhook
         && (path == "/api/state"
             || path == "/api/media/upload"
             || path == "/api/v1"

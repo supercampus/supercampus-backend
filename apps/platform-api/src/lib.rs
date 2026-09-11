@@ -3,6 +3,7 @@ pub mod dashboard;
 pub mod error;
 pub mod governance;
 pub mod guardian_link;
+pub mod guardian_whatsapp;
 pub mod library_lending;
 pub mod media;
 pub mod models;
@@ -12,7 +13,6 @@ pub mod passes;
 pub mod razorpay;
 pub mod visitors;
 
-pub(crate) use routes::public_base_url;
 pub mod realtime;
 pub mod routes;
 pub mod state;
@@ -80,6 +80,11 @@ async fn security_response_headers(
     next: middleware::Next,
 ) -> Response {
     let mut response = next.run(request).await;
+    let is_html = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
@@ -92,7 +97,11 @@ async fn security_response_headers(
     );
     headers.insert(
         HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+        HeaderValue::from_static(if is_html {
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+        } else {
+            "default-src 'none'; frame-ancestors 'none'"
+        }),
     );
     headers.insert(
         HeaderName::from_static("permissions-policy"),
@@ -296,6 +305,12 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .context("failed to apply the hostel services release patch")?;
         sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0100_guardian_whatsapp_workflows.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply guardian WhatsApp workflows")?;
+        sqlx::raw_sql(include_str!(
             "../../../migrations/runtime/0098_hostel_services_and_meals.sql"
         ))
         .execute(control_database.pool())
@@ -457,6 +472,12 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to configure hostel services and meals")?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0100_guardian_whatsapp_workflows.sql"
+        ))
+        .execute(mec_database.pool())
+        .await
+        .context("failed to configure guardian WhatsApp workflows")?;
     }
     tracing::info!("tenant database manager initialized");
     let mailer = supercampus_notifications::mailer_from_environment()?;
@@ -473,6 +494,10 @@ pub async fn run() -> anyhow::Result<()> {
         .with_auth(auth)
         .with_mailer(mailer)
         .with_whatsapp(whatsapp);
+    let attendance_whatsapp_state = state.clone();
+    tokio::spawn(async move {
+        guardian_whatsapp::run_daily_attendance(attendance_whatsapp_state).await;
+    });
     let seeded = state.seed_test_identities_from_environment().await?;
     if seeded > 0 {
         tracing::info!(count = seeded, "testing identities seeded from environment");

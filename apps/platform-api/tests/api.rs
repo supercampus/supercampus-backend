@@ -198,7 +198,7 @@ async fn maintenance_blocks_users_but_keeps_admin_access() {
 }
 
 #[tokio::test]
-async fn login_rejects_a_mismatched_pre_auth_tenant_header() {
+async fn login_ignores_a_legacy_pre_auth_tenant_header() {
     let response = test_app()
         .oneshot(
             Request::post("/api/auth/login")
@@ -211,11 +211,11 @@ async fn login_rejects_a_mismatched_pre_auth_tenant_header() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
-async fn login_tenant_id_is_case_insensitive_and_resolves_to_mec() {
+async fn login_identity_resolves_the_tenant_without_client_selection() {
     let app = app(AppState::default().with_memory_identity(
         TEST_EMAIL,
         TEST_PASSWORD,
@@ -252,7 +252,7 @@ async fn login_tenant_id_is_case_insensitive_and_resolves_to_mec() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

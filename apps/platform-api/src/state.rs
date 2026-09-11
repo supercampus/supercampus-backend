@@ -710,12 +710,29 @@ impl AppState {
                         WHEN 'hosteller' THEN 'hosteller'
                         ELSE 'day_scholar'
                       END AS residency,
+                      guardian.full_name AS guardian_name,
+                      guardian.phone AS guardian_phone,
+                      guardian.relationship AS guardian_relationship,
                       student.created_at, student.updated_at
                FROM core.students student
                JOIN platform.tenants tenant ON tenant.id = student.tenant_id
                LEFT JOIN core.departments department
                  ON department.tenant_id = student.tenant_id
                 AND department.id::text = student.department_id::text
+               LEFT JOIN LATERAL (
+                 SELECT candidate.full_name,candidate.phone,
+                        COALESCE(candidate.relationship,link.relationship) AS relationship
+                 FROM core.guardians candidate
+                 LEFT JOIN core.student_guardians link
+                   ON link.tenant_id=candidate.tenant_id AND link.guardian_id=candidate.id
+                  AND link.student_id=student.id
+                 WHERE candidate.tenant_id=student.tenant_id
+                   AND (candidate.student_id=student.id OR link.student_id=student.id)
+                   AND (candidate.is_primary OR link.is_primary)
+                 ORDER BY CASE WHEN candidate.student_id=student.id AND candidate.is_primary THEN 0 ELSE 1 END,
+                          candidate.updated_at DESC
+                 LIMIT 1
+               ) guardian ON true
                WHERE tenant.slug = $1
                ORDER BY student.student_number, student.full_name"#,
         )
@@ -740,6 +757,9 @@ impl AppState {
                     "section": row.try_get::<Option<String>, _>("section")?,
                     "photoUrl": row.try_get::<Option<String>, _>("photo_url")?,
                     "residency": row.try_get::<String, _>("residency")?,
+                    "guardianName": row.try_get::<Option<String>, _>("guardian_name")?,
+                    "guardianPhone": row.try_get::<Option<String>, _>("guardian_phone")?,
+                    "guardianRelationship": row.try_get::<Option<String>, _>("guardian_relationship")?,
                     "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?,
                     "updatedAt": row.try_get::<DateTime<Utc>, _>("updated_at")?,
                 }))
@@ -1057,6 +1077,98 @@ impl AppState {
         .fetch_one(&mut *transaction)
         .await?;
 
+        if let (Some(guardian_name), Some(guardian_phone)) = (
+            request.guardian_name.as_deref(),
+            request.guardian_phone.as_deref(),
+        ) {
+            let relationship = request
+                .guardian_relationship
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Parent");
+            let existing_guardian = sqlx::query_scalar::<_, Uuid>(
+                r#"SELECT guardian.id
+                   FROM core.guardians guardian
+                   LEFT JOIN core.student_guardians link
+                     ON link.tenant_id=guardian.tenant_id AND link.guardian_id=guardian.id
+                    AND link.student_id=$2
+                   WHERE guardian.tenant_id=$1
+                     AND (guardian.student_id=$2 OR link.student_id=$2)
+                     AND (guardian.is_primary OR link.is_primary)
+                   ORDER BY CASE WHEN guardian.student_id=$2 AND guardian.is_primary THEN 0 ELSE 1 END,
+                            guardian.updated_at DESC
+                   LIMIT 1"#,
+            )
+            .bind(tenant_id).bind(student_id)
+            .fetch_optional(&mut *transaction).await?;
+            let guardian_id = match existing_guardian {
+                Some(guardian_id) => {
+                    sqlx::query(
+                        r#"UPDATE core.guardians SET full_name=$3,phone=$4,
+                           relationship=$5,student_id=$2,is_primary=true,updated_at=now()
+                           WHERE tenant_id=$1 AND id=$6"#,
+                    )
+                    .bind(tenant_id)
+                    .bind(student_id)
+                    .bind(guardian_name.trim())
+                    .bind(guardian_phone.trim())
+                    .bind(relationship)
+                    .bind(guardian_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                    guardian_id
+                }
+                None => {
+                    sqlx::query_scalar::<_, Uuid>(
+                        r#"INSERT INTO core.guardians
+                       (tenant_id,full_name,phone,student_id,relationship,is_primary)
+                       VALUES($1,$2,$3,$4,$5,true) RETURNING id"#,
+                    )
+                    .bind(tenant_id)
+                    .bind(guardian_name.trim())
+                    .bind(guardian_phone.trim())
+                    .bind(student_id)
+                    .bind(relationship)
+                    .fetch_one(&mut *transaction)
+                    .await?
+                }
+            };
+            sqlx::query(
+                r#"INSERT INTO core.student_guardians
+                   (tenant_id,student_id,guardian_id,relationship,is_primary)
+                   VALUES($1,$2,$3,$4,true)
+                   ON CONFLICT(tenant_id,student_id,guardian_id) DO UPDATE SET
+                     relationship=EXCLUDED.relationship,is_primary=true"#,
+            )
+            .bind(tenant_id)
+            .bind(student_id)
+            .bind(guardian_id)
+            .bind(relationship)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let guardian = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            r#"SELECT guardian.full_name,guardian.phone,
+                      COALESCE(guardian.relationship,link.relationship)
+               FROM core.guardians guardian
+               LEFT JOIN core.student_guardians link
+                 ON link.tenant_id=guardian.tenant_id AND link.guardian_id=guardian.id
+                AND link.student_id=$2
+               WHERE guardian.tenant_id=$1
+                 AND (guardian.student_id=$2 OR link.student_id=$2)
+                 AND (guardian.is_primary OR link.is_primary)
+               ORDER BY CASE WHEN guardian.student_id=$2 AND guardian.is_primary THEN 0 ELSE 1 END,
+                        guardian.updated_at DESC
+               LIMIT 1"#,
+        )
+        .bind(tenant_id)
+        .bind(student_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .unwrap_or((None, None, None));
+
         if let Some(user_id) = user_id {
             sqlx::query(
                 r#"UPDATE identity.users
@@ -1138,6 +1250,9 @@ impl AppState {
             "section": section,
             "photoUrl": student.try_get::<Option<String>, _>("photo_url")?,
             "residency": request.residency,
+            "guardianName": guardian.0,
+            "guardianPhone": guardian.1,
+            "guardianRelationship": guardian.2,
             "createdAt": student.try_get::<DateTime<Utc>, _>("created_at")?,
             "updatedAt": student.try_get::<DateTime<Utc>, _>("updated_at")?,
         })))
@@ -1165,7 +1280,7 @@ impl AppState {
             .await?;
 
             let source_id = format!("bulk:{}", row.roll_no);
-            sqlx::query(
+            let student_id = sqlx::query_scalar::<_, Uuid>(
                 r#"INSERT INTO core.students
                    (tenant_id, student_number, full_name, email, phone, applicant_id,
                     application_id, admission_id, department_id, status, profile)
@@ -1176,7 +1291,8 @@ impl AppState {
                        phone = EXCLUDED.phone,
                        department_id = EXCLUDED.department_id,
                        profile = core.students.profile || EXCLUDED.profile,
-                       updated_at = now()"#,
+                       updated_at = now()
+                   RETURNING id"#,
             )
             .bind(tenant_id)
             .bind(&row.roll_no)
@@ -1186,8 +1302,80 @@ impl AppState {
             .bind(source_id)
             .bind(&row.department)
             .bind(json!({ "source": "bulk_import", "importedBy": actor_id }))
-            .execute(&mut *transaction)
+            .fetch_one(&mut *transaction)
             .await?;
+
+            if let (Some(guardian_name), Some(guardian_phone)) =
+                (row.guardian_name.as_deref(), row.guardian_phone.as_deref())
+            {
+                let relationship = row
+                    .guardian_relationship
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("Parent");
+                let guardian_id = sqlx::query_scalar::<_, Uuid>(
+                    r#"SELECT guardian.id FROM core.guardians guardian
+                       LEFT JOIN core.student_guardians link
+                         ON link.tenant_id=guardian.tenant_id AND link.guardian_id=guardian.id
+                        AND link.student_id=$2
+                       WHERE guardian.tenant_id=$1
+                         AND (guardian.student_id=$2 OR link.student_id=$2)
+                         AND (guardian.is_primary OR link.is_primary)
+                       ORDER BY CASE WHEN guardian.student_id=$2 AND guardian.is_primary THEN 0 ELSE 1 END,
+                                guardian.updated_at DESC
+                       LIMIT 1"#,
+                )
+                .bind(tenant_id)
+                .bind(student_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                let guardian_id = match guardian_id {
+                    Some(id) => {
+                        sqlx::query(
+                            r#"UPDATE core.guardians SET full_name=$3,phone=$4,relationship=$5,
+                               student_id=$2,is_primary=true,updated_at=now()
+                               WHERE tenant_id=$1 AND id=$6"#,
+                        )
+                        .bind(tenant_id)
+                        .bind(student_id)
+                        .bind(guardian_name.trim())
+                        .bind(guardian_phone.trim())
+                        .bind(relationship)
+                        .bind(id)
+                        .execute(&mut *transaction)
+                        .await?;
+                        id
+                    }
+                    None => {
+                        sqlx::query_scalar::<_, Uuid>(
+                            r#"INSERT INTO core.guardians
+                               (tenant_id,full_name,phone,student_id,relationship,is_primary)
+                               VALUES($1,$2,$3,$4,$5,true) RETURNING id"#,
+                        )
+                        .bind(tenant_id)
+                        .bind(guardian_name.trim())
+                        .bind(guardian_phone.trim())
+                        .bind(student_id)
+                        .bind(relationship)
+                        .fetch_one(&mut *transaction)
+                        .await?
+                    }
+                };
+                sqlx::query(
+                    r#"INSERT INTO core.student_guardians
+                       (tenant_id,student_id,guardian_id,relationship,is_primary)
+                       VALUES($1,$2,$3,$4,true)
+                       ON CONFLICT(tenant_id,student_id,guardian_id) DO UPDATE SET
+                         relationship=EXCLUDED.relationship,is_primary=true"#,
+                )
+                .bind(tenant_id)
+                .bind(student_id)
+                .bind(guardian_id)
+                .bind(relationship)
+                .execute(&mut *transaction)
+                .await?;
+            }
 
             if existed {
                 updated += 1;

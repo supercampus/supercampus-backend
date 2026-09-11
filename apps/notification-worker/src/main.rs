@@ -238,6 +238,7 @@ async fn enqueue_whatsapp_deliveries(database: &Database, tenant_id: Uuid) -> an
              WHERE notification.tenant_id=$1
                AND notification.recipient_user_id IS NOT NULL
                AND notification.category=ANY($2)
+               AND notification.category NOT IN ('attendance','fees')
                AND notification.created_at >= now()-make_interval(hours=>$3)
                AND (notification.expires_at IS NULL OR notification.expires_at>now())
              UNION ALL
@@ -252,6 +253,7 @@ async fn enqueue_whatsapp_deliveries(database: &Database, tenant_id: Uuid) -> an
                AND notification.recipient_user_id IS NULL
                AND notification.recipient_role IS NOT NULL
                AND notification.category=ANY($2)
+               AND notification.category NOT IN ('attendance','fees')
                AND notification.created_at >= now()-make_interval(hours=>$3)
                AND (notification.expires_at IS NULL OR notification.expires_at>now())
            ), contacts AS (

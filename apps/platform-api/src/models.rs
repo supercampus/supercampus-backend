@@ -95,6 +95,12 @@ pub struct StudentImportRow {
     pub department: String,
     pub mobile_number: String,
     pub email: String,
+    #[serde(default)]
+    pub guardian_name: Option<String>,
+    #[serde(default)]
+    pub guardian_phone: Option<String>,
+    #[serde(default)]
+    pub guardian_relationship: Option<String>,
 }
 
 /// Sets or clears a student's photograph. `null` removes it.
@@ -123,6 +129,12 @@ pub struct UpdateStudentMasterRequest {
     pub year_of_study: u8,
     pub section: String,
     pub residency: String,
+    #[serde(default)]
+    pub guardian_name: Option<String>,
+    #[serde(default)]
+    pub guardian_phone: Option<String>,
+    #[serde(default)]
+    pub guardian_relationship: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

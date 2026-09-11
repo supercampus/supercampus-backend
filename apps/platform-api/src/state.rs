@@ -37,7 +37,7 @@ const PASSWORD_RESET_TTL_MINUTES: i64 = 60;
 const PASSWORD_RESET_MAX_REQUESTS: i64 = 3;
 const PASSWORD_RESET_THROTTLE_MINUTES: i64 = 15;
 /// Matches the minimum enforced by the sign-in form.
-pub const MINIMUM_PASSWORD_LENGTH: usize = 12;
+pub const MINIMUM_PASSWORD_LENGTH: usize = 8;
 /// Realtime handshake tokens travel in a URL, so they expire almost immediately.
 const REALTIME_TOKEN_TTL_SECONDS: i64 = 60;
 const REFRESH_ROTATION_GRACE_SECONDS: i64 = 10;

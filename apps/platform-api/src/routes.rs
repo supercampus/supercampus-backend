@@ -577,13 +577,13 @@ async fn create_tenant_user(
     if request.name.trim().is_empty()
         || !request.email.contains('@')
         || request.role_ids.is_empty()
-        || request
-            .credential_password()
-            .is_none_or(|password| password.chars().count() < 12 || password.len() > 72)
+        || request.credential_password().is_none_or(|password| {
+            password.chars().count() < MINIMUM_PASSWORD_LENGTH || password.len() > 72
+        })
     {
-        return Err(ApiError::BadRequest(
-            "name, valid email, at least one role, and a password between 12 characters and 72 bytes are required".into(),
-        ));
+        return Err(ApiError::BadRequest(format!(
+            "name, valid email, at least one role, and a password between {MINIMUM_PASSWORD_LENGTH} characters and 72 bytes are required"
+        )));
     }
     let user = state
         .create_tenant_user(

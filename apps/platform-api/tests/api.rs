@@ -858,7 +858,7 @@ async fn reset_password_rejects_a_password_below_the_minimum_length() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert!(body["error"].as_str().unwrap().contains("12 characters"));
+    assert!(body["error"].as_str().unwrap().contains("8 characters"));
 }
 
 #[tokio::test]

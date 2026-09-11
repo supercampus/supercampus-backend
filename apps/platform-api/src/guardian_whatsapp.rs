@@ -101,8 +101,8 @@ pub async fn send_fee_payment_request(
     let due_date = first_string(&record.data, &["dueDate", "dueOn", "deadline"])
         .unwrap_or_else(|| "as notified".into());
     let body = format!(
-        "{}'s fee of {amount} is ready for payment. Due {due_date}.",
-        student.student_name
+        "{}'s fee of {amount} is ready for payment. Due {due_date}. Pay securely: {}",
+        student.student_name, link.short_url
     );
     let values = BTreeMap::from([
         ("RecipientName".into(), student.guardian_name.clone()),
@@ -131,11 +131,19 @@ pub async fn send_fee_payment_request(
             recipient_name: Some(student.guardian_name.clone()),
             template_name: event_template("GALLABOX_TEMPLATE_FEES"),
             template_values: values,
-            button_values: vec![json!({
-                "index": 0,
-                "sub_type": "url",
-                "parameters": {"type": "text", "text": link.short_url}
-            })],
+            // The currently approved fee template has no CTA button. Keep the
+            // payment URL in the named Message variable, and only attach a
+            // button substitution after a matching URL-button template is
+            // approved and explicitly enabled.
+            button_values: if env_flag("GALLABOX_FEES_HAS_URL_BUTTON") {
+                vec![json!({
+                    "index": 0,
+                    "sub_type": "url",
+                    "parameters": {"type": "text", "text": link.short_url}
+                })]
+            } else {
+                Vec::new()
+            },
         })
         .await;
     record_delivery_outcome(database.pool(), tenant, delivery_id, outcome).await?;
@@ -682,6 +690,15 @@ fn parent_whatsapp_enabled() -> bool {
     std::env::var("WHATSAPP_ENABLED").is_ok_and(|value| value.eq_ignore_ascii_case("true"))
         && !std::env::var("PARENT_WHATSAPP_ENABLED")
             .is_ok_and(|value| value.eq_ignore_ascii_case("false"))
+}
+
+fn env_flag(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn api_public_url() -> String {

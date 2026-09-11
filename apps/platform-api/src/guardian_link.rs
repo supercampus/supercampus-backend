@@ -91,8 +91,13 @@ pub async fn issue_guardian_link(
         "{guardian_name}, {student_name} has requested an outpass. Approve or decline here: {link}"
     );
 
-    let quick_replies =
-        std::env::var("GALLABOX_WEBHOOK_SECRET").is_ok_and(|value| !value.trim().is_empty());
+    // Interactive payloads are template-defined in WhatsApp. Do not attach
+    // button substitutions to the currently approved buttonless template.
+    // Once a matching quick-reply template is approved, both the signed
+    // webhook secret and this explicit feature flag must be enabled.
+    let quick_replies = std::env::var("GALLABOX_WEBHOOK_SECRET")
+        .is_ok_and(|value| !value.trim().is_empty())
+        && env_flag("GALLABOX_GUARDIAN_APPROVAL_INTERACTIVE");
     let button_values = if quick_replies {
         vec![
             json!({
@@ -107,17 +112,13 @@ pub async fn issue_guardian_link(
             }),
         ]
     } else {
-        vec![json!({
-            "index": 0,
-            "sub_type": "url",
-            "parameters": {"type": "text", "text": link}
-        })]
+        Vec::new()
     };
     let outcome = state
         .whatsapp()
         .send(WhatsAppMessage {
             to: guardian_phone.to_owned(),
-            body,
+            body: body.clone(),
             media_url: None,
             template_variables: vec![student_name.to_owned(), link.clone()],
             recipient_name: Some(guardian_name.to_owned()),
@@ -125,6 +126,16 @@ pub async fn issue_guardian_link(
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             template_values: [
+                ("RecipientName".to_owned(), guardian_name.to_owned()),
+                (
+                    "Title".to_owned(),
+                    format!("Outpass request for {student_name}"),
+                ),
+                ("Message".to_owned(), body.clone()),
+                (
+                    "EventType".to_owned(),
+                    "gatepass.parent_approval".to_owned(),
+                ),
                 ("GuardianName".to_owned(), guardian_name.to_owned()),
                 ("StudentName".to_owned(), student_name.to_owned()),
                 ("ActionUrl".to_owned(), link.clone()),
@@ -163,6 +174,15 @@ pub async fn issue_guardian_link(
         "deliveryState": delivery_state,
         "expiresAt": expires_at,
     }))
+}
+
+fn env_flag(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// What the guardian sees before deciding.

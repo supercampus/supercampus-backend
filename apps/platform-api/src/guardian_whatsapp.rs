@@ -641,7 +641,16 @@ fn amount_due_paise(data: &Value) -> Option<i64> {
         &["amountDue", "outstanding", "balanceDue", "dueAmount"],
     );
     let major = direct.or_else(|| {
-        let assigned = first_number(data, &["amount", "total", "assignedAmount", "feeAmount"])?;
+        let assigned = first_number(
+            data,
+            &[
+                "amount",
+                "total",
+                "assignedAmount",
+                "amountPerStudent",
+                "feeAmount",
+            ],
+        )?;
         let paid = first_number(data, &["paid", "paidAmount"]).unwrap_or(0.0);
         let waiver = first_number(data, &["waiver", "waiverAmount"]).unwrap_or(0.0);
         Some((assigned - paid - waiver).max(0.0))
@@ -774,6 +783,13 @@ mod tests {
             Some(125_050)
         );
         assert_eq!(amount_due_paise(&json!({"amount": 500, "paid": 500})), None);
+        assert_eq!(
+            amount_due_paise(&json!({
+                "amountPerStudent": 501,
+                "status": "assigned"
+            })),
+            Some(50_100)
+        );
     }
 
     #[test]

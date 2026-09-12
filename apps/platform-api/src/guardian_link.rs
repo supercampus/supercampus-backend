@@ -350,6 +350,15 @@ fn verify_gallabox_signature(headers: &HeaderMap, body: &[u8]) -> ApiResult<()> 
     let secret = std::env::var("GALLABOX_WEBHOOK_SECRET")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        // Existing production deployments already hold the Gallabox API
+        // secret. Accept it as the webhook signing secret during migration so
+        // inbound quick replies can be enabled without rotating credentials.
+        // A dedicated webhook secret remains preferred and takes precedence.
+        .or_else(|| {
+            std::env::var("GALLABOX_API_SECRET")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .ok_or_else(|| ApiError::ServiceUnavailable("Gallabox webhook is not configured".into()))?;
     let supplied = headers
         .get("x-gallabox-signature")

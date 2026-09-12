@@ -48,3 +48,28 @@ without changing event routing once its provider payload is approved.
 WhatsApp delivery is opt-in. The preferences API accepts an explicit
 `whatsappEnabled: true` per category and records the consent timestamp. Older
 clients that only update push settings preserve the existing WhatsApp choice.
+
+## Parent WhatsApp templates
+
+Use a Utility template for `GALLABOX_TEMPLATE_GUARDIAN_APPROVAL` with this
+body: `{{StudentName}} requested an outpass to {{Destination}} on
+{{DepartureTime}}. Reason: {{Reason}}.` Add two quick-reply buttons in this
+order: `Approve`, then `Reject`. Do not add a URL. Configure Gallabox's
+`Message.WA.Interaction.Received` webhook to POST to
+`/api/v1/public/gallabox/webhook`, and set the same signing secret as
+`GALLABOX_WEBHOOK_SECRET`.
+
+Use a Utility template for `GALLABOX_TEMPLATE_ATTENDANCE` with this body:
+`{{StudentName}} was marked absent for {{Absent}} period(s) on
+{{AttendanceDate}}.` The API sends it only when `Absent` is greater than zero,
+at most once per student per day. Do not include the daily percentage,
+`EventType`, a reference line, or an open-app footer.
+
+Use a Utility payment template for `GALLABOX_TEMPLATE_FEES` with this body:
+`Fee due for {{StudentName}}: {{Amount}}. Due {{DueDate}}.` For an ordinary
+template, button 0 is a dynamic `Pay now` URL populated from `ActionUrl`. To
+keep checkout inside WhatsApp, connect the institution's Razorpay account to
+the WhatsApp channel in Gallabox and use an `ORDER_DETAILS` payment button.
+Native payment is a provider-side configuration and must not be represented by
+a normal URL CTA. Add an `Open app` CTA only when that payment template permits
+it, using `SUPERCAMPUS_APP_URL` as the destination.

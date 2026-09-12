@@ -1,11 +1,11 @@
 //! Parent approval of an outpass, without an account.
 //!
 //! An outpass runs `["parent", "warden", "security"]`, and the first approver
-//! has no login and never will. A guardian is reached on WhatsApp, taps a link,
-//! and answers — no app, no password, no enrolment.
+//! has no login and never will. A guardian is reached on WhatsApp and answers
+//! with a signed, one-use Approve or Reject quick reply.
 //!
-//! The link is the whole authorisation, so it is kept as narrow as a session
-//! would be:
+//! The quick-reply payload is the whole authorisation, so it is kept as narrow
+//! as a session would be:
 //!
 //! * 256 bits of randomness, and only its hash is stored;
 //! * good for one decision on one request, at one named step;
@@ -46,7 +46,7 @@ pub struct GuardianDecisionInput {
     pub note: Option<String>,
 }
 
-/// Mints a link and sends it to the guardian.
+/// Mints a one-use action token and sends it to the guardian.
 ///
 /// Called when a hosteller raises an outpass. Failure to deliver is recorded
 /// but never fails the request: the pass is validly raised either way, and a
@@ -83,44 +83,39 @@ pub async fn issue_guardian_link(
     .execute(pool)
     .await?;
 
-    let link = format!(
-        "{}/api/v1/public/gatepass/approvals/{raw}/page",
-        api_public_url().trim_end_matches('/')
-    );
+    let (destination, reason): (String, String) = sqlx::query_as(
+        r#"SELECT destination, reason
+           FROM campus_ops.gatepass_requests
+           WHERE tenant_id=$1 AND id=$2"#,
+    )
+    .bind(tenant)
+    .bind(request_id)
+    .fetch_one(pool)
+    .await?;
+    let departure = departure_at
+        .with_timezone(&chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST"))
+        .format("%d %b %Y, %I:%M %p")
+        .to_string();
     let body = format!(
-        "{guardian_name}, {student_name} has requested an outpass. Approve or decline here: {link}"
+        "{student_name} requested an outpass to {destination} on {departure}. Reason: {reason}."
     );
 
-    // Interactive payloads are template-defined in WhatsApp. Do not attach
-    // button substitutions to the currently approved buttonless template.
-    // Once a matching quick-reply template is approved, both the signed
-    // webhook secret and this explicit feature flag must be enabled.
-    let quick_replies = std::env::var("GALLABOX_WEBHOOK_SECRET")
-        .is_ok_and(|value| !value.trim().is_empty())
-        && env_flag("GALLABOX_GUARDIAN_APPROVAL_INTERACTIVE");
-    let button_values = if quick_replies {
-        vec![
-            json!({
-                "index": 0,
-                "sub_type": "quick_reply",
-                "parameters": {"type": "payload", "payload": format!("SC_OUTPASS:approved:{raw}")}
-            }),
-            json!({
-                "index": 1,
-                "sub_type": "quick_reply",
-                "parameters": {"type": "payload", "payload": format!("SC_OUTPASS:rejected:{raw}")}
-            }),
-        ]
-    } else {
-        Vec::new()
-    };
+    // Never fall back to an approval URL. If the approved template or webhook
+    // is misconfigured the provider records a failed delivery instead of
+    // sending a message that cannot be acted on inside WhatsApp.
+    let button_values = guardian_action_buttons(&raw);
     let outcome = state
         .whatsapp()
         .send(WhatsAppMessage {
             to: guardian_phone.to_owned(),
             body: body.clone(),
             media_url: None,
-            template_variables: vec![student_name.to_owned(), link.clone()],
+            template_variables: vec![
+                student_name.to_owned(),
+                destination.clone(),
+                departure.clone(),
+                reason.clone(),
+            ],
             recipient_name: Some(guardian_name.to_owned()),
             template_name: std::env::var("GALLABOX_TEMPLATE_GUARDIAN_APPROVAL")
                 .ok()
@@ -138,7 +133,9 @@ pub async fn issue_guardian_link(
                 ),
                 ("GuardianName".to_owned(), guardian_name.to_owned()),
                 ("StudentName".to_owned(), student_name.to_owned()),
-                ("ActionUrl".to_owned(), link.clone()),
+                ("Destination".to_owned(), destination),
+                ("DepartureTime".to_owned(), departure),
+                ("Reason".to_owned(), reason),
             ]
             .into_iter()
             .collect(),
@@ -176,13 +173,19 @@ pub async fn issue_guardian_link(
     }))
 }
 
-fn env_flag(key: &str) -> bool {
-    std::env::var(key).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn guardian_action_buttons(token: &str) -> Vec<Value> {
+    vec![
+        json!({
+            "index": 0,
+            "sub_type": "quick_reply",
+            "parameters": {"type": "payload", "payload": format!("SC_OUTPASS:approved:{token}")}
+        }),
+        json!({
+            "index": 1,
+            "sub_type": "quick_reply",
+            "parameters": {"type": "payload", "payload": format!("SC_OUTPASS:rejected:{token}")}
+        }),
+    ]
 }
 
 /// What the guardian sees before deciding.
@@ -399,10 +402,6 @@ fn phones_match(left: &str, right: &str) -> bool {
             && left[left.len() - 10..] == right[right.len() - 10..])
 }
 
-fn api_public_url() -> String {
-    std::env::var("API_PUBLIC_URL").unwrap_or_else(|_| "https://api.supercampus.ai".into())
-}
-
 fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -533,5 +532,22 @@ mod tests {
             find_action(&payload).as_deref(),
             Some("SC_OUTPASS:approved:deadbeef")
         );
+    }
+
+    #[test]
+    fn guardian_action_template_has_only_in_chat_quick_replies() {
+        let buttons = guardian_action_buttons("deadbeef");
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(buttons[0]["sub_type"], "quick_reply");
+        assert_eq!(buttons[1]["sub_type"], "quick_reply");
+        assert_eq!(
+            buttons[0]["parameters"]["payload"],
+            "SC_OUTPASS:approved:deadbeef"
+        );
+        assert_eq!(
+            buttons[1]["parameters"]["payload"],
+            "SC_OUTPASS:rejected:deadbeef"
+        );
+        assert!(buttons.iter().all(|button| button["sub_type"] != "url"));
     }
 }

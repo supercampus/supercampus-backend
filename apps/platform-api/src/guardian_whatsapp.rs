@@ -101,8 +101,8 @@ pub async fn send_fee_payment_request(
     let due_date = first_string(&record.data, &["dueDate", "dueOn", "deadline"])
         .unwrap_or_else(|| "as notified".into());
     let body = format!(
-        "{}'s fee of {amount} is ready for payment. Due {due_date}. Pay securely: {}",
-        student.student_name, link.short_url
+        "Fee due for {}: {amount}. Due {due_date}.",
+        student.student_name
     );
     let values = BTreeMap::from([
         ("RecipientName".into(), student.guardian_name.clone()),
@@ -111,10 +111,11 @@ pub async fn send_fee_payment_request(
         ("Amount".into(), amount),
         ("DueDate".into(), due_date),
         ("Status".into(), "Payment due".into()),
-        ("Title".into(), "Student fee payment".into()),
+        ("Title".into(), "Fee payment due".into()),
         ("Message".into(), body.clone()),
         ("EventType".into(), "fees.payment.requested".into()),
         ("ActionUrl".into(), link.short_url.clone()),
+        ("AppUrl".into(), supercampus_app_url()),
     ]);
     let outcome = state
         .whatsapp()
@@ -131,10 +132,9 @@ pub async fn send_fee_payment_request(
             recipient_name: Some(student.guardian_name.clone()),
             template_name: event_template("GALLABOX_TEMPLATE_FEES"),
             template_values: values,
-            // The currently approved fee template has no CTA button. Keep the
-            // payment URL in the named Message variable, and only attach a
-            // button substitution after a matching URL-button template is
-            // approved and explicitly enabled.
+            // Standard templates use a Pay now URL. Gallabox native-payment
+            // templates replace it with an ORDER_DETAILS action configured
+            // against the institution's linked Razorpay account.
             button_values: if env_flag("GALLABOX_FEES_HAS_URL_BUTTON") {
                 vec![json!({
                     "index": 0,
@@ -232,7 +232,8 @@ async fn send_attendance_for_tenant(state: &AppState, slug: &str) -> anyhow::Res
              AND session.status IN ('submitted_to_principal','approved')
              AND student.user_account_id IS NOT NULL
            GROUP BY student.id,student.user_account_id,student.student_number,student.email,
-                    student.full_name,guardian.id,guardian.full_name,guardian.phone,session.held_on"#,
+                    student.full_name,guardian.id,guardian.full_name,guardian.phone,session.held_on
+           HAVING count(*) FILTER (WHERE entry.status='absent') > 0"#,
     )
     .bind(tenant)
     .fetch_all(database.pool())
@@ -255,12 +256,12 @@ async fn send_attendance_for_tenant(state: &AppState, slug: &str) -> anyhow::Res
         let absent: i64 = row.try_get("absent")?;
         let od: i64 = row.try_get("od")?;
         let leave: i64 = row.try_get("leave")?;
-        let event_key = format!("attendance:{}:{date}", student.student_user_id);
+        let event_key = format!("attendance.absent:{}:{date}", student.student_user_id);
         let Some(delivery_id) = claim_delivery(
             database.pool(),
             tenant,
             &student,
-            "attendance.daily_summary",
+            "attendance.absent",
             &event_key,
             event_template("GALLABOX_TEMPLATE_ATTENDANCE"),
         )
@@ -268,31 +269,21 @@ async fn send_attendance_for_tenant(state: &AppState, slug: &str) -> anyhow::Res
         else {
             continue;
         };
-        let attended = present + od;
-        let percentage = if total == 0 {
-            0.0
-        } else {
-            attended as f64 * 100.0 / total as f64
-        };
         let date_label = date.format("%d %b %Y").to_string();
-        let body = format!(
-            "{} attendance for {date_label}: {present} present, {absent} absent, {od} OD, {leave} leave ({percentage:.1}%).",
-            student.student_name
-        );
+        let body = attendance_absence_body(&student.student_name, &date_label, absent);
         let values = BTreeMap::from([
             ("RecipientName".into(), student.guardian_name.clone()),
             ("GuardianName".into(), student.guardian_name.clone()),
             ("StudentName".into(), student.student_name.clone()),
-            ("AttendanceDate".into(), date_label),
+            ("AttendanceDate".into(), date_label.clone()),
             ("Present".into(), present.to_string()),
             ("Absent".into(), absent.to_string()),
             ("OD".into(), od.to_string()),
             ("Leave".into(), leave.to_string()),
             ("Total".into(), total.to_string()),
-            ("Percentage".into(), format!("{percentage:.1}%")),
-            ("Title".into(), "Daily attendance summary".into()),
+            ("Title".into(), "Attendance absence alert".into()),
             ("Message".into(), body.clone()),
-            ("EventType".into(), "attendance.daily_summary".into()),
+            ("EventType".into(), "attendance.absent".into()),
         ]);
         let outcome = state
             .whatsapp()
@@ -302,9 +293,8 @@ async fn send_attendance_for_tenant(state: &AppState, slug: &str) -> anyhow::Res
                 media_url: None,
                 template_variables: vec![
                     student.student_name.clone(),
-                    present.to_string(),
                     absent.to_string(),
-                    format!("{percentage:.1}%"),
+                    date_label,
                 ],
                 recipient_name: Some(student.guardian_name.clone()),
                 template_name: event_template("GALLABOX_TEMPLATE_ATTENDANCE"),
@@ -710,8 +700,23 @@ fn env_flag(key: &str) -> bool {
     })
 }
 
+fn attendance_absence_body(student_name: &str, date: &str, absent: i64) -> String {
+    let unit = if absent == 1 { "period" } else { "periods" };
+    format!("{student_name} was marked absent for {absent} {unit} on {date}.")
+}
+
 fn api_public_url() -> String {
     std::env::var("API_PUBLIC_URL").unwrap_or_else(|_| "https://api.supercampus.ai".into())
+}
+
+fn supercampus_app_url() -> String {
+    std::env::var("SUPERCAMPUS_APP_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            "https://supercampusapplication-e0miwj-dcd788-200-141-5-86.sslip.io".into()
+        })
 }
 
 fn razorpay_api_base() -> String {
@@ -809,5 +814,17 @@ mod tests {
             callback.razorpay_payment_id
         );
         assert_eq!(payload, "plink_1|sc-1|paid|pay_1");
+    }
+
+    #[test]
+    fn absence_message_contains_only_the_required_alert() {
+        assert_eq!(
+            attendance_absence_body("Rubesh R", "11 Sep 2026", 1),
+            "Rubesh R was marked absent for 1 period on 11 Sep 2026."
+        );
+        assert_eq!(
+            attendance_absence_body("Vishnu S", "12 Sep 2026", 2),
+            "Vishnu S was marked absent for 2 periods on 12 Sep 2026."
+        );
     }
 }

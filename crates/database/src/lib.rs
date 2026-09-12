@@ -267,6 +267,48 @@ impl TenantDatabaseManager {
             .remove(tenant_slug);
         Ok(())
     }
+
+    /// Creates, migrates, and registers a dedicated database for a new tenant.
+    /// The identifier is strictly validated before it is used in DDL.
+    pub async fn provision(
+        &self,
+        tenant_slug: &str,
+        database_name: &str,
+    ) -> anyhow::Result<Database> {
+        validate_database_name(database_name)?;
+        let Some(base_options) = &self.base_options else {
+            self.register(tenant_slug, database_name).await?;
+            return Ok(self.control.clone());
+        };
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+                .bind(database_name)
+                .fetch_one(self.control.pool())
+                .await
+                .context("failed to check tenant database availability")?;
+        if !exists {
+            sqlx::query(&format!("CREATE DATABASE {database_name}"))
+                .execute(self.control.pool())
+                .await
+                .with_context(|| format!("failed to create tenant database {database_name}"))?;
+        }
+        let database = Database::connect_options(
+            base_options.clone().database(database_name),
+            self.tenant_max_connections,
+        )
+        .await
+        .with_context(|| format!("failed to connect tenant {tenant_slug} database"))?;
+        database
+            .migrate()
+            .await
+            .with_context(|| format!("failed to migrate tenant {tenant_slug} database"))?;
+        self.register(tenant_slug, database_name).await?;
+        self.pools
+            .write()
+            .map_err(|_| anyhow::anyhow!("tenant database cache is unavailable"))?
+            .insert(tenant_slug.to_owned(), database.clone());
+        Ok(database)
+    }
 }
 
 pub fn validate_database_name(database_name: &str) -> anyhow::Result<()> {
@@ -286,7 +328,7 @@ pub fn validate_database_name(database_name: &str) -> anyhow::Result<()> {
 pub const CRATE_NAME: &str = "supercampus-database";
 
 /// Latest forward-only runtime migration embedded in this build.
-pub const RUNTIME_MIGRATION_VERSION: i64 = 95;
+pub const RUNTIME_MIGRATION_VERSION: i64 = 106;
 
 #[cfg(test)]
 mod tests {

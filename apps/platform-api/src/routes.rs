@@ -142,6 +142,7 @@ pub fn router(state: AppState) -> Router {
         )
         .nest("/timetable", crate::timetable::router())
         .nest("/operations", crate::operations::router())
+        .nest("/platform-admin", crate::platform_admin::router())
         .route(
             "/{module_key}/records",
             get(list_records).post(create_record),

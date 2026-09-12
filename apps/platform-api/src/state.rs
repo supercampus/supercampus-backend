@@ -3547,8 +3547,8 @@ fn authorization_role_row(row: &PgRow, permissions: Value) -> anyhow::Result<Val
 
 fn validate_portal_family(value: &str) -> anyhow::Result<&str> {
     match value.trim() {
-        "student" | "parent" | "staff" | "admin" => Ok(value.trim()),
-        _ => bail!("portal family must be student, parent, staff, or admin"),
+        "student" | "parent" | "staff" | "admin" | "platform-control" => Ok(value.trim()),
+        _ => bail!("portal family must be student, parent, staff, admin, or platform-control"),
     }
 }
 
@@ -3558,6 +3558,8 @@ fn legacy_portal_family(role_key: &str) -> &'static str {
         "student"
     } else if matches!(normalized.as_str(), "parent" | "guardian") {
         "parent"
+    } else if normalized == "platform_super_admin" {
+        "platform-control"
     } else if normalized.contains("admin") {
         "admin"
     } else {

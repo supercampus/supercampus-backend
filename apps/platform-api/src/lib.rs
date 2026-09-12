@@ -10,6 +10,7 @@ pub mod models;
 pub mod notification;
 pub mod operations;
 pub mod passes;
+pub mod platform_admin;
 pub mod razorpay;
 pub mod visitors;
 
@@ -311,6 +312,12 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .context("failed to apply guardian WhatsApp workflows")?;
         sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0106_platform_superadmin_control.sql"
+        ))
+        .execute(control_database.pool())
+        .await
+        .context("failed to apply the SuperCampus control-plane release patch")?;
+        sqlx::raw_sql(include_str!(
             "../../../migrations/runtime/0098_hostel_services_and_meals.sql"
         ))
         .execute(control_database.pool())
@@ -504,6 +511,9 @@ pub async fn run() -> anyhow::Result<()> {
         .with_auth(auth)
         .with_mailer(mailer)
         .with_whatsapp(whatsapp);
+    if platform_admin::seed_platform_admin_from_environment(&state).await? {
+        tracing::info!("platform administrator synchronized from environment");
+    }
     let attendance_whatsapp_state = state.clone();
     tokio::spawn(async move {
         guardian_whatsapp::run_daily_attendance(attendance_whatsapp_state).await;

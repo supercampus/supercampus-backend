@@ -310,11 +310,9 @@ pub async fn decide_visitor_pass(
             to: visitor_phone.clone(),
             body,
             media_url: Some(image_url.clone()),
-            // Used only when the tenant has an approved template configured.
-            // The card's link rides along as a variable, because a template
-            // cannot carry freeform text and a trial account cannot carry an
-            // attachment at all.
-            template_variables: vec![visitor_name.clone(), image_url.clone()],
+            // The approved template has an image header (the generated pass)
+            // followed by the visitor and host names in its body.
+            template_variables: vec![visitor_name.clone(), host_name.clone()],
             recipient_name: Some(visitor_name.clone()),
             template_name: std::env::var("GALLABOX_TEMPLATE_VISITOR_PASS")
                 .ok()
@@ -326,11 +324,9 @@ pub async fn decide_visitor_pass(
             ]
             .into_iter()
             .collect(),
-            button_values: vec![serde_json::json!({
-                "index": 0,
-                "sub_type": "url",
-                "parameters": {"type": "text", "text": image_url.clone()}
-            })],
+            // The QR is delivered directly as the image header, so visitors
+            // never need to follow a separate pass URL.
+            button_values: Vec::new(),
         })
         .await;
 

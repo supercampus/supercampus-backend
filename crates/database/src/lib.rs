@@ -154,6 +154,9 @@ impl TenantDatabaseManager {
         if tenant_slug.is_empty() {
             bail!("tenant slug is required for database resolution");
         }
+        if tenant_slug == "supercampus-control" {
+            return Ok(self.control.clone());
+        }
         if self.base_options.is_none() {
             return Ok(self.control.clone());
         }

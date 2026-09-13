@@ -3447,6 +3447,9 @@ impl AppState {
         tenant_id: &str,
         student_id: &str,
     ) -> anyhow::Result<StoredAppState> {
+        if tenant_id == "supercampus-control" {
+            return Ok(default_app_state());
+        }
         if self.database.is_some() {
             let database = self.tenant_database(tenant_id).await?;
             let row = sqlx::query(
@@ -3482,6 +3485,9 @@ impl AppState {
         student_id: String,
         state: Value,
     ) -> anyhow::Result<StoredAppState> {
+        if tenant_id == "supercampus-control" {
+            return Ok(default_app_state());
+        }
         if self.database.is_some() {
             let database = self.tenant_database(&tenant_id).await?;
             let tenant_uuid = ensure_tenant(&database, &tenant_id).await?;

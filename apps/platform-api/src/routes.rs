@@ -135,6 +135,14 @@ pub fn router(state: AppState) -> Router {
             "/public/gallabox/webhook",
             post(crate::guardian_link::gallabox_interaction),
         )
+        .route(
+            "/public/visitor/invitations/{token}/page",
+            get(crate::visitors::show_public_visitor_page),
+        )
+        .route(
+            "/public/visitor/passes/{token}",
+            get(crate::visitors::get_public_visitor_pass),
+        )
         .route("/realtime/ws", get(crate::realtime::websocket))
         .nest(
             "/academic-assignments",
@@ -1704,6 +1712,9 @@ fn requires_authorization(method: &Method, path: &str) -> bool {
         path == "/api/v1/public/fees/payment-links/callback" && *method == Method::GET;
     let is_public_gallabox_webhook =
         path == "/api/v1/public/gallabox/webhook" && *method == Method::POST;
+    let is_public_visitor_route = (path.starts_with("/api/v1/public/visitor/invitations/")
+        || path.starts_with("/api/v1/public/visitor/passes/"))
+        && *method == Method::GET;
 
     let is_public_crm_route = (*method == Method::GET && path == "/api/v1/crm/health")
         || (path.starts_with("/api/v1/crm/public/applications/")
@@ -1717,6 +1728,7 @@ fn requires_authorization(method: &Method, path: &str) -> bool {
         && !is_public_guardian_route
         && !is_public_fee_callback
         && !is_public_gallabox_webhook
+        && !is_public_visitor_route
         && (path == "/api/state"
             || path == "/api/media/upload"
             || path == "/api/v1"

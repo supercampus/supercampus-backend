@@ -123,6 +123,10 @@ pub fn router() -> Router<AppState> {
             "/gatepass/visitors/{pass_id}/decision",
             post(crate::visitors::decide_visitor_pass),
         )
+        .route(
+            "/gatepass/visitors/{pass_id}/cancel",
+            post(crate::visitors::cancel_visitor_pass),
+        )
         .route("/attendance/roster", get(attendance_roster))
         .route("/attendance/classes", get(attendance_classes))
         .route("/student/assessments", get(student_assessments))
@@ -4531,12 +4535,12 @@ async fn scan_gatepass(
            WHERE pass.tenant_id=$1
              AND (pass.qr_token_hash=$2 OR pass.manual_code_hash=$2)
           UNION ALL
-          -- A visitor pass is only good inside the window it was approved for.
+          -- A visitor pass is good inside the window it was approved for (including 30m early grace).
           SELECT id::text,NULL::uuid,id,visitor_name,'visitor' pass_type,
                  visit_until valid_until
             FROM campus_ops.visitor_passes
-           WHERE tenant_id=$1 AND state='approved' AND qr_token_hash=$2
-             AND now() BETWEEN visit_from AND visit_until
+           WHERE tenant_id=$1 AND state IN ('approved', 'sent', 'active', 'checked_in') AND qr_token_hash=$2
+             AND now() BETWEEN (visit_from - interval '30 minutes') AND visit_until
         ) valid LIMIT 1"#,
     )
     .bind(tenant)
@@ -4572,6 +4576,29 @@ async fn scan_gatepass(
         .bind(request_id)
         .execute(&mut *tx)
         .await?;
+    }
+    if let Some(visitor_pass_id) = match_row.2 {
+        if input.direction == "entry" {
+            sqlx::query(
+                r#"UPDATE campus_ops.visitor_passes
+                   SET state='checked_in',checked_in_at=COALESCE(checked_in_at,now()),updated_at=now()
+                   WHERE tenant_id=$1 AND id=$2"#,
+            )
+            .bind(tenant)
+            .bind(visitor_pass_id)
+            .execute(&mut *tx)
+            .await?;
+        } else if input.direction == "exit" {
+            sqlx::query(
+                r#"UPDATE campus_ops.visitor_passes
+                   SET state='checked_out',checked_out_at=now(),updated_at=now()
+                   WHERE tenant_id=$1 AND id=$2"#,
+            )
+            .bind(tenant)
+            .bind(visitor_pass_id)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
     if let Some(object) = value.as_object_mut() {
         object.insert("holderName".into(), json!(match_row.3));

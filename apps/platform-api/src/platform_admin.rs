@@ -36,7 +36,7 @@ fn require_platform_admin(access: &EffectiveAccess) -> ApiResult<()> {
         .roles
         .iter()
         .any(|role| role == "platform_super_admin")
-        && access
+        || access
             .portal_families
             .iter()
             .any(|family| family == "platform-control")
@@ -750,6 +750,10 @@ pub async fn seed_platform_admin_from_environment(state: &AppState) -> anyhow::R
         .bind(tenant_id).bind(user_id).execute(&mut *transaction).await?;
     sqlx::query("INSERT INTO authz.user_roles (tenant_id,user_id,role_id,assigned_by) SELECT $1,$2,id,'platform-admin-environment' FROM authz.roles WHERE tenant_id=$1 AND role_key='platform_super_admin' ON CONFLICT DO NOTHING")
         .bind(tenant_id).bind(user_id).execute(&mut *transaction).await?;
+    sqlx::query("INSERT INTO authz.role_surfaces (tenant_id,role_id,surface,enabled_by) SELECT $1,id,s,'platform-admin-environment' FROM authz.roles CROSS JOIN (VALUES ('website'::text),('app'::text)) AS available(s) WHERE tenant_id=$1 AND role_key='platform_super_admin' ON CONFLICT DO NOTHING")
+        .bind(tenant_id).execute(&mut *transaction).await?;
+    sqlx::query("INSERT INTO authz.role_permissions (tenant_id,role_id,permission_key,scope,granted_by,surface) SELECT $1,id,'platform.control.*','all','platform-admin-environment',s FROM authz.roles CROSS JOIN (VALUES ('website'::text),('app'::text)) AS available(s) WHERE tenant_id=$1 AND role_key='platform_super_admin' ON CONFLICT (tenant_id,role_id,surface,permission_key) DO UPDATE SET scope='all'")
+        .bind(tenant_id).execute(&mut *transaction).await?;
     transaction.commit().await?;
     Ok(true)
 }

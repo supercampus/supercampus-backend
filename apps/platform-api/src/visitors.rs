@@ -174,22 +174,32 @@ pub async fn create_visitor_pass(
         let token_hash = crate::operations::token_hash(&raw_token);
         let tier = PassTier::for_visitor_kind(kind);
 
-        let png = passes::render(&raw_token, tier, 740).map_err(|error| {
-            tracing::error!(error = ?error, "failed to render a visitor pass card");
-            ApiError::Internal
-        })?;
-        let temp_id = Uuid::new_v4();
-        let stored = crate::media::store_rendered_png(
-            &principal.student.tenant_id,
-            &format!("visitor-pass-{temp_id}.png"),
-            png,
-        )
-        .await?;
-        let image_url = stored
-            .get("secureUrl")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+        let image_url = match passes::render(&raw_token, tier, 740) {
+            Ok(png) => {
+                let temp_id = Uuid::new_v4();
+                match crate::media::store_rendered_png(
+                    &principal.student.tenant_id,
+                    &format!("visitor-pass-{temp_id}.png"),
+                    png,
+                )
+                .await
+                {
+                    Ok(stored) => stored
+                        .get("secureUrl")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    Err(error) => {
+                        tracing::warn!(error = ?error, "Media storage skipped or failed for visitor pass");
+                        String::new()
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = ?error, "failed to render visitor pass card");
+                String::new()
+            }
+        };
 
         let (ds, de) = dispatch_visitor_whatsapp(
             &state,
@@ -204,7 +214,14 @@ pub async fn create_visitor_pass(
         )
         .await;
 
-        ("approved", Some(raw_token), Some(token_hash), Some(image_url), ds, de)
+        (
+            "approved",
+            Some(raw_token),
+            Some(token_hash),
+            if image_url.is_empty() { None } else { Some(image_url) },
+            ds,
+            de,
+        )
     } else {
         ("pending_admin", None, None, None, "pending".to_string(), None)
     };
@@ -337,11 +354,11 @@ pub async fn decide_visitor_pass(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
-    // Set tenant context for RLS. Using false (session-level) so the setting
-    // persists across multiple queries on this pooled connection.
-    sqlx::query("SELECT set_config('app.tenant_id', $1, false)")
+    let mut tx = db.pool().begin().await?;
+
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
         .bind(tenant.to_string())
-        .execute(db.pool())
+        .execute(&mut *tx)
         .await?;
 
     let pending = sqlx::query_as::<_, (String, String, String, String, DateTime<Utc>, DateTime<Utc>)>(
@@ -351,7 +368,7 @@ pub async fn decide_visitor_pass(
     )
     .bind(tenant)
     .bind(pass_id)
-    .fetch_optional(db.pool())
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::Conflict("This pass is not awaiting a decision".into()))?;
 
@@ -366,8 +383,10 @@ pub async fn decide_visitor_pass(
         .bind(pass_id)
         .bind(&principal.student.id)
         .bind(input.note.as_deref())
-        .fetch_one(db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+
+        tx.commit().await?;
         return Ok(Json(crate::models::ApiResponse::new(value)));
     }
 
@@ -377,36 +396,31 @@ pub async fn decide_visitor_pass(
     let raw_token = Uuid::new_v4().to_string();
     let token_hash = crate::operations::token_hash(&raw_token);
 
-    let png = passes::render(&raw_token, tier, 740).map_err(|error| {
-        tracing::error!(error = ?error, "failed to render a visitor pass card");
-        ApiError::Internal
-    })?;
-    let stored = crate::media::store_rendered_png(
-        &principal.student.tenant_id,
-        &format!("visitor-pass-{pass_id}.png"),
-        png,
-    )
-    .await?;
-    let image_url = stored
-        .get("secureUrl")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-
-    sqlx::query(
-        r#"UPDATE campus_ops.visitor_passes
-           SET state = 'approved', qr_token_hash = $3, pass_image_url = $4,
-               decided_by = $5, decision_note = $6, updated_at = now()
-           WHERE tenant_id = $1 AND id = $2"#,
-    )
-    .bind(tenant)
-    .bind(pass_id)
-    .bind(&token_hash)
-    .bind(&image_url)
-    .bind(&principal.student.id)
-    .bind(input.note.as_deref())
-    .execute(db.pool())
-    .await?;
+    let image_url = match passes::render(&raw_token, tier, 740) {
+        Ok(png) => {
+            match crate::media::store_rendered_png(
+                &principal.student.tenant_id,
+                &format!("visitor-pass-{pass_id}.png"),
+                png,
+            )
+            .await
+            {
+                Ok(stored) => stored
+                    .get("secureUrl")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                Err(error) => {
+                    tracing::warn!(error = ?error, "Media storage skipped or failed for visitor pass");
+                    String::new()
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = ?error, "failed to render visitor pass card");
+            String::new()
+        }
+    };
 
     let (delivery_state, delivery_error) = dispatch_visitor_whatsapp(
         &state,
@@ -423,8 +437,11 @@ pub async fn decide_visitor_pass(
 
     let value = sqlx::query_scalar::<_, Value>(
         r#"UPDATE campus_ops.visitor_passes
-           SET delivery_state = $3, delivery_error = $4,
-               delivered_at = CASE WHEN $3 = 'sent' THEN now() ELSE NULL END,
+           SET state = 'approved', qr_token_hash = $3,
+               pass_image_url = CASE WHEN $4 = '' THEN NULL ELSE $4 END,
+               decided_by = $5, decision_note = $6,
+               delivery_state = $7, delivery_error = $8,
+               delivered_at = CASE WHEN $7 = 'sent' THEN now() ELSE NULL END,
                updated_at = now()
            WHERE tenant_id = $1 AND id = $2
            RETURNING jsonb_build_object(
@@ -435,10 +452,16 @@ pub async fn decide_visitor_pass(
     )
     .bind(tenant)
     .bind(pass_id)
+    .bind(&token_hash)
+    .bind(&image_url)
+    .bind(&principal.student.id)
+    .bind(input.note.as_deref())
     .bind(&delivery_state)
     .bind(delivery_error.as_deref())
-    .fetch_one(db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok(Json(crate::models::ApiResponse::new(value)))
 }

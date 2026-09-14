@@ -235,6 +235,13 @@ pub async fn create_visitor_pass(
         ("pending_admin", None, None, None, "pending".to_string(), None)
     };
 
+    let mut tx = db.pool().begin().await?;
+
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await?;
+
     let value = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.visitor_passes
                (tenant_id, visitor_kind, visitor_name, visitor_phone, purpose, relationship,
@@ -265,8 +272,10 @@ pub async fn create_visitor_pass(
     .bind(pass_image_url.as_deref())
     .bind(&delivery_state)
     .bind(delivery_error.as_deref())
-    .fetch_one(db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     let mut result_json = value;
     if let (Some(obj), Some(token_str)) = (result_json.as_object_mut(), raw_token) {

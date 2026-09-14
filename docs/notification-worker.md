@@ -70,6 +70,13 @@ Use a Utility payment template for `GALLABOX_TEMPLATE_FEES` with this body:
 template, button 0 is a dynamic `Pay now` URL populated from `ActionUrl`. To
 keep checkout inside WhatsApp, connect the institution's Razorpay account to
 the WhatsApp channel in Gallabox and use an `ORDER_DETAILS` payment button.
-Native payment is a provider-side configuration and must not be represented by
+native payment is a provider-side configuration and must not be represented by
 a normal URL CTA. Add an `Open app` CTA only when that payment template permits
 it, using `SUPERCAMPUS_APP_URL` as the destination.
+
+## Visitor passes
+
+Use a Utility template for `GALLABOX_TEMPLATE_VISITOR_INVITATION` (or `GALLABOX_TEMPLATE_VISITOR_PASS`) with this body:
+`Hello {{1}}, Your visit to SuperCampus has been scheduled. Date: {{2}} Time: {{3}} Please show the QR pass attached to this message at the campus gate.`
+
+The API supplies these named variables (for reference/mapping): `VisitorName`, `HostName`, `VisitDate`, `VisitTime`, `PassUrl`, and `PageUrl`. The pass card image is attached as header media. Configure one dynamic URL button at index 0 for the pass link (`/api/v1/public/visitor/invitations/{{1}}/page`).

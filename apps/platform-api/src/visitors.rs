@@ -83,9 +83,7 @@ pub async fn create_visitor_pass(
     // reach. A student holds `visitor.create` for their own guardian and stops
     // there.
     if kind == "guest" {
-        let scope = access
-            .scope_for("gatepass.visitor.create")
-            .unwrap_or("own");
+        let scope = access.scope_for("gatepass.visitor.create").unwrap_or("own");
         if !matches!(scope, "institution" | "all") {
             return Err(ApiError::Forbidden);
         }
@@ -109,10 +107,7 @@ pub async fn create_visitor_pass(
     }
 
     let (host_user_id, host_name) = if kind == "parent" {
-        (
-            principal.student.id.clone(),
-            principal.student.name.clone(),
-        )
+        (principal.student.id.clone(), principal.student.name.clone())
     } else {
         (
             input
@@ -130,6 +125,13 @@ pub async fn create_visitor_pass(
 
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
+
+    let mut tx = db.pool().begin().await?;
+
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await?;
 
     let value = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.visitor_passes
@@ -153,8 +155,10 @@ pub async fn create_visitor_pass(
     .bind(&principal.student.id)
     .bind(input.visit_from)
     .bind(input.visit_until)
-    .fetch_one(db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok((
         StatusCode::CREATED,
@@ -186,6 +190,13 @@ pub async fn list_visitor_passes(
 
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
+
+    let mut tx = db.pool().begin().await?;
+
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await?;
 
     let value = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -273,11 +284,10 @@ pub async fn decide_visitor_pass(
     let raw_token = Uuid::new_v4().to_string();
     let token_hash = crate::operations::token_hash(&raw_token);
 
-    let png = passes::render(&raw_token, tier, 740)
-        .map_err(|error| {
-            tracing::error!(error = ?error, "failed to render a visitor pass card");
-            ApiError::Internal
-        })?;
+    let png = passes::render(&raw_token, tier, 740).map_err(|error| {
+        tracing::error!(error = ?error, "failed to render a visitor pass card");
+        ApiError::Internal
+    })?;
     let stored = crate::media::store_rendered_png(
         &principal.student.tenant_id,
         &format!("visitor-pass-{pass_id}.png"),

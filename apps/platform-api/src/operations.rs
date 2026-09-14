@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post, put},
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -23,6 +23,19 @@ pub fn router() -> Router<AppState> {
         .merge(crate::library_lending::router())
         .route("/changes", get(changes))
         .route("/notifications", get(notifications))
+        .route("/notifications/read-all", post(read_all_notifications))
+        .route(
+            "/notifications/{notification_id}/read",
+            post(read_notification),
+        )
+        .route(
+            "/notifications/preferences",
+            get(notification_preferences).put(update_notification_preferences),
+        )
+        .route(
+            "/notifications/devices",
+            post(register_push_device).delete(unregister_push_device),
+        )
         .route("/canteen/store", get(canteen_store))
         .route("/canteen/shops", get(list_shops).post(create_shop))
         .route(
@@ -40,6 +53,7 @@ pub fn router() -> Router<AppState> {
             put(update_order_status),
         )
         .route("/canteen/orders/scan", post(scan_order))
+        .route("/canteen/wallets", get(wallet_directory))
         .route("/canteen/wallets/{user_id}/top-ups", post(top_up_wallet))
         .route("/canteen/staff-state", put(update_canteen_staff_state))
         .route("/gatepass/overview", get(gatepass_overview))
@@ -64,8 +78,22 @@ pub fn router() -> Router<AppState> {
             "/gatepass/visitors/{pass_id}/decision",
             post(crate::visitors::decide_visitor_pass),
         )
+        .route(
+            "/gatepass/visitors/{pass_id}/cancel",
+            post(crate::visitors::cancel_visitor_pass),
+        )
         .route("/attendance/roster", get(attendance_roster))
+        .route("/student/assessments", get(student_assessments))
         .route("/advisor/students", get(advisor_students))
+        .route(
+            "/advisor/students/{student_id}/assessments",
+            get(advisor_student_assessments).post(create_advisor_student_assessment),
+        )
+        .route(
+            "/advisor/students/{student_id}/assessments/{assessment_id}",
+            put(update_advisor_student_assessment),
+        )
+>>>>>>> fddf3042 (fix: visitor passes RLS transaction context, relationship field, and cancel route)
         .route("/attendance/wards", get(attendance_wards))
         .route("/attendance/summary/{student_id}", get(attendance_summary))
         .route(
@@ -74,7 +102,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/attendance/sessions/{session_id}/entries",
-            put(replace_attendance_entries),
+            get(attendance_session_entries).put(replace_attendance_entries),
         )
         .route(
             "/attendance/sessions/{session_id}/publish",
@@ -325,19 +353,297 @@ async fn notifications(
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let rows = sqlx::query_scalar::<_, Value>(
         r#"
-      SELECT COALESCE(jsonb_agg(jsonb_build_object('id', id, 'category', category,
-        'title', title, 'body', body, 'data', data, 'readAt', read_at,
-        'createdAt', created_at) ORDER BY created_at DESC), '[]'::jsonb)
-      FROM campus_ops.notifications
-      WHERE tenant_id=$1 AND (recipient_user_id=$2 OR recipient_role = ANY($3))
-      LIMIT 100"#,
+      WITH accessible AS (
+        SELECT notification.*,
+          CASE WHEN notification.recipient_user_id=$2
+            THEN notification.read_at ELSE receipt.read_at END AS viewer_read_at
+        FROM campus_ops.notifications notification
+        LEFT JOIN campus_ops.notification_receipts receipt
+          ON receipt.tenant_id=notification.tenant_id
+         AND receipt.notification_id=notification.id AND receipt.user_id=$2
+        WHERE notification.tenant_id=$1
+          AND (notification.recipient_user_id=$2 OR notification.recipient_role = ANY($3))
+          AND (notification.expires_at IS NULL OR notification.expires_at > now())
+      ), visible AS (
+        SELECT jsonb_build_object(
+          'id', id, 'category', category, 'eventType', event_type,
+          'title', title, 'body', body, 'data', data, 'priority', priority,
+          'requiresAction', requires_action, 'deepLink', deep_link,
+          'readAt', viewer_read_at, 'createdAt', created_at
+        ) AS item, created_at
+        FROM accessible
+        ORDER BY created_at DESC
+        LIMIT 100
+      )
+      SELECT jsonb_build_object(
+        'notifications', COALESCE(
+          (SELECT jsonb_agg(item ORDER BY created_at DESC) FROM visible),
+          '[]'::jsonb
+        ),
+        'unreadCount', (SELECT count(*) FROM accessible WHERE viewer_read_at IS NULL)
+      )"#,
     )
     .bind(tenant)
     .bind(&principal.student.id)
     .bind(&principal.roles)
     .fetch_one(db.pool())
     .await?;
-    Ok(Json(ApiResponse::new(json!({"notifications": rows}))))
+    Ok(Json(ApiResponse::new(rows)))
+}
+
+async fn read_notification(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(notification_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let changed = sqlx::query_scalar::<_, Uuid>(
+        r#"WITH accessible AS (
+             SELECT id,recipient_user_id FROM campus_ops.notifications
+             WHERE id=$1 AND tenant_id=$2
+               AND (recipient_user_id=$3 OR recipient_role = ANY($4))
+           ), direct AS (
+             UPDATE campus_ops.notifications SET read_at=COALESCE(read_at,now())
+             WHERE id IN (SELECT id FROM accessible WHERE recipient_user_id=$3)
+           ), role_receipt AS (
+             INSERT INTO campus_ops.notification_receipts
+               (tenant_id,notification_id,user_id)
+             SELECT $2,id,$3 FROM accessible WHERE recipient_user_id IS NULL
+             ON CONFLICT(tenant_id,notification_id,user_id)
+             DO UPDATE SET read_at=EXCLUDED.read_at
+           )
+           SELECT id FROM accessible"#,
+    )
+    .bind(notification_id)
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&principal.roles)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Notification not found".into()))?;
+    Ok(Json(ApiResponse::new(json!({"id": changed, "read": true}))))
+}
+
+async fn read_all_notifications(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let direct = sqlx::query(
+        r#"UPDATE campus_ops.notifications SET read_at=now()
+           WHERE tenant_id=$1 AND recipient_user_id=$2 AND read_at IS NULL"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .execute(&mut *tx)
+    .await?;
+    let role = sqlx::query(
+        r#"INSERT INTO campus_ops.notification_receipts
+             (tenant_id,notification_id,user_id)
+           SELECT $1,id,$2 FROM campus_ops.notifications
+           WHERE tenant_id=$1 AND recipient_user_id IS NULL
+             AND recipient_role = ANY($3)
+           ON CONFLICT(tenant_id,notification_id,user_id) DO NOTHING"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&principal.roles)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(
+        json!({"updated": direct.rows_affected() + role.rows_affected()}),
+    )))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationPreferenceInput {
+    category: String,
+    push_enabled: bool,
+    #[serde(default)]
+    digest_enabled: bool,
+    quiet_hours_start: Option<String>,
+    quiet_hours_end: Option<String>,
+}
+
+async fn notification_preferences(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'category', category, 'pushEnabled', push_enabled,
+             'digestEnabled', digest_enabled,
+             'quietHoursStart', quiet_hours_start,
+             'quietHoursEnd', quiet_hours_end
+           ) ORDER BY category), '[]'::jsonb)
+           FROM campus_ops.notification_preferences
+           WHERE tenant_id=$1 AND user_id=$2"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({"preferences": rows}))))
+}
+
+async fn update_notification_preferences(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(input): Json<Vec<NotificationPreferenceInput>>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    for item in &input {
+        let category = item.category.trim().to_ascii_lowercase();
+        if category.is_empty() || category.len() > 64 {
+            return Err(ApiError::BadRequest("Invalid notification category".into()));
+        }
+        validate_quiet_hours(
+            item.quiet_hours_start.as_deref(),
+            item.quiet_hours_end.as_deref(),
+        )?;
+        sqlx::query(
+            r#"INSERT INTO campus_ops.notification_preferences
+                 (tenant_id,user_id,category,push_enabled,digest_enabled,
+                  quiet_hours_start,quiet_hours_end)
+               VALUES($1,$2,$3,$4,$5,$6::time,$7::time)
+               ON CONFLICT(tenant_id,user_id,category) DO UPDATE SET
+                 push_enabled=EXCLUDED.push_enabled,
+                 digest_enabled=EXCLUDED.digest_enabled,
+                 quiet_hours_start=EXCLUDED.quiet_hours_start,
+                 quiet_hours_end=EXCLUDED.quiet_hours_end,
+                 updated_at=now()"#,
+        )
+        .bind(tenant)
+        .bind(&principal.student.id)
+        .bind(category)
+        .bind(item.push_enabled)
+        .bind(item.digest_enabled)
+        .bind(item.quiet_hours_start.as_deref())
+        .bind(item.quiet_hours_end.as_deref())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(json!({"updated": input.len()}))))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PushDeviceInput {
+    token: String,
+    platform: String,
+    #[serde(default = "default_push_provider")]
+    provider: String,
+    device_name: Option<String>,
+    locale: Option<String>,
+}
+
+fn default_push_provider() -> String {
+    "fcm".into()
+}
+
+async fn register_push_device(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(input): Json<PushDeviceInput>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let platform = input.platform.trim().to_ascii_lowercase();
+    let provider = input.provider.trim().to_ascii_lowercase();
+    let token = input.token.trim();
+    validate_push_device(token, &platform, &provider)?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let id = sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO campus_ops.push_devices
+             (tenant_id,user_id,provider,platform,token,device_name,locale)
+           VALUES($1,$2,$3,$4,$5,$6,$7)
+           ON CONFLICT(tenant_id,token) DO UPDATE SET
+             user_id=EXCLUDED.user_id, provider=EXCLUDED.provider,
+             platform=EXCLUDED.platform, device_name=EXCLUDED.device_name,
+             locale=EXCLUDED.locale, enabled=true, last_seen_at=now(), updated_at=now()
+           RETURNING id"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(provider)
+    .bind(platform)
+    .bind(token)
+    .bind(input.device_name.as_deref())
+    .bind(input.locale.as_deref())
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"id": id, "registered": true}),
+    )))
+}
+
+fn validate_quiet_hours(start: Option<&str>, end: Option<&str>) -> ApiResult<()> {
+    match (start, end) {
+        (None, None) => Ok(()),
+        (Some(start), Some(end))
+            if parse_notification_time(start).is_some()
+                && parse_notification_time(end).is_some() =>
+        {
+            Ok(())
+        }
+        _ => Err(ApiError::BadRequest(
+            "Quiet hours require valid start and end times".into(),
+        )),
+    }
+}
+
+fn parse_notification_time(value: &str) -> Option<NaiveTime> {
+    NaiveTime::parse_from_str(value.trim(), "%H:%M")
+        .or_else(|_| NaiveTime::parse_from_str(value.trim(), "%H:%M:%S"))
+        .ok()
+}
+
+fn validate_push_device(token: &str, platform: &str, provider: &str) -> ApiResult<()> {
+    if !(16..=4096).contains(&token.len()) || token.chars().any(char::is_whitespace) {
+        return Err(ApiError::BadRequest("Invalid push token".into()));
+    }
+    let supported = matches!(
+        (platform, provider),
+        ("android" | "ios", "fcm") | ("ios", "apns") | ("web", "web_push")
+    );
+    if !supported {
+        return Err(ApiError::BadRequest("Unsupported push device".into()));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RemovePushDeviceInput {
+    token: String,
+}
+
+async fn unregister_push_device(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(input): Json<RemovePushDeviceInput>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let result = sqlx::query(
+        "UPDATE campus_ops.push_devices SET enabled=false,updated_at=now() WHERE tenant_id=$1 AND user_id=$2 AND token=$3",
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(input.token.trim())
+    .execute(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"unregistered": result.rows_affected() > 0}),
+    )))
 }
 
 async fn canteen_store(
@@ -387,7 +693,7 @@ async fn canteen_store(
         'orders', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'orderNumber',order_number,
           'customerUserId',customer_user_id,'customerName',customer_name,'lines',lines,
           'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,
-          'tokenNumber',token_number,'createdAt',created_at,'updatedAt',updated_at)
+          'tokenNumber',token_number,'qrPayload',id::text,'createdAt',created_at,'updatedAt',updated_at)
           ORDER BY created_at DESC) FROM campus_ops.canteen_orders
           WHERE tenant_id=$1 AND (($7 AND (NOT $9 OR store = ANY($10))) OR customer_user_id=$2)), '[]'::jsonb),
         'walletTransactions', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,
@@ -1077,6 +1383,45 @@ async fn place_order(
             &order,
         )
         .await?;
+        let operator_user_ids = sqlx::query_scalar::<_, String>(
+            r#"SELECT assignment.user_id
+               FROM campus_ops.shop_user_assignments assignment
+               JOIN campus_ops.shops shop
+                 ON shop.tenant_id = assignment.tenant_id AND shop.id = assignment.shop_id
+               WHERE assignment.tenant_id = $1 AND shop.shop_key = $2
+                 AND assignment.is_active AND shop.is_active"#,
+        )
+        .bind(tenant)
+        .bind(&store)
+        .fetch_all(&mut *tx)
+        .await?;
+        use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+        for operator_user_id in operator_user_ids {
+            enqueue_tx(
+                &mut tx,
+                tenant,
+                NotificationSpec {
+                    recipient: Recipient::User(operator_user_id.clone()),
+                    category: "canteen".into(),
+                    event_type: "canteen.order.created".into(),
+                    title: "New canteen order".into(),
+                    body: format!(
+                        "{} placed a {} order for ₹{store_total:.0}.",
+                        principal.student.name,
+                        shop_label(&store)
+                    ),
+                    data: order.clone(),
+                    priority: "high".into(),
+                    requires_action: true,
+                    deep_link: Some("/shops/orders".into()),
+                    deduplication_key: Some(format!(
+                        "canteen:order:{order_id}:created:{operator_user_id}"
+                    )),
+                    expires_at: None,
+                },
+            )
+            .await?;
+        }
         orders.push(order);
         transactions.push(transaction);
     }
@@ -1234,11 +1579,13 @@ async fn scan_order(
         return Err(ApiError::BadRequest("Invalid scan action".into()));
     }
     let mut tx = db.pool().begin().await?;
+    let order_id = Uuid::parse_str(input.qr_payload.trim()).ok();
     let current = sqlx::query_as::<_, (Uuid, String, String, f64, String)>(
-        "SELECT id,status,customer_user_id,total::float8,store FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND qr_token_hash=$2 FOR UPDATE",
+        "SELECT id,status,customer_user_id,total::float8,store FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (qr_token_hash=$2 OR id=$3) FOR UPDATE",
     )
     .bind(tenant)
     .bind(token_hash(&input.qr_payload))
+    .bind(order_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::NotFound("Order QR is invalid".into()))?;
@@ -1301,6 +1648,80 @@ struct TopUpRequest {
     reference: Option<String>,
     idempotency_key: Option<String>,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WalletDirectoryQuery {
+    search: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Accountant-facing wallet directory.  Wallets are still owned by users, not
+/// by the finance screen, so every row is tenant-scoped and backed by the same
+/// ledger that order checkout debits.
+async fn wallet_directory(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Query(query): Query<WalletDirectoryQuery>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "canteen.wallet.top_up")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let search = query.search.unwrap_or_default().trim().to_lowercase();
+    let pattern = format!("%{search}%");
+    let limit = query.limit.unwrap_or(100).clamp(1, 250);
+    let wallets = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT COALESCE(jsonb_agg(row ORDER BY row->>'studentNumber'), '[]'::jsonb)
+        FROM (
+          SELECT jsonb_build_object(
+            'userId', student.user_account_id::text,
+            'studentId', student.id,
+            'studentNumber', student.student_number,
+            'studentName', student.full_name,
+            'email', student.email,
+            'department', COALESCE(department.code, student.department_id, ''),
+            'yearOfStudy', COALESCE(
+              NULLIF(student.profile->>'yearOfStudy',''),
+              NULLIF(student.profile->>'year',''),
+              NULLIF(student.academic_year,'')
+            ),
+            'balance', COALESCE(wallet.balance, 0)::float8,
+            'updatedAt', wallet.updated_at,
+            'lastTransactionAt', (
+              SELECT transaction.created_at
+              FROM campus_ops.canteen_wallet_transactions transaction
+              WHERE transaction.tenant_id=student.tenant_id
+                AND transaction.user_id=student.user_account_id::text
+              ORDER BY transaction.created_at DESC LIMIT 1
+            )
+          ) AS row
+          FROM core.students student
+          LEFT JOIN core.departments department
+            ON department.tenant_id=student.tenant_id
+           AND department.id::text=student.department_id
+          LEFT JOIN campus_ops.canteen_wallets wallet
+            ON wallet.tenant_id=student.tenant_id
+           AND wallet.user_id=student.user_account_id::text
+          WHERE student.tenant_id=$1
+            AND student.user_account_id IS NOT NULL
+            AND student.status IN ('provisional','active')
+            AND ($2='' OR lower(concat_ws(' ', student.student_number,
+              student.full_name, student.email, department.code)) LIKE $3)
+          ORDER BY student.student_number, student.full_name
+          LIMIT $4
+        ) directory"#,
+    )
+    .bind(tenant)
+    .bind(&search)
+    .bind(pattern)
+    .bind(limit)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({"wallets": wallets}))))
+}
+
 async fn top_up_wallet(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -1460,11 +1881,87 @@ async fn gatepass_overview(
     )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let manage = access.allows("gatepass.outpass.approve")
-        || access.allows("gatepass.leave.approve")
-        || access.allows("gatepass.scan.read");
-    let data=sqlx::query_scalar::<_,Value>(r#"SELECT jsonb_build_object('requests',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'requesterUserId',requester_user_id,'requesterName',requester_name,'passType',pass_type,'residency',residency,'departureAt',departure_at,'returnAt',return_at,'destination',destination,'reason',reason,'guardianPhone',guardian_phone,'state',state,'workflow',workflow,'createdAt',created_at,'updatedAt',updated_at) ORDER BY created_at DESC) FROM campus_ops.gatepass_requests WHERE tenant_id=$1 AND ($3 OR requester_user_id=$2)),'[]'::jsonb),'movements',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'userId',user_id,'requestId',request_id,'direction',direction,'checkpoint',checkpoint,'method',method,'createdAt',created_at) ORDER BY created_at DESC) FROM campus_ops.gate_movements WHERE tenant_id=$1 AND ($3 OR user_id=$2)),'[]'::jsonb),'canManage',$3::boolean)"#)
- .bind(tenant).bind(&principal.student.id).bind(manage).fetch_one(db.pool()).await?;
+    let is_parent = access.roles.iter().any(|role| role == "parent");
+    let is_warden = access.roles.iter().any(|role| role == "warden");
+    let is_security = access.roles.iter().any(|role| role == "security");
+    let manage = is_parent || is_warden || is_security || access.allows("gatepass.leave.approve");
+    let viewer_kind = if is_parent {
+        "parent"
+    } else if is_warden {
+        "warden"
+    } else if is_security {
+        "security"
+    } else {
+        "student"
+    };
+
+    // Approvers never receive an institution-wide dump merely because they
+    // hold an approve permission. A parent sees only explicitly linked
+    // children, a warden sees hosteller requests, and security sees only QR
+    // passes that are already approved. Learners keep their own history.
+    let data = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+          'viewerKind',$3::text,
+          'requests',COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'id',request.id,'requesterUserId',request.requester_user_id,
+              'requesterName',request.requester_name,'passType',request.pass_type,
+              'residency',request.residency,'departureAt',request.departure_at,
+              'returnAt',request.return_at,'destination',request.destination,
+              'reason',request.reason,'guardianPhone',request.guardian_phone,
+              'state',request.state,'workflow',request.workflow,
+              'qrPayload',CASE WHEN $3::text IN ('student','parent')
+                               THEN request.qr_payload ELSE NULL END,
+              'decisionNote',request.decision_note,'decidedBy',request.decided_by,
+              'createdAt',request.created_at,'updatedAt',request.updated_at)
+              ORDER BY request.created_at DESC)
+            FROM campus_ops.gatepass_requests request
+            WHERE request.tenant_id=$1 AND CASE $3::text
+              WHEN 'parent' THEN EXISTS (
+                SELECT 1 FROM campus_ops.parent_student_links link
+                WHERE link.tenant_id=request.tenant_id AND link.active
+                  AND link.parent_user_id=$2
+                  AND link.student_user_id=request.requester_user_id)
+              WHEN 'warden' THEN request.residency='hosteller'
+              WHEN 'security' THEN request.state='approved'
+              ELSE request.requester_user_id=$2
+            END
+          ),'[]'::jsonb),
+          'children',COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'userId',student.user_account_id::text,
+              'name',student.full_name,'email',student.email,
+              'rollNumber',student.student_number,
+              'department',COALESCE(department.name,student.profile->>'dept',''),
+              'year',COALESCE(student.academic_year,student.profile->>'year',''),
+              'hostel',COALESCE(student.profile->>'hostel',''),
+              'room',COALESCE(student.profile->>'room',''),
+              'photoUrl',NULLIF(student.profile->>'photoUrl',''))
+              ORDER BY student.full_name)
+            FROM campus_ops.parent_student_links link
+            JOIN core.students student ON student.tenant_id=link.tenant_id
+              AND student.user_account_id::text=link.student_user_id
+            LEFT JOIN core.departments department ON department.tenant_id=student.tenant_id
+              AND department.id::text=student.department_id
+            WHERE link.tenant_id=$1 AND link.parent_user_id=$2 AND link.active
+          ),'[]'::jsonb),
+          'movements',COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+              'id',movement.id,'userId',movement.user_id,
+              'requestId',movement.request_id,'direction',movement.direction,
+              'checkpoint',movement.checkpoint,'method',movement.method,
+              'createdAt',movement.created_at) ORDER BY movement.created_at DESC)
+            FROM campus_ops.gate_movements movement
+            WHERE movement.tenant_id=$1 AND movement.user_id=$2
+          ),'[]'::jsonb),
+          'canManage',$4::boolean)"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(viewer_kind)
+    .bind(manage)
+    .fetch_one(db.pool())
+    .await?;
     Ok(Json(ApiResponse::new(data)))
 }
 
@@ -1565,6 +2062,30 @@ async fn create_gatepass_request(
                 );
             }
         }
+    } else {
+        use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+        let mut tx = db.pool().begin().await?;
+        for role in ["class_advisor", "hod"] {
+            enqueue_tx(
+                &mut tx,
+                tenant,
+                NotificationSpec {
+                    recipient: Recipient::Role(role.into()),
+                    category: "gatepass".into(),
+                    event_type: "gatepass.request.created".into(),
+                    title: "Leave pass awaiting review".into(),
+                    body: format!("{} submitted a leave-pass request.", principal.student.name),
+                    data: value.clone(),
+                    priority: "high".into(),
+                    requires_action: true,
+                    deep_link: Some("/gatepass/approvals".into()),
+                    deduplication_key: Some(format!("gatepass:{id}:created:{role}")),
+                    expires_at: Some(input.departure_at),
+                },
+            )
+            .await?;
+        }
+        tx.commit().await?;
     }
 
     emit(
@@ -1648,10 +2169,9 @@ struct DecisionRequest {
 pub(crate) struct StepOutcome {
     pub value: Value,
     pub next_state: String,
-    pub pass_type: String,
-    pub requester_user_id: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn advance_gatepass_step(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: Uuid,
@@ -1706,17 +2226,113 @@ pub(crate) async fn advance_gatepass_step(
         .bind(tenant).bind(request_id).bind(step).bind(decision).bind(actor).bind(note)
         .execute(&mut **tx).await?;
 
-    let value = sqlx::query_scalar::<_, Value>("UPDATE campus_ops.gatepass_requests SET state=$3,qr_token_hash=$4,decided_by=$5,decision_note=$6,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'requesterUserId',requester_user_id,'state',state,'qrPayload',$7::text,'updatedAt',updated_at)")
+    let value = sqlx::query_scalar::<_, Value>("UPDATE campus_ops.gatepass_requests SET state=$3,qr_token_hash=$4,qr_payload=$7,decided_by=$5,decision_note=$6,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'requesterUserId',requester_user_id,'state',state,'qrPayload',$7::text,'updatedAt',updated_at)")
         .bind(tenant).bind(request_id).bind(&next)
         .bind(raw_qr.as_ref().map(|v| token_hash(v)))
         .bind(actor).bind(note).bind(&raw_qr)
         .fetch_one(&mut **tx).await?;
 
+    use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+    enqueue_tx(
+        tx,
+        tenant,
+        NotificationSpec {
+            recipient: Recipient::User(current.2.clone()),
+            category: "gatepass".into(),
+            event_type: "gatepass.request.decided".into(),
+            title: "Gatepass updated".into(),
+            body: format!("Your {} is now {next}.", current.0),
+            data: value.clone(),
+            priority: "high".into(),
+            requires_action: false,
+            deep_link: Some("/gatepass".into()),
+            deduplication_key: Some(format!("gatepass:{request_id}:{next}:requester")),
+            expires_at: None,
+        },
+    )
+    .await?;
+    // Once the parent has handed the request to the hostel, keep them in the
+    // loop. In particular, a warden rejection must reach both the student and
+    // every active linked guardian instead of disappearing into staff history.
+    if step == "warden" {
+        let parent_ids = sqlx::query_scalar::<_, String>(
+            r#"SELECT link.parent_user_id
+               FROM campus_ops.parent_student_links link
+               WHERE link.tenant_id=$1 AND link.student_user_id=$2 AND link.active"#,
+        )
+        .bind(tenant)
+        .bind(&current.2)
+        .fetch_all(&mut **tx)
+        .await?;
+        for parent_id in parent_ids {
+            enqueue_tx(
+                tx,
+                tenant,
+                NotificationSpec {
+                    recipient: Recipient::User(parent_id.clone()),
+                    category: "gatepass".into(),
+                    event_type: "gatepass.request.warden_decided".into(),
+                    title: if next == "rejected" {
+                        "Outpass rejected by warden".into()
+                    } else {
+                        "Outpass approved by warden".into()
+                    },
+                    body: if next == "rejected" {
+                        "The warden rejected your child's outpass request.".into()
+                    } else {
+                        "The warden approved your child's outpass; its QR is ready.".into()
+                    },
+                    data: value.clone(),
+                    priority: "high".into(),
+                    requires_action: false,
+                    deep_link: Some("/gatepass".into()),
+                    deduplication_key: Some(format!(
+                        "gatepass:{request_id}:{next}:parent:{parent_id}"
+                    )),
+                    expires_at: None,
+                },
+            )
+            .await?;
+        }
+    }
+    let next_roles: &[&str] = match next.as_str() {
+        "pending_warden" => &["warden"],
+        "pending_principal" => &["principal"],
+        "approved" => &["security", "warden"],
+        _ => &[],
+    };
+    for role in next_roles {
+        enqueue_tx(
+            tx,
+            tenant,
+            NotificationSpec {
+                recipient: Recipient::Role((*role).into()),
+                category: "gatepass".into(),
+                event_type: if next == "approved" {
+                    "gatepass.request.approved".into()
+                } else {
+                    "gatepass.request.awaiting_approval".into()
+                },
+                title: if next == "approved" {
+                    "Approved gatepass ready".into()
+                } else {
+                    "Gatepass awaiting your review".into()
+                },
+                body: format!("A {} request is now {next}.", current.0),
+                data: value.clone(),
+                priority: "high".into(),
+                requires_action: next != "approved",
+                deep_link: Some("/gatepass/approvals".into()),
+                deduplication_key: Some(format!("gatepass:{request_id}:{next}:{role}")),
+                expires_at: None,
+            },
+        )
+        .await?;
+    }
+
     Ok(StepOutcome {
         value,
         next_state: next,
-        pass_type: current.0,
-        requester_user_id: current.2,
     })
 }
 
@@ -1738,6 +2354,35 @@ async fn decide_gatepass_request(
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let is_parent = access.roles.iter().any(|role| role == "parent");
+    let is_warden = access.roles.iter().any(|role| role == "warden");
+    let expected_step = if is_parent {
+        // Possessing the parent role is not enough: this exact request must
+        // belong to one of the signed-in guardian's active child links.
+        let linked = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM campus_ops.gatepass_requests request
+                 JOIN campus_ops.parent_student_links link
+                   ON link.tenant_id=request.tenant_id
+                  AND link.student_user_id=request.requester_user_id
+                  AND link.active
+                WHERE request.tenant_id=$1 AND request.id=$2
+                  AND link.parent_user_id=$3)"#,
+        )
+        .bind(tenant)
+        .bind(request_id)
+        .bind(&principal.student.id)
+        .fetch_one(db.pool())
+        .await?;
+        if !linked {
+            return Err(ApiError::Forbidden);
+        }
+        Some("parent")
+    } else if is_warden {
+        Some("warden")
+    } else {
+        None
+    };
     let mut tx = db.pool().begin().await?;
     let outcome = advance_gatepass_step(
         &mut tx,
@@ -1746,17 +2391,10 @@ async fn decide_gatepass_request(
         &input.decision,
         input.note.as_deref(),
         &principal.student.id,
-        // Staff may answer whichever step the pass is on; the permission check
-        // above is what limits them.
-        None,
+        expected_step,
     )
     .await?;
-    let StepOutcome {
-        value,
-        next_state: next,
-        pass_type,
-        requester_user_id,
-    } = outcome;
+    let value = outcome.value;
     emit_tx(
         &mut tx,
         tenant,
@@ -1765,17 +2403,6 @@ async fn decide_gatepass_request(
         &request_id.to_string(),
         "request.decided",
         &principal.student.id,
-        &value,
-    )
-    .await?;
-    notify_tx(
-        &mut tx,
-        tenant,
-        Some(&requester_user_id),
-        None,
-        "gatepass",
-        "Gatepass updated",
-        &format!("Your {pass_type} is now {next}"),
         &value,
     )
     .await?;
@@ -2018,12 +2645,14 @@ async fn scan_gatepass(
     .fetch_optional(db.pool())
     .await?
     .ok_or_else(|| ApiError::NotFound("QR is invalid or expired".into()))?;
+<<<<<<< HEAD
+=======
+    let mut tx = db.pool().begin().await?;
+>>>>>>> fddf3042 (fix: visitor passes RLS transaction context, relationship field, and cancel route)
     let value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.gate_movements(tenant_id,user_id,request_id,visitor_pass_id,direction,checkpoint,scanned_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING jsonb_build_object('id',id,'userId',user_id,'requestId',request_id,'visitorPassId',visitor_pass_id,'direction',direction,'checkpoint',checkpoint,'createdAt',created_at)")
- .bind(tenant).bind(&match_row.0).bind(match_row.1).bind(match_row.2).bind(&input.direction).bind(input.checkpoint.trim()).bind(&principal.student.id).fetch_one(db.pool()).await?;
-    emit(
-        &state,
-        &principal.student.tenant_id,
-        db.pool(),
+ .bind(tenant).bind(&match_row.0).bind(match_row.1).bind(match_row.2).bind(&input.direction).bind(input.checkpoint.trim()).bind(&principal.student.id).fetch_one(&mut *tx).await?;
+    emit_tx(
+        &mut tx,
         tenant,
         "gatepass",
         "movement",
@@ -2033,6 +2662,43 @@ async fn scan_gatepass(
         &value,
     )
     .await?;
+    // Visitor passes do not have an application account. Member and student
+    // gate-ins do, and receive an auditable movement confirmation.
+    if match_row.2.is_none() {
+        use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+        let movement_id = value["id"].as_str().unwrap_or_default();
+        enqueue_tx(
+            &mut tx,
+            tenant,
+            NotificationSpec {
+                recipient: Recipient::User(match_row.0.clone()),
+                category: "security".into(),
+                event_type: "gatepass.movement.scanned".into(),
+                title: format!("Campus {} recorded", input.direction),
+                body: format!(
+                    "Your {} was recorded at {}.",
+                    input.direction,
+                    input.checkpoint.trim()
+                ),
+                data: value.clone(),
+                priority: "normal".into(),
+                requires_action: false,
+                deep_link: Some("/gatepass".into()),
+                deduplication_key: Some(format!("gatepass:movement:{movement_id}")),
+                expires_at: None,
+            },
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "gatepass",
+        "movement",
+        value["id"].as_str().unwrap_or_default(),
+        "movement.scanned",
+    );
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
 }
 
@@ -2119,6 +2785,312 @@ async fn advisor_students(
     Ok(Json(ApiResponse::new(json!({"students": students}))))
 }
 
+<<<<<<< HEAD
+=======
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdvisorAssessmentRequest {
+    assessment_kind: String,
+    title: String,
+    semester: Option<i16>,
+    marks_obtained: f64,
+    maximum_marks: f64,
+    notes: Option<String>,
+    assessed_on: Option<NaiveDate>,
+}
+
+struct ValidatedAdvisorAssessment {
+    assessment_kind: String,
+    title: String,
+    semester: Option<i16>,
+    marks_obtained: f64,
+    maximum_marks: f64,
+    notes: Option<String>,
+    assessed_on: Option<NaiveDate>,
+}
+
+fn validate_advisor_assessment(
+    input: AdvisorAssessmentRequest,
+) -> ApiResult<ValidatedAdvisorAssessment> {
+    let kind = input.assessment_kind.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "semester" | "internal" | "test") {
+        return Err(ApiError::BadRequest(
+            "Assessment type must be semester, internal, or test".into(),
+        ));
+    }
+    let title = input.title.trim();
+    if title.is_empty() || title.chars().count() > 120 {
+        return Err(ApiError::BadRequest(
+            "Assessment title must contain 1 to 120 characters".into(),
+        ));
+    }
+    if input
+        .semester
+        .is_some_and(|value| !(1..=12).contains(&value))
+    {
+        return Err(ApiError::BadRequest(
+            "Semester must be between 1 and 12".into(),
+        ));
+    }
+    if !input.maximum_marks.is_finite()
+        || input.maximum_marks <= 0.0
+        || input.maximum_marks > 10_000.0
+        || !input.marks_obtained.is_finite()
+        || input.marks_obtained < 0.0
+        || input.marks_obtained > input.maximum_marks
+    {
+        return Err(ApiError::BadRequest(
+            "Marks must be between zero and the maximum mark".into(),
+        ));
+    }
+    let notes = input
+        .notes
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if notes
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 2_000)
+    {
+        return Err(ApiError::BadRequest(
+            "Assessment notes cannot exceed 2000 characters".into(),
+        ));
+    }
+    Ok(ValidatedAdvisorAssessment {
+        assessment_kind: kind,
+        title: title.to_owned(),
+        semester: input.semester,
+        marks_obtained: input.marks_obtained,
+        maximum_marks: input.maximum_marks,
+        notes,
+        assessed_on: input.assessed_on,
+    })
+}
+
+fn require_class_advisor(access: &EffectiveAccess) -> ApiResult<()> {
+    if !access.roles.iter().any(|role| role == "class_advisor") {
+        return Err(ApiError::Forbidden);
+    }
+    require(access, "students.directory.read")
+}
+
+async fn ensure_advisor_owns_student(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    advisor_user_id: &str,
+    student_id: Uuid,
+) -> ApiResult<()> {
+    let owned = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+             SELECT 1
+             FROM core.students student
+             JOIN core.class_advisor_assignments assignment
+               ON assignment.tenant_id = student.tenant_id
+              AND assignment.department_id::text = student.department_id
+              AND assignment.advisor_user_id::text = $2
+              AND assignment.active
+             WHERE student.tenant_id = $1
+               AND student.id = $3
+               AND student.status IN ('provisional', 'active')
+           )"#,
+    )
+    .bind(tenant)
+    .bind(advisor_user_id)
+    .bind(student_id)
+    .fetch_one(pool)
+    .await?;
+    if owned {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound("Student not found".into()))
+    }
+}
+
+async fn advisor_student_assessments(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(student_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_class_advisor(&access)?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    ensure_advisor_owns_student(db.pool(), tenant, &principal.student.id, student_id).await?;
+
+    let assessments = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'id', mark.id,
+             'assessmentKind', mark.assessment_kind,
+             'title', mark.title,
+             'semester', mark.semester,
+             'marksObtained', mark.marks_obtained,
+             'maximumMarks', mark.maximum_marks,
+             'notes', mark.notes,
+             'assessedOn', mark.assessed_on,
+             'updatedAt', mark.updated_at
+           ) ORDER BY mark.semester DESC NULLS LAST,
+                      mark.assessed_on DESC NULLS LAST,
+                      mark.created_at DESC), '[]'::jsonb)
+           FROM core.student_assessment_marks mark
+           WHERE mark.tenant_id = $1 AND mark.student_id = $2"#,
+    )
+    .bind(tenant)
+    .bind(student_id)
+    .fetch_one(db.pool())
+    .await?;
+
+    Ok(Json(ApiResponse::new(json!({"assessments": assessments}))))
+}
+
+async fn create_advisor_student_assessment(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(student_id): Path<Uuid>,
+    Json(input): Json<AdvisorAssessmentRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require_class_advisor(&access)?;
+    let input = validate_advisor_assessment(input)?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    ensure_advisor_owns_student(db.pool(), tenant, &principal.student.id, student_id).await?;
+
+    let created = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO core.student_assessment_marks
+             (tenant_id, student_id, advisor_user_id, assessment_kind, title,
+              semester, marks_obtained, maximum_marks, notes, assessed_on)
+           VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8, $9, $10)
+           RETURNING jsonb_build_object(
+             'id', id, 'assessmentKind', assessment_kind, 'title', title,
+             'semester', semester, 'marksObtained', marks_obtained,
+             'maximumMarks', maximum_marks, 'notes', notes,
+             'assessedOn', assessed_on, 'updatedAt', updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(student_id)
+    .bind(&principal.student.id)
+    .bind(&input.assessment_kind)
+    .bind(&input.title)
+    .bind(input.semester)
+    .bind(input.marks_obtained)
+    .bind(input.maximum_marks)
+    .bind(&input.notes)
+    .bind(input.assessed_on)
+    .fetch_one(db.pool())
+    .await?;
+
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "students",
+        "assessment",
+        &student_id.to_string(),
+        "assessment.created",
+    );
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(created))))
+}
+
+async fn update_advisor_student_assessment(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path((student_id, assessment_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<AdvisorAssessmentRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_class_advisor(&access)?;
+    let input = validate_advisor_assessment(input)?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    ensure_advisor_owns_student(db.pool(), tenant, &principal.student.id, student_id).await?;
+
+    let updated = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE core.student_assessment_marks
+           SET assessment_kind = $4, title = $5, semester = $6,
+               marks_obtained = $7, maximum_marks = $8, notes = $9,
+               assessed_on = $10, advisor_user_id = $11::uuid, updated_at = now()
+           WHERE tenant_id = $1 AND student_id = $2 AND id = $3
+           RETURNING jsonb_build_object(
+             'id', id, 'assessmentKind', assessment_kind, 'title', title,
+             'semester', semester, 'marksObtained', marks_obtained,
+             'maximumMarks', maximum_marks, 'notes', notes,
+             'assessedOn', assessed_on, 'updatedAt', updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(student_id)
+    .bind(assessment_id)
+    .bind(&input.assessment_kind)
+    .bind(&input.title)
+    .bind(input.semester)
+    .bind(input.marks_obtained)
+    .bind(input.maximum_marks)
+    .bind(&input.notes)
+    .bind(input.assessed_on)
+    .bind(&principal.student.id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Assessment not found".into()))?;
+
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "students",
+        "assessment",
+        &assessment_id.to_string(),
+        "assessment.updated",
+    );
+    Ok(Json(ApiResponse::new(updated)))
+}
+
+/// Assessment marks for the student linked to the signed-in user account.
+/// The student identity is resolved from the bearer token rather than a path
+/// parameter so a learner cannot request another student's results.
+async fn student_assessments(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "academics.marks.read")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let student_id = sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT id
+           FROM core.students
+           WHERE tenant_id = $1
+             AND user_account_id::text = $2
+             AND status IN ('provisional', 'active')
+           LIMIT 1"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Student profile not found".into()))?;
+
+    let assessments = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'id', mark.id,
+             'assessmentKind', mark.assessment_kind,
+             'title', mark.title,
+             'semester', mark.semester,
+             'marksObtained', mark.marks_obtained,
+             'maximumMarks', mark.maximum_marks,
+             'notes', mark.notes,
+             'assessedOn', mark.assessed_on,
+             'updatedAt', mark.updated_at
+           ) ORDER BY mark.semester DESC NULLS LAST,
+                      mark.assessed_on DESC NULLS LAST,
+                      mark.created_at DESC), '[]'::jsonb)
+           FROM core.student_assessment_marks mark
+           WHERE mark.tenant_id = $1 AND mark.student_id = $2"#,
+    )
+    .bind(tenant)
+    .bind(student_id)
+    .fetch_one(db.pool())
+    .await?;
+
+    Ok(Json(ApiResponse::new(json!({"assessments": assessments}))))
+}
+
+>>>>>>> fddf3042 (fix: visitor passes RLS transaction context, relationship field, and cancel route)
 async fn attendance_roster(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -2258,12 +3230,69 @@ async fn attendance_sessions(
             "attendance.roster.read",
             "attendance.records.read",
             "attendance.reports.create",
+            "attendance.reports.publish",
         ],
     )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let manage = access.allows("attendance.reports.create");
-    let rows=sqlx::query_scalar::<_,Value>("SELECT COALESCE(jsonb_agg(jsonb_build_object('id',id,'subjectOfferingId',subject_offering_id,'sectionId',section_id,'subjectName',subject_name,'facultyUserId',faculty_user_id,'heldOn',held_on,'periodLabel',period_label,'status',status,'updatedAt',updated_at) ORDER BY held_on DESC,created_at DESC),'[]'::jsonb) FROM campus_ops.attendance_sessions WHERE tenant_id=$1 AND ($3 OR faculty_user_id=$2)").bind(tenant).bind(&principal.student.id).bind(manage).fetch_one(db.pool()).await?;
+    let review_scope = access
+        .scope_for("attendance.reports.publish")
+        .or_else(|| access.scope_for("attendance.reports.create"))
+        .unwrap_or("own");
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(
+                 jsonb_agg(
+                   jsonb_build_object(
+                     'id', session.id,
+                     'subjectOfferingId', session.subject_offering_id,
+                     'sectionId', session.section_id,
+                     'subjectName', session.subject_name,
+                     'facultyUserId', session.faculty_user_id,
+                     'heldOn', session.held_on,
+                     'periodLabel', session.period_label,
+                     'status', session.status,
+                     'updatedAt', session.updated_at
+                   ) ORDER BY session.held_on DESC, session.created_at DESC
+                 ),
+                 '[]'::jsonb
+               )
+           FROM campus_ops.attendance_sessions session
+          WHERE session.tenant_id = $1
+            AND (
+              session.faculty_user_id = $2
+              OR $3 IN ('institution', 'all')
+              OR EXISTS (
+                SELECT 1
+                  FROM core.subject_offerings offering
+                  JOIN core.subjects subject
+                    ON subject.tenant_id = offering.tenant_id
+                   AND subject.id = offering.subject_id
+                 WHERE offering.tenant_id = session.tenant_id
+                   AND offering.id = session.subject_offering_id
+                   AND (
+                     ($3 = 'assigned' AND EXISTS (
+                       SELECT 1 FROM core.class_advisor_assignments advisor
+                        WHERE advisor.tenant_id = session.tenant_id
+                          AND advisor.department_id = subject.department_id
+                          AND advisor.advisor_user_id::text = $2
+                          AND advisor.active
+                     ))
+                     OR ($3 = 'department' AND EXISTS (
+                       SELECT 1 FROM core.department_authorities authority
+                        WHERE authority.tenant_id = session.tenant_id
+                          AND authority.department_id = subject.department_id
+                          AND authority.user_id::text = $2
+                          AND authority.active
+                     ))
+                   )
+              )
+            )"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(review_scope)
+    .fetch_one(db.pool())
+    .await?;
     Ok(Json(ApiResponse::new(json!({"sessions":rows}))))
 }
 async fn create_attendance_session(
@@ -2295,6 +3324,106 @@ async fn create_attendance_session(
     )
     .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+async fn attendance_session_entries(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(session_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(
+        &access,
+        &[
+            "attendance.roster.read",
+            "attendance.reports.create",
+            "attendance.reports.publish",
+        ],
+    )?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let review_scope = access
+        .scope_for("attendance.reports.publish")
+        .or_else(|| access.scope_for("attendance.reports.create"))
+        .unwrap_or("own");
+    let session = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+                 'id', session.id,
+                 'subjectName', session.subject_name,
+                 'sectionId', session.section_id,
+                 'facultyUserId', session.faculty_user_id,
+                 'heldOn', session.held_on,
+                 'periodLabel', session.period_label,
+                 'status', session.status
+               )
+           FROM campus_ops.attendance_sessions session
+          WHERE session.tenant_id = $1
+            AND session.id = $2
+            AND (
+              session.faculty_user_id = $3
+              OR $4 IN ('institution', 'all')
+              OR EXISTS (
+                SELECT 1
+                  FROM core.subject_offerings offering
+                  JOIN core.subjects subject
+                    ON subject.tenant_id = offering.tenant_id
+                   AND subject.id = offering.subject_id
+                 WHERE offering.tenant_id = session.tenant_id
+                   AND offering.id = session.subject_offering_id
+                   AND (
+                     ($4 = 'assigned' AND EXISTS (
+                       SELECT 1 FROM core.class_advisor_assignments advisor
+                        WHERE advisor.tenant_id = session.tenant_id
+                          AND advisor.department_id = subject.department_id
+                          AND advisor.advisor_user_id::text = $3
+                          AND advisor.active
+                     ))
+                     OR ($4 = 'department' AND EXISTS (
+                       SELECT 1 FROM core.department_authorities authority
+                        WHERE authority.tenant_id = session.tenant_id
+                          AND authority.department_id = subject.department_id
+                          AND authority.user_id::text = $3
+                          AND authority.active
+                     ))
+                   )
+              )
+            )"#,
+    )
+    .bind(tenant)
+    .bind(session_id)
+    .bind(&principal.student.id)
+    .bind(review_scope)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Attendance session not found".into()))?;
+    let entries = sqlx::query_scalar::<_, Value>(
+        r#"SELECT COALESCE(
+                 jsonb_agg(
+                   jsonb_build_object(
+                     'studentUserId', entry.student_user_id,
+                     'studentName', entry.student_name,
+                     'studentNumber', student.student_number,
+                     'status', entry.status,
+                     'markedAt', entry.marked_at
+                   )
+                   ORDER BY entry.student_name
+                 ),
+                 '[]'::jsonb
+               )
+           FROM campus_ops.attendance_entries entry
+           LEFT JOIN core.students student
+             ON student.tenant_id = entry.tenant_id
+            AND student.user_account_id::text = entry.student_user_id
+          WHERE entry.tenant_id = $1
+            AND entry.session_id = $2"#,
+    )
+    .bind(tenant)
+    .bind(session_id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"session": session, "entries": entries}),
+    )))
 }
 
 #[derive(Deserialize)]
@@ -2657,8 +3786,67 @@ async fn notify_tx(
     body: &str,
     data: &Value,
 ) -> ApiResult<()> {
-    sqlx::query("INSERT INTO campus_ops.notifications(tenant_id,recipient_user_id,recipient_role,category,title,body,data) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(tenant).bind(user).bind(role).bind(category).bind(title).bind(body).bind(data).execute(&mut **tx).await?;
-    Ok(())
+    use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+
+    let recipient = match (user, role) {
+        (Some(user), _) => Recipient::User(user.to_owned()),
+        (None, Some(role)) => Recipient::Role(role.to_owned()),
+        (None, None) => return Ok(()),
+    };
+    let event_type = match title {
+        "Wallet credited" => "wallet.credited",
+        "Order rejected and refunded" => "canteen.order.refunded",
+        "Order updated" => "canteen.order.updated",
+        "Gatepass updated" => "gatepass.request.decided",
+        "Attendance marked" => "attendance.marked",
+        "Attendance ready for review" => "attendance.ready_for_review",
+        "Attendance report submitted" => "attendance.report.submitted",
+        _ => "general.notice",
+    };
+    let deep_link = match category {
+        "canteen" => Some("/shops/orders"),
+        "gatepass" => Some("/gatepass"),
+        "attendance" => Some("/academics/attendance"),
+        "fees" => Some("/tuition-fee"),
+        "timetable" => Some("/timetable"),
+        "examination" => Some("/examinations"),
+        _ => None,
+    };
+    let identity = data
+        .get("id")
+        .or_else(|| data.get("requestId"))
+        .or_else(|| data.get("sessionId"))
+        .map(Value::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let state = data.get("status").map(Value::to_string).unwrap_or_default();
+    enqueue_tx(
+        tx,
+        tenant,
+        NotificationSpec {
+            recipient,
+            category: category.into(),
+            event_type: event_type.into(),
+            title: title.into(),
+            body: body.into(),
+            data: data.clone(),
+            priority: if matches!(category, "gatepass" | "fees") {
+                "high".into()
+            } else {
+                "normal".into()
+            },
+            requires_action: matches!(
+                title,
+                "Attendance ready for review" | "Attendance report submitted"
+            ),
+            deep_link: deep_link.map(str::to_owned),
+            deduplication_key: Some(format!(
+                "operation:{event_type}:{identity}:{state}:{}",
+                user.or(role).unwrap_or_default()
+            )),
+            expires_at: None,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2691,6 +3879,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn gps_accuracy_margin_keeps_an_inside_device_inside() {
         let without_margin =
             position_is_within_fence(13.0144, 80.2356, 13.0104, 80.2356, 400.0, 0.0);
@@ -2706,5 +3895,267 @@ mod tests {
             campus_code_from("Madras Engineering College"),
             "MADRAS-ENGINEERING"
         );
+=======
+    fn advisor_assessment_validation_accepts_manual_tests() {
+        let value = validate_advisor_assessment(AdvisorAssessmentRequest {
+            assessment_kind: "test".into(),
+            title: "Weekly quiz 3".into(),
+            semester: Some(2),
+            marks_obtained: 17.5,
+            maximum_marks: 20.0,
+            notes: Some("Improved presentation".into()),
+            assessed_on: None,
+        })
+        .expect("valid manual test");
+        assert_eq!(value.assessment_kind, "test");
+        assert_eq!(value.title, "Weekly quiz 3");
+    }
+
+    #[test]
+    fn advisor_assessment_validation_rejects_impossible_marks() {
+        let result = validate_advisor_assessment(AdvisorAssessmentRequest {
+            assessment_kind: "internal".into(),
+            title: "Internal 1".into(),
+            semester: Some(1),
+            marks_obtained: 41.0,
+            maximum_marks: 40.0,
+            notes: None,
+            assessed_on: None,
+        });
+        assert!(matches!(result, Err(ApiError::BadRequest(_))));
+    }
+}
+
+// ---------------------------------------------------------------- campuses
+
+/// The campus geofence, as the admin console edits it.
+///
+/// A circle rather than a polygon because that is what [`ensure_inside_campus`]
+/// reads: one centre and one radius, compared by great-circle distance. Storing
+/// anything richer here would be a shape nothing enforces.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CampusGeofenceRequest {
+    /// Null clears the fence, which reopens activation from anywhere. That is a
+    /// real choice for a campus with no fixed boundary, so it is expressible
+    /// rather than something an admin has to fake with a huge radius.
+    geofence: Option<CampusGeofence>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CampusGeofence {
+    latitude: f64,
+    longitude: f64,
+    radius_metres: f64,
+}
+
+/// Bounds on the radius.
+///
+/// The lower bound is about the accuracy of a phone's fix: a fence tighter than
+/// this would reject people standing inside it. The upper bound is a sanity
+/// stop — a 50km "campus" is a misconfiguration, not a campus.
+const MIN_GEOFENCE_RADIUS_METRES: f64 = 50.0;
+const MAX_GEOFENCE_RADIUS_METRES: f64 = 20_000.0;
+
+async fn list_campuses(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "platform.configuration.read")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object(
+                     'id', id,
+                     'code', code,
+                     'name', name,
+                     'geofence', metadata -> 'geofence')
+           FROM core.campuses
+           WHERE tenant_id = $1 AND active
+           ORDER BY name"#,
+    )
+    .bind(tenant)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(json!({ "campuses": rows }))))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateCampusRequest {
+    name: String,
+    /// Short identifier, unique within the tenant. Derived from the name when
+    /// the caller does not supply one, because an admin drawing a boundary
+    /// should not have to invent a key first.
+    code: Option<String>,
+}
+
+/// A tenant provisioned without a campus has nothing to attach a fence to, and
+/// nothing else in the console creates one — so the boundary editor has to be
+/// able to.
+async fn create_campus(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<CreateCampusRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require(&access, "platform.configuration.update")?;
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("A campus name is required".into()));
+    }
+    let code = match input.code.as_deref().map(str::trim) {
+        Some(value) if !value.is_empty() => value.to_uppercase(),
+        _ => campus_code_from(name),
+    };
+
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let created = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO core.campuses (tenant_id, code, name)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (tenant_id, code) DO NOTHING
+           RETURNING jsonb_build_object(
+                       'id', id, 'code', code, 'name', name,
+                       'geofence', metadata -> 'geofence')"#,
+    )
+    .bind(tenant)
+    .bind(&code)
+    .bind(name)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::Conflict(format!("A campus with code {code} already exists")))?;
+
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(created))))
+}
+
+/// `Madras Engineering College` -> `MADRAS-ENGINEERING`. Letters, digits and
+/// single hyphens only, so the code stays usable in a URL and a spreadsheet.
+fn campus_code_from(name: &str) -> String {
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let joined = slug
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("-");
+    if joined.is_empty() {
+        "CAMPUS".into()
+    } else {
+        joined.chars().take(24).collect()
+    }
+}
+
+async fn set_campus_geofence(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(campus_id): Path<Uuid>,
+    Json(input): Json<CampusGeofenceRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "platform.configuration.update")?;
+
+    let patch = match input.geofence {
+        None => Value::Null,
+        Some(fence) => {
+            if !(-90.0..=90.0).contains(&fence.latitude)
+                || !(-180.0..=180.0).contains(&fence.longitude)
+            {
+                return Err(ApiError::BadRequest(
+                    "That is not a valid campus location".into(),
+                ));
+            }
+            if !(MIN_GEOFENCE_RADIUS_METRES..=MAX_GEOFENCE_RADIUS_METRES)
+                .contains(&fence.radius_metres)
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "Radius must be between {MIN_GEOFENCE_RADIUS_METRES:.0} and \
+                     {MAX_GEOFENCE_RADIUS_METRES:.0} metres"
+                )));
+            }
+            json!({
+                "latitude": fence.latitude,
+                "longitude": fence.longitude,
+                "radiusMetres": fence.radius_metres,
+            })
+        }
+    };
+
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+
+    // Scoped by tenant as well as id so one tenant cannot move another's fence
+    // by guessing a campus id.
+    let updated = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE core.campuses
+           SET metadata = CASE
+                            WHEN $3::jsonb IS NULL OR $3::jsonb = 'null'::jsonb
+                              THEN COALESCE(metadata, '{}'::jsonb) - 'geofence'
+                            ELSE jsonb_set(
+                                   COALESCE(metadata, '{}'::jsonb),
+                                   '{geofence}', $3::jsonb, true)
+                          END
+           WHERE tenant_id = $1 AND id = $2 AND active
+           RETURNING jsonb_build_object(
+                       'id', id,
+                       'code', code,
+                       'name', name,
+                       'geofence', metadata -> 'geofence')"#,
+    )
+    .bind(tenant)
+    .bind(campus_id)
+    .bind(&patch)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Campus not found".into()))?;
+
+    emit(
+        &state,
+        &principal.student.tenant_id,
+        db.pool(),
+        tenant,
+        "gatepass",
+        "campus_geofence",
+        &campus_id.to_string(),
+        "campus_geofence.updated",
+        &principal.student.id,
+        &json!({ "geofence": patch }),
+    )
+    .await?;
+
+    Ok(Json(ApiResponse::new(updated)))
+}
+
+#[cfg(test)]
+mod notification_input_tests {
+    use super::{validate_push_device, validate_quiet_hours};
+
+    #[test]
+    fn accepts_fcm_mobile_devices_and_rejects_mismatched_providers() {
+        assert!(validate_push_device("token-1234567890abcdef", "android", "fcm").is_ok());
+        assert!(validate_push_device("token-1234567890abcdef", "ios", "fcm").is_ok());
+        assert!(validate_push_device("token-1234567890abcdef", "android", "apns").is_err());
+        assert!(validate_push_device("short", "android", "fcm").is_err());
+        assert!(validate_push_device("token with whitespace", "android", "fcm").is_err());
+    }
+
+    #[test]
+    fn quiet_hours_are_both_valid_or_both_absent() {
+        assert!(validate_quiet_hours(None, None).is_ok());
+        assert!(validate_quiet_hours(Some("22:30"), Some("06:15")).is_ok());
+        assert!(validate_quiet_hours(Some("22:30"), None).is_err());
+        assert!(validate_quiet_hours(Some("25:00"), Some("06:15")).is_err());
+>>>>>>> fddf3042 (fix: visitor passes RLS transaction context, relationship field, and cancel route)
     }
 }

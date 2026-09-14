@@ -57,6 +57,30 @@ pub struct VisitorDecisionInput {
     pub note: Option<String>,
 }
 
+/// Helper function to ensure database schema columns exist on campus_ops.visitor_passes.
+async fn ensure_visitor_pass_schema(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) {
+    let _ = sqlx::query(
+        "ALTER TABLE campus_ops.visitor_passes \
+         ADD COLUMN IF NOT EXISTS relationship text, \
+         ADD COLUMN IF NOT EXISTS checked_in_at timestamptz, \
+         ADD COLUMN IF NOT EXISTS checked_out_at timestamptz",
+    )
+    .execute(&mut **tx)
+    .await;
+
+    let _ = sqlx::query("ALTER TABLE campus_ops.visitor_passes DROP CONSTRAINT IF EXISTS visitor_passes_state_check")
+        .execute(&mut **tx)
+        .await;
+
+    let _ = sqlx::query(
+        "ALTER TABLE campus_ops.visitor_passes \
+         ADD CONSTRAINT visitor_passes_state_check \
+         CHECK (state IN ('pending_admin', 'approved', 'rejected', 'cancelled', 'checked_in', 'checked_out'))",
+    )
+    .execute(&mut **tx)
+    .await;
+}
+
 /// Helper function to dispatch WhatsApp invitation with template.
 async fn dispatch_visitor_whatsapp(
     state: &AppState,
@@ -233,6 +257,8 @@ pub async fn create_visitor_pass(
         .execute(&mut *tx)
         .await?;
 
+    ensure_visitor_pass_schema(&mut tx).await;
+
     let value = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.visitor_passes
                (tenant_id, visitor_kind, visitor_name, visitor_phone, purpose, relationship,
@@ -306,6 +332,8 @@ pub async fn list_visitor_passes(
         .execute(&mut *tx)
         .await?;
 
+    ensure_visitor_pass_schema(&mut tx).await;
+
     let value = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
                'id', id, 'visitorKind', visitor_kind, 'visitorName', visitor_name,
@@ -360,6 +388,8 @@ pub async fn decide_visitor_pass(
         .bind(tenant.to_string())
         .execute(&mut *tx)
         .await?;
+
+    ensure_visitor_pass_schema(&mut tx).await;
 
     let pending = sqlx::query_as::<_, (String, String, String, String, DateTime<Utc>, DateTime<Utc>)>(
         r#"SELECT visitor_kind, visitor_name, visitor_phone, host_name, visit_from, visit_until
@@ -485,6 +515,8 @@ pub async fn cancel_visitor_pass(
         .bind(tenant.to_string())
         .execute(&mut *tx)
         .await?;
+
+    ensure_visitor_pass_schema(&mut tx).await;
 
     let value = sqlx::query_scalar::<_, Value>(
         r#"UPDATE campus_ops.visitor_passes

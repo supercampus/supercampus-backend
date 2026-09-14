@@ -154,6 +154,9 @@ impl TenantDatabaseManager {
         if tenant_slug.is_empty() {
             bail!("tenant slug is required for database resolution");
         }
+        if tenant_slug == "supercampus-control" {
+            return Ok(self.control.clone());
+        }
         if self.base_options.is_none() {
             return Ok(self.control.clone());
         }
@@ -290,7 +293,7 @@ pub const RUNTIME_MIGRATION_VERSION: i64 = 95;
 
 #[cfg(test)]
 mod tests {
-    use super::validate_database_name;
+    use super::{MIGRATOR, RUNTIME_MIGRATION_VERSION, validate_database_name};
 
     #[test]
     fn tenant_database_names_are_safe_identifiers() {
@@ -298,5 +301,16 @@ mod tests {
         assert!(validate_database_name("tenant-a").is_err());
         assert!(validate_database_name("tenant a").is_err());
         assert!(validate_database_name("").is_err());
+    }
+
+    #[test]
+    fn advertised_runtime_migration_is_the_embedded_latest_version() {
+        let embedded_latest = MIGRATOR
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .expect("at least one runtime migration");
+        assert_eq!(RUNTIME_MIGRATION_VERSION, embedded_latest);
     }
 }

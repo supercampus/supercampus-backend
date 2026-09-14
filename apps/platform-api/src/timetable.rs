@@ -1,20 +1,20 @@
 use anyhow::Context;
 use axum::{
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post, put},
-    Extension, Json, Router,
 };
 use chrono::{NaiveDate, NaiveTime};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::{
     error::{ApiError, ApiResult},
-    governance::{any_role_may_perform, GovernedCapability},
+    governance::{GovernedCapability, any_role_may_perform},
     models::ApiResponse,
     state::{AppState, AuthPrincipal, EffectiveAccess},
 };
@@ -1489,6 +1489,11 @@ async fn publish_version(
     let actor = principal_user_id(&principal)?;
     let database = state.tenant_database(&principal.student.tenant_id).await?;
     let mut tx = database.pool().begin().await?;
+    let tenant_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM platform.tenants WHERE slug = $1")
+            .bind(&principal.student.tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
     let conflicts =
         publication_conflicts(&mut tx, &principal.student.tenant_id, version_id).await?;
     if conflicts.as_array().is_some_and(|items| !items.is_empty()) {
@@ -1514,6 +1519,27 @@ async fn publish_version(
         payload.clone(),
     )
     .await?;
+    use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+    for role in ["student", "faculty"] {
+        enqueue_tx(
+            &mut tx,
+            tenant_id,
+            NotificationSpec {
+                recipient: Recipient::Role(role.into()),
+                category: "timetable".into(),
+                event_type: "timetable.version.published".into(),
+                title: "New timetable published".into(),
+                body: "Your latest class timetable is ready.".into(),
+                data: payload.clone(),
+                priority: "high".into(),
+                requires_action: false,
+                deep_link: Some("/timetable".into()),
+                deduplication_key: Some(format!("timetable:version:{version_id}:published:{role}")),
+                expires_at: None,
+            },
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(Json(ApiResponse::new(
         json!({"revision": revision, "version": payload}),
@@ -1755,6 +1781,11 @@ async fn request_substitution(
     let actor = principal_user_id(&principal)?;
     let database = state.tenant_database(&principal.student.tenant_id).await?;
     let mut tx = database.pool().begin().await?;
+    let tenant_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM platform.tenants WHERE slug = $1")
+            .bind(&principal.student.tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
     let value = sqlx::query_scalar::<_, Value>(r#"INSERT INTO core.faculty_substitution_requests
         (tenant_id, timetable_entry_id, service_date, original_faculty_user_id,
          substitute_faculty_user_id, reason, requested_by)
@@ -1784,6 +1815,34 @@ async fn request_substitution(
         value.clone(),
     )
     .await?;
+    use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+    for (party, key) in [
+        ("original", "original_faculty_user_id"),
+        ("substitute", "substitute_faculty_user_id"),
+    ] {
+        if let Some(user_id) = value.get(key).and_then(Value::as_str) {
+            enqueue_tx(
+                &mut tx,
+                tenant_id,
+                NotificationSpec {
+                    recipient: Recipient::User(user_id.into()),
+                    category: "timetable".into(),
+                    event_type: "timetable.substitution.requested".into(),
+                    title: "Substitution acknowledgement required".into(),
+                    body: format!("You are the {party} faculty member for a substitution request."),
+                    data: value.clone(),
+                    priority: "high".into(),
+                    requires_action: true,
+                    deep_link: Some("/timetable/substitutions".into()),
+                    deduplication_key: Some(format!(
+                        "timetable:substitution:{id}:requested:{user_id}"
+                    )),
+                    expires_at: None,
+                },
+            )
+            .await?;
+        }
+    }
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
 }
@@ -1801,6 +1860,11 @@ async fn acknowledge_substitution(
     let actor = principal_user_id(&principal)?;
     let database = state.tenant_database(&principal.student.tenant_id).await?;
     let mut tx = database.pool().begin().await?;
+    let tenant_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM platform.tenants WHERE slug = $1")
+            .bind(&principal.student.tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
     let party = sqlx::query_scalar::<_, Option<String>>(
         r#"SELECT CASE
         WHEN substitution.original_faculty_user_id = $3 THEN 'original'
@@ -1845,6 +1909,29 @@ async fn acknowledge_substitution(
         payload.clone(),
     )
     .await?;
+    if count == 2 {
+        use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+        enqueue_tx(
+            &mut tx,
+            tenant_id,
+            NotificationSpec {
+                recipient: Recipient::Role("principal".into()),
+                category: "timetable".into(),
+                event_type: "timetable.substitution.awaiting_decision".into(),
+                title: "Substitution decision required".into(),
+                body: "Both faculty members acknowledged a substitution request.".into(),
+                data: payload.clone(),
+                priority: "high".into(),
+                requires_action: true,
+                deep_link: Some("/timetable/substitutions".into()),
+                deduplication_key: Some(format!(
+                    "timetable:substitution:{request_id}:awaiting-principal"
+                )),
+                expires_at: None,
+            },
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(Json(ApiResponse::new(payload)))
 }
@@ -1872,6 +1959,23 @@ async fn decide_substitution(
     let actor = principal_user_id(&principal)?;
     let database = state.tenant_database(&principal.student.tenant_id).await?;
     let mut tx = database.pool().begin().await?;
+    let tenant_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM platform.tenants WHERE slug = $1")
+            .bind(&principal.student.tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let parties = sqlx::query_as::<_, (Uuid, Uuid)>(
+        r#"SELECT substitution.original_faculty_user_id,
+                  substitution.substitute_faculty_user_id
+           FROM core.faculty_substitution_requests substitution
+           JOIN platform.tenants tenant ON tenant.id = substitution.tenant_id
+           WHERE tenant.slug = $1 AND substitution.id = $2"#,
+    )
+    .bind(&principal.student.tenant_id)
+    .bind(request_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("substitution request not found".into()))?;
     let updated = sqlx::query(
         r#"UPDATE core.faculty_substitution_requests substitution
         SET status = $3, decided_by = $4, decision_note = $5, decided_at = now(), updated_at = now()
@@ -1904,6 +2008,29 @@ async fn decide_substitution(
         payload.clone(),
     )
     .await?;
+    use crate::notification::{NotificationSpec, Recipient, enqueue_tx};
+    for user_id in [parties.0, parties.1] {
+        enqueue_tx(
+            &mut tx,
+            tenant_id,
+            NotificationSpec {
+                recipient: Recipient::User(user_id.to_string()),
+                category: "timetable".into(),
+                event_type: "timetable.substitution.decided".into(),
+                title: "Substitution decision recorded".into(),
+                body: format!("The substitution request was {}.", request.decision),
+                data: payload.clone(),
+                priority: "high".into(),
+                requires_action: false,
+                deep_link: Some("/timetable/substitutions".into()),
+                deduplication_key: Some(format!(
+                    "timetable:substitution:{request_id}:decided:{user_id}"
+                )),
+                expires_at: None,
+            },
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(Json(ApiResponse::new(
         json!({"revision": revision, "substitution": payload}),
@@ -2090,11 +2217,13 @@ mod tests {
         assert!(require_timetable_manager(&principal("principal"), &allowed).is_ok());
         assert!(require_timetable_manager(&principal("academic_administrator"), &allowed).is_ok());
         assert!(require_timetable_manager(&principal("hod"), &allowed).is_err());
-        assert!(require_timetable_manager(
-            &principal("principal"),
-            &access("academics.timetable.manage", "department")
-        )
-        .is_err());
+        assert!(
+            require_timetable_manager(
+                &principal("principal"),
+                &access("academics.timetable.manage", "department")
+            )
+            .is_err()
+        );
     }
 
     #[test]

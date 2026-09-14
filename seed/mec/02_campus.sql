@@ -6429,14 +6429,13 @@ INSERT INTO core.teaching_assignments (id, tenant_id, subject_offering_id,
 VALUES ('95a3d619-6f06-5ced-a4cc-2b1e8a7d6c9c'::uuid, (SELECT id FROM platform.tenants WHERE slug = 'mec'), '6603c85f-6a62-52e8-ada4-5b0f868a9c3d'::uuid, '8b6c5b47-d23b-5f75-aece-99e36189d9c2'::uuid, 'primary', true, 'e7f9152f-bd58-5a7f-9920-d455b874b0e3'::uuid)
 ON CONFLICT (id) DO UPDATE SET faculty_user_id = EXCLUDED.faculty_user_id, active = true;
 
--- A fortnight of attendance ------------------------------------------------------
--- Without published sessions every student reads 0% and every dashboard reads
--- "no attendance recorded yet", which is true but shows nothing. Ten working
--- days of the first subject per section gives the roll something real to report.
--- The status has to be `published_to_hod`: that, and submitted_to_principal, are
--- what the summary query counts. A draft session contributes nothing.
--- Absences are spread deterministically rather than randomly so the seed stays
--- reproducible from one run to the next.
+-- Optional demo attendance ------------------------------------------------------
+-- Production-like seeds must start with no fabricated attendance. A developer
+-- can explicitly opt into this sample history in a disposable database with:
+--   SET supercampus.seed_demo_attendance = 'on';
+DO $demo_attendance$
+BEGIN
+IF current_setting('supercampus.seed_demo_attendance', true) = 'on' THEN
 INSERT INTO campus_ops.attendance_sessions (id, tenant_id, subject_offering_id,
         section_id, subject_name, faculty_user_id, held_on, period_label, status)
 VALUES ('144661ff-5259-5bfe-9f8c-c4a624dc4214'::uuid, (SELECT id FROM platform.tenants WHERE slug = 'mec'), '1b639365-9e85-576a-9054-06be486eba69'::uuid, 'a0d91082-debc-52c7-b285-685593153d8d'::uuid, 'Data Structures', 'a5b04495-6107-5ee6-a107-de244ef7ad13'::uuid, '2026-08-10'::date, 'Period 1', 'published_to_hod')
@@ -14737,6 +14736,9 @@ INSERT INTO campus_ops.attendance_entries (tenant_id, session_id,
 VALUES ((SELECT id FROM platform.tenants WHERE slug = 'mec'), '52c14d58-6598-5f01-88cd-8807f0f0c30e'::uuid, '460c13d5-67a9-5c86-95b2-b78c5180a841'::uuid, 'Arun Subramanian', 'present', 'd26e9a06-2afb-54d1-880d-303b091a0176'::uuid)
 ON CONFLICT (tenant_id, session_id, student_user_id) DO UPDATE SET status = EXCLUDED.status;
 
+END IF;
+END;
+$demo_attendance$;
 
 -- Campus shops ----------------------------------------------------------------
 INSERT INTO campus_ops.shops (id, tenant_id, shop_key, name, category, description,

@@ -5,3 +5,7 @@
 .idea/
 .vscode/
 .DS_Store
+/seed/mec/source/
+__pycache__/
+/secrets/
+firebase-admin*.json

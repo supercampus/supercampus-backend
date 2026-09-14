@@ -9,8 +9,8 @@ password `Mec@2026`, and every one is a local development account on the
 | 200 | Students | `student001@mec.local ... student200@mec.local` | `student` |
 | 1 | Principal | `principal@mec.local` | `principal` |
 | 6 | Heads of Department | `hod.aids@mec.local, hod.csbs@mec.local, hod.it@mec.local, hod.cyber@mec.local, hod.cse@mec.local, hod.aiml@mec.local` | `staff + hod` |
-| 6 | Class Advisors | `advisor.aids@mec.local, advisor.csbs@mec.local, advisor.it@mec.local, advisor.cyber@mec.local, advisor.cse@mec.local, advisor.aiml@mec.local` | `staff + class_advisor` |
-| 7 | Faculty | `faculty01@mec.local ... faculty07@mec.local` | `staff` |
+| 5 | Class Advisors | `shobana@mec.local, elakkiya@mec.local, devanath@mec.local, hariramakrishna@mec.local, karthikeyan@mec.local` | `staff + class_advisor` |
+| 10 | Faculty | `saranya@mec.local, anitha@mec.local, saranyaa@mec.local, deepika@mec.local, lakshmikanth@mec.local, vijayakumar@mec.local, arunmozhi@mec.local, ganesh@mec.local, santhosh@mec.local, preethi@mec.local` | `staff` |
 | 1 | Librarian | `librarian@mec.local` | `librarian` |
 | 3 | Security | `security1@mec.local, security2@mec.local, security3@mec.local` | `security` |
 | 2 | Wardens | `warden.boys@mec.local, warden.girls@mec.local` | `warden` |
@@ -25,7 +25,7 @@ password `Mec@2026`, and every one is a local development account on the
 | 1 | Campus Laundry owner | `laundry.owner@mec.local` | `owner` |
 | 1 | Campus Laundry captains | `laundry.captain1@mec.local` | `captain` |
 
-**Total: 245 accounts.**
+**Total: 248 accounts.**
 
 ## Scope ladder
 

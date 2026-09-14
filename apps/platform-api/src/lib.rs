@@ -6,6 +6,7 @@ pub mod guardian_link;
 pub mod library_lending;
 pub mod media;
 pub mod models;
+pub mod notification;
 pub mod operations;
 pub mod passes;
 pub mod visitors;

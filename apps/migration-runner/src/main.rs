@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str).unwrap_or("migrate") {
         "migrate" => migrate_registered_databases().await,
         "apply-mec-advisors" => apply_mec_advisors().await,
-        "repair-mec-geofence" => repair_mec_geofence().await,
+        "apply-mec-original-faculty" => apply_mec_original_faculty().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
         "inspect-source" => inspect_source().await,
@@ -47,6 +47,52 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+async fn apply_mec_original_faculty() -> anyhow::Result<()> {
+    apply_isolated_mec_sql(
+        include_str!("../../../migrations/runtime/0067_mec_original_faculty.sql"),
+        "original MEC faculty roster",
+    )
+    .await
+}
+
+async fn apply_isolated_mec_sql(sql: &str, label: &str) -> anyhow::Result<()> {
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+    sqlx::raw_sql(sql)
+        .execute(control.pool())
+        .await
+        .with_context(|| format!("failed to apply {label} to the control plane"))?;
+
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug, registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id = registry.tenant_id
+           WHERE registry.status = 'active' AND tenant.status = 'active'
+           ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await
+    .context("failed to list tenant databases")?;
+
+    let base_options =
+        PgConnectOptions::from_str(&control_url).context("invalid CONTROL_DATABASE_URL")?;
+    for (slug, database_name) in &databases {
+        validate_database_name(database_name)?;
+        let tenant = Database::connect_options(base_options.clone().database(database_name), 2)
+            .await
+            .with_context(|| format!("failed to connect tenant {slug} database"))?;
+        sqlx::raw_sql(sql)
+            .execute(tenant.pool())
+            .await
+            .with_context(|| format!("failed to apply {label} to {slug}"))?;
+    }
+    println!(
+        "applied {label} to control and {} tenant database(s)",
+        databases.len()
+    );
+    Ok(())
+}
+
 /// Applies the isolated MEC advisor change when a legacy installation cannot
 /// run the full migrator because an old migration checksum predates immutable
 /// migration enforcement. This deliberately does not edit migration history.
@@ -71,8 +117,8 @@ async fn apply_mec_advisors() -> anyhow::Result<()> {
     .await
     .context("failed to list tenant databases")?;
 
-    let base_options = PgConnectOptions::from_str(&control_url)
-        .context("invalid CONTROL_DATABASE_URL")?;
+    let base_options =
+        PgConnectOptions::from_str(&control_url).context("invalid CONTROL_DATABASE_URL")?;
     for (slug, database_name) in &databases {
         validate_database_name(database_name)?;
         let tenant = Database::connect_options(base_options.clone().database(database_name), 2)
@@ -89,47 +135,6 @@ async fn apply_mec_advisors() -> anyhow::Result<()> {
     );
     Ok(())
 }
-
-/// Applies the guarded MEC coordinate correction even when legacy migration
-/// checksums prevent the general release migrator from advancing. The WHERE
-/// clause makes the repair idempotent and refuses to overwrite any later edit.
-async fn repair_mec_geofence() -> anyhow::Result<()> {
-    let control_url = required_environment("CONTROL_DATABASE_URL")?;
-    let control = Database::connect(&control_url).await?;
-    let manager = TenantDatabaseManager::clustered(control, &control_url)?;
-    let mec = manager.tenant("mec").await?;
-    let result = sqlx::query(
-        r#"UPDATE core.campuses AS campus
-           SET metadata = jsonb_set(
-               COALESCE(campus.metadata, '{}'::jsonb),
-               '{geofence}',
-               COALESCE(campus.metadata -> 'geofence', '{}'::jsonb)
-                   || jsonb_build_object(
-                       'latitude', 12.9277504,
-                       'longitude', 79.9926235
-                   ),
-               true
-           )
-           FROM platform.tenants AS tenant
-           WHERE campus.tenant_id = tenant.id
-             AND tenant.slug = 'mec'
-             AND campus.active
-             AND abs((campus.metadata -> 'geofence' ->> 'latitude')::double precision
-                     - 13.0104) < 0.000001
-             AND abs((campus.metadata -> 'geofence' ->> 'longitude')::double precision
-                     - 80.2356) < 0.000001"#,
-    )
-    .execute(mec.pool())
-    .await
-    .context("failed to repair the MEC campus geofence")?;
-
-    println!(
-        "MEC geofence repair complete; {} stale campus record(s) corrected",
-        result.rows_affected()
-    );
-    Ok(())
-}
-
 async fn inspect_source() -> anyhow::Result<()> {
     let source_url = required_environment("DATABASE_URL")?;
     let source = Database::connect(&source_url).await?;

@@ -47,6 +47,19 @@ impl CloudinaryConfig {
 }
 
 pub fn validate_configuration() -> anyhow::Result<()> {
+    let cloudinary_is_unset = [
+        "CLOUDINARY_CLOUD_NAME",
+        "CLOUDINARY_API_KEY",
+        "CLOUDINARY_API_SECRET",
+        "CLOUDINARY_URL",
+    ]
+    .iter()
+    .all(|name| optional_environment(name).is_none());
+    let is_production = optional_environment("APP_ENV")
+        .is_some_and(|value| value.eq_ignore_ascii_case("production"));
+    if cloudinary_is_unset && !is_production {
+        return Ok(());
+    }
     CloudinaryConfig::from_environment().map(|_| ())
 }
 

@@ -293,6 +293,7 @@ fn default_permission_mode() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoginRequest {
+    #[serde(alias = "username")]
     pub email: String,
     pub password: String,
     #[serde(default)]
@@ -372,7 +373,8 @@ pub struct AuthStudent {
 #[serde(rename_all = "camelCase")]
 pub struct LoginData {
     pub student: AuthStudent,
-    pub access_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
     pub token_type: &'static str,
     pub expires_at: DateTime<Utc>,
     pub session_id: Uuid,

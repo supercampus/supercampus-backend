@@ -14,17 +14,18 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod admin_users;
+mod student_accounts;
 
 use crate::{
     error::{ApiError, ApiResult},
     models::{
-        ApiResponse, AssignUserRolesRequest, BootstrapDocument, BulkStudentImportRequest,
-        CreateAuthorizationRoleRequest, CreateRecordRequest, CreateTenantUserRequest,
-        ForgotPasswordRequest, HealthDocument, LoginData, LoginRequest, LogoutRequest,
-        NavigationItem, PutConfigurationRequest, RefreshRequest, ResetPasswordRequest,
-        SaveAppStateRequest, SessionData, SessionMode, SetRolePermissionsRequest,
-        SetUserAccessRequest, StudentPhotoRequest, UpdateAuthorizationRoleRequest,
-        UpdateRecordRequest, ValidateWorkflowTransitionRequest,
+        ApiResponse, AssignUserRolesRequest, AuthStudent, BootstrapDocument,
+        BulkStudentImportRequest, CreateAuthorizationRoleRequest, CreateRecordRequest,
+        CreateTenantUserRequest, ForgotPasswordRequest, HealthDocument, LoginData, LoginRequest,
+        LogoutRequest, NavigationItem, PutConfigurationRequest, RefreshRequest,
+        ResetPasswordRequest, SaveAppStateRequest, SessionData, SessionMode,
+        SetRolePermissionsRequest, SetUserAccessRequest, StudentPhotoRequest,
+        UpdateAuthorizationRoleRequest, UpdateRecordRequest, ValidateWorkflowTransitionRequest,
     },
     realtime::RealtimePublication,
     state::{
@@ -90,6 +91,10 @@ pub fn router(state: AppState) -> Router {
         .route("/student-master", get(list_student_master))
         .route("/student/fees", get(list_own_student_fee_records))
         .route("/student-master/import", post(import_student_master))
+        .route(
+            "/student-master/accounts/import",
+            post(student_accounts::import),
+        )
         .route("/student-master/{student_id}/photo", put(set_student_photo))
         // Reached by a guardian holding a WhatsApp link and nothing else.
         // Exempted from authorization in `requires_authorization` below.
@@ -513,16 +518,40 @@ async fn assign_tenant_user_roles(
     if request.role_ids.is_empty() {
         return Err(ApiError::BadRequest("at least one role is required".into()));
     }
-    Ok(Json(ApiResponse::new(
-        state
-            .assign_tenant_user_roles(
-                &principal.student.tenant_id,
-                &principal.student.id,
-                user_id,
-                &request,
-            )
-            .await?,
-    )))
+    let result = state
+        .assign_tenant_user_roles(
+            &principal.student.tenant_id,
+            &principal.student.id,
+            user_id,
+            &request,
+        )
+        .await?;
+    use crate::notification::{NotificationSpec, Recipient, enqueue};
+    if let Err(error) = enqueue(
+        &state,
+        &principal.student.tenant_id,
+        NotificationSpec {
+            recipient: Recipient::User(user_id.to_string()),
+            category: "account".into(),
+            event_type: "account.roles.updated".into(),
+            title: "Account roles updated".into(),
+            body: "Your SuperCampus responsibilities and modules were updated.".into(),
+            data: json!({"userId": user_id, "roles": request.role_ids}),
+            priority: "high".into(),
+            requires_action: false,
+            deep_link: Some("/modules".into()),
+            deduplication_key: Some(format!(
+                "account:{user_id}:roles:{}",
+                Utc::now().timestamp_millis()
+            )),
+            expires_at: None,
+        },
+    )
+    .await
+    {
+        tracing::error!(?error, %user_id, "role-change notification enqueue failed");
+    }
+    Ok(Json(ApiResponse::new(result)))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -596,12 +625,39 @@ async fn set_tenant_user_access(
         .await?;
     state.publish_realtime(
         RealtimePublication::tenant(
-            principal.student.tenant_id,
+            principal.student.tenant_id.clone(),
             "authorization.changed",
             json!({"resource": "user_access", "userId": user_id, "surface": request.surface}),
         )
         .for_user(user_id.to_string()),
     );
+    use crate::notification::{NotificationSpec, Recipient, enqueue};
+    if let Err(error) = enqueue(
+        &state,
+        &principal.student.tenant_id,
+        NotificationSpec {
+            recipient: Recipient::User(user_id.to_string()),
+            category: "account".into(),
+            event_type: "account.access.updated".into(),
+            title: "Application access updated".into(),
+            body: "Your SuperCampus application access was changed. Reopen the app to refresh it."
+                .into(),
+            data: json!({"userId": user_id, "surface": request.surface}),
+            priority: "high".into(),
+            requires_action: true,
+            deep_link: Some("/modules".into()),
+            deduplication_key: Some(format!(
+                "account:{user_id}:access:{}:{}",
+                request.surface,
+                Utc::now().timestamp_millis()
+            )),
+            expires_at: None,
+        },
+    )
+    .await
+    {
+        tracing::error!(?error, %user_id, "access-change notification enqueue failed");
+    }
     Ok(Json(ApiResponse::new(result)))
 }
 
@@ -739,15 +795,33 @@ async fn import_student_master(
 
 async fn list_records(
     State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
     Path(module_key): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     ensure_module(&state, &module_key)?;
-    require_module_record_permission(&access, &module_key, "read")?;
-    let records = state
+    if module_key == "fees" {
+        require_any_tuition_fee_permission(&access, "read")?;
+    } else {
+        require_module_record_permission(&access, &module_key, "read")?;
+    }
+    let mut records = state
         .list_records(&tenant_id(&headers), &module_key)
         .await?;
+    if module_key == "fees" && !access.allows("*") {
+        records.retain(|record| {
+            tuition_fee_permission(&record.record_type, "read").is_some_and(|permission| {
+                access.allows(&permission)
+                    && tuition_fee_record_in_scope(
+                        &access,
+                        &principal.student,
+                        &permission,
+                        &record.data,
+                    )
+            })
+        });
+    }
     Ok(Json(ApiResponse::new(json!(records))))
 }
 
@@ -791,65 +865,163 @@ async fn list_own_student_fee_records(
 
 async fn create_record(
     State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
     Path(module_key): Path<String>,
     headers: HeaderMap,
     Json(request): Json<CreateRecordRequest>,
 ) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
     ensure_module(&state, &module_key)?;
-    require_module_record_permission(&access, &module_key, "create")?;
     if request.record_type.trim().is_empty() {
         return Err(ApiError::BadRequest("recordType is required".into()));
     }
+    if module_key == "fees" {
+        require_tuition_fee_permission(&access, &request.record_type, "create")?;
+    } else {
+        require_module_record_permission(&access, &module_key, "create")?;
+    }
+    let data = if module_key == "fees" {
+        tuition_fee_audit_data(request.data, &principal.student.id, "created", None)
+    } else {
+        request.data
+    };
     let record = state
-        .create_record(
-            tenant_id(&headers),
-            module_key,
-            request.record_type,
-            request.data,
-        )
+        .create_record(tenant_id(&headers), module_key, request.record_type, data)
         .await?;
+    if let Err(error) = crate::notification::enqueue_record_change(
+        &state,
+        &principal.student.tenant_id,
+        &record.module_key,
+        record.id,
+        &record.record_type,
+        &record.data,
+        "created",
+    )
+    .await
+    {
+        tracing::error!(record_id=%record.id, error=?error, "failed to enqueue record notification");
+    }
     Ok((StatusCode::CREATED, Json(ApiResponse::new(json!(record)))))
 }
 
 async fn get_record(
     State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
     Path((module_key, record_id)): Path<(String, Uuid)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     ensure_module(&state, &module_key)?;
-    require_module_record_permission(&access, &module_key, "read")?;
     let record = state
         .record(&tenant_id(&headers), &module_key, record_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Record not found: {record_id}")))?;
+    if module_key == "fees" {
+        require_tuition_fee_permission(&access, &record.record_type, "read")?;
+        let permission = tuition_fee_permission(&record.record_type, "read")
+            .expect("validated tuition fee workflow");
+        if !tuition_fee_record_in_scope(&access, &principal.student, &permission, &record.data) {
+            return Err(ApiError::NotFound(format!("Record not found: {record_id}")));
+        }
+    } else {
+        require_module_record_permission(&access, &module_key, "read")?;
+    }
     Ok(Json(ApiResponse::new(json!(record))))
 }
 
 async fn update_record(
     State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
     Path((module_key, record_id)): Path<(String, Uuid)>,
     headers: HeaderMap,
     Json(request): Json<UpdateRecordRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     ensure_module(&state, &module_key)?;
-    require_module_record_permission(&access, &module_key, "update")?;
-    let record = state
-        .update_record(&tenant_id(&headers), &module_key, record_id, request.data)
+    let current = state
+        .record(&tenant_id(&headers), &module_key, record_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Record not found: {record_id}")))?;
+    if module_key == "fees" {
+        require_tuition_fee_permission(&access, &current.record_type, "update")?;
+    } else {
+        require_module_record_permission(&access, &module_key, "update")?;
+    }
+    let data = if module_key == "fees" {
+        tuition_fee_audit_data(
+            request.data,
+            &principal.student.id,
+            "updated",
+            Some(&current.data),
+        )
+    } else {
+        request.data
+    };
+    let record = state
+        .update_record(&tenant_id(&headers), &module_key, record_id, data)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Record not found: {record_id}")))?;
+    if let Err(error) = crate::notification::enqueue_record_change(
+        &state,
+        &principal.student.tenant_id,
+        &record.module_key,
+        record.id,
+        &record.record_type,
+        &record.data,
+        "updated",
+    )
+    .await
+    {
+        tracing::error!(record_id=%record.id, error=?error, "failed to enqueue record notification");
+    }
     Ok(Json(ApiResponse::new(json!(record))))
 }
 
 async fn delete_record(
     State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
     Path((module_key, record_id)): Path<(String, Uuid)>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
     ensure_module(&state, &module_key)?;
+    if module_key == "fees" {
+        let current = state
+            .record(&tenant_id(&headers), &module_key, record_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Record not found: {record_id}")))?;
+        require_tuition_fee_permission(&access, &current.record_type, "delete")?;
+        let status = match current.record_type.as_str() {
+            "payments" => "void",
+            "reconciliation" => "reversed",
+            "fines_penalties" | "fee_assignment" => "cancelled",
+            _ => "archived",
+        };
+        let mut data = current.data.clone();
+        if let Some(object) = data.as_object_mut() {
+            object.insert("status".into(), json!(status));
+            object.insert("archived".into(), json!(true));
+        }
+        let data = tuition_fee_audit_data(data, &principal.student.id, status, Some(&current.data));
+        let record = state
+            .update_record(&tenant_id(&headers), &module_key, record_id, data)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Record not found: {record_id}")))?;
+        if let Err(error) = crate::notification::enqueue_record_change(
+            &state,
+            &principal.student.tenant_id,
+            &record.module_key,
+            record.id,
+            &record.record_type,
+            &record.data,
+            status,
+        )
+        .await
+        {
+            tracing::error!(record_id=%record.id, error=?error, "failed to enqueue archived fee notification");
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
     require_module_record_permission(&access, &module_key, "delete")?;
     if state
         .delete_record(&tenant_id(&headers), &module_key, record_id)
@@ -1227,6 +1399,110 @@ fn require_module_record_permission(
     require_effective_permission(access, &format!("{module_key}.records.{action}"))
 }
 
+const TUITION_FEE_WORKFLOWS: [&str; 11] = [
+    "fee_heads",
+    "fee_structures",
+    "fee_assignment",
+    "installment_plans",
+    "student_fee_accounts",
+    "payments",
+    "fines_penalties",
+    "reconciliation",
+    "fee_defaulters",
+    "fee_notifications",
+    "fee_reports",
+];
+
+fn tuition_fee_permission(record_type: &str, action: &str) -> Option<String> {
+    TUITION_FEE_WORKFLOWS
+        .contains(&record_type)
+        .then(|| format!("tuition_fee.{record_type}.{action}"))
+}
+
+fn require_tuition_fee_permission(
+    access: &EffectiveAccess,
+    record_type: &str,
+    action: &str,
+) -> ApiResult<()> {
+    let permission = tuition_fee_permission(record_type, action).ok_or_else(|| {
+        ApiError::BadRequest(format!("Unsupported tuition fee workflow: {record_type}"))
+    })?;
+    require_effective_permission(access, &permission)
+}
+
+fn require_any_tuition_fee_permission(access: &EffectiveAccess, action: &str) -> ApiResult<()> {
+    if access.allows("*")
+        || TUITION_FEE_WORKFLOWS
+            .iter()
+            .any(|workflow| access.allows(&format!("tuition_fee.{workflow}.{action}")))
+    {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+/// Student finance grants use the `own` scope. A stable user identifier must
+/// match the authenticated student; names are deliberately not accepted
+/// because two students can share the same name.
+fn tuition_fee_record_in_scope(
+    access: &EffectiveAccess,
+    student: &AuthStudent,
+    permission: &str,
+    data: &Value,
+) -> bool {
+    if access.allows("*") || access.scope_for(permission) != Some("own") {
+        return true;
+    }
+
+    let value_matches = |key: &str, expected: &str| {
+        data.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected.trim()))
+    };
+
+    value_matches("studentId", &student.id)
+        || value_matches("userId", &student.id)
+        || value_matches("studentNumber", &student.roll)
+        || value_matches("roll", &student.roll)
+        || value_matches("registrationNumber", &student.roll)
+        || value_matches("studentEmail", &student.email)
+        || value_matches("email", &student.email)
+}
+
+/// Financial records are append-audited inside the tenant-scoped record. The
+/// previous value is retained for updates and reversals, so the history remains
+/// inspectable even when the current presentation changes.
+fn tuition_fee_audit_data(
+    mut data: Value,
+    actor: &str,
+    action: &str,
+    previous: Option<&Value>,
+) -> Value {
+    if !data.is_object() {
+        data = json!({ "value": data });
+    }
+    let existing = previous
+        .and_then(|value| value.get("auditHistory"))
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| data.get("auditHistory").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    let mut history = existing;
+    history.push(json!({
+        "actor": actor,
+        "action": action,
+        "previous": previous,
+        "timestamp": Utc::now(),
+    }));
+    if let Some(object) = data.as_object_mut() {
+        object.insert("auditHistory".into(), Value::Array(history));
+        object.insert("updatedBy".into(), json!(actor));
+        object.insert("updatedAt".into(), json!(Utc::now()));
+    }
+    data
+}
+
 fn can_access_module(access: &EffectiveAccess, module_key: &str) -> bool {
     access.allows("*")
         || access
@@ -1503,7 +1779,7 @@ fn login_response(
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     let data = LoginData {
         student: session.student,
-        access_token: session.access_token,
+        access_token: expose_refresh_token.then_some(session.access_token),
         token_type: "Bearer",
         expires_at: session.access_expires_at,
         session_id: session.session_id,
@@ -1579,6 +1855,87 @@ mod tests {
         assert!(matches!(
             require_module_record_permission(&reader, "admissions", "update"),
             Err(ApiError::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn tuition_fee_records_use_workflow_permissions() {
+        let fee_head_reader = access(&["tuition_fee.fee_heads.read"]);
+        assert!(require_any_tuition_fee_permission(&fee_head_reader, "read").is_ok());
+        assert!(require_tuition_fee_permission(&fee_head_reader, "fee_heads", "read").is_ok());
+        assert!(matches!(
+            require_tuition_fee_permission(&fee_head_reader, "payments", "read"),
+            Err(ApiError::Forbidden)
+        ));
+        assert!(matches!(
+            require_tuition_fee_permission(&fee_head_reader, "unknown", "read"),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn tuition_fee_changes_append_an_audit_entry() {
+        let created =
+            tuition_fee_audit_data(json!({"status": "Draft"}), "actor-1", "created", None);
+        assert_eq!(created["auditHistory"].as_array().map(Vec::len), Some(1));
+        let updated = tuition_fee_audit_data(
+            json!({"status": "Active"}),
+            "actor-2",
+            "updated",
+            Some(&created),
+        );
+        assert_eq!(updated["auditHistory"].as_array().map(Vec::len), Some(2));
+        assert_eq!(updated["updatedBy"], "actor-2");
+    }
+
+    #[test]
+    fn tuition_fee_own_scope_requires_a_stable_student_identifier() {
+        let permission = "tuition_fee.student_fee_accounts.read";
+        let mut student_access = access(&[permission]);
+        student_access
+            .scopes
+            .insert(permission.into(), "own".into());
+        let student = AuthStudent {
+            id: "student-1".into(),
+            tenant_id: "tenant-1".into(),
+            email: "one@example.edu".into(),
+            name: "Shared Name".into(),
+            initials: "SN".into(),
+            role: "student".into(),
+            portal_families: vec!["student".into()],
+            team: String::new(),
+            access: vec![],
+            roll: "SC001".into(),
+            college: String::new(),
+            dept: String::new(),
+            year: String::new(),
+            photo_url: String::new(),
+            full_college: String::new(),
+            tenant: crate::models::TenantSummary {
+                id: "tenant-1".into(),
+                code: "T1".into(),
+                name: "Tenant".into(),
+                city: String::new(),
+            },
+        };
+
+        assert!(tuition_fee_record_in_scope(
+            &student_access,
+            &student,
+            permission,
+            &json!({"studentNumber": "sc001"})
+        ));
+        assert!(!tuition_fee_record_in_scope(
+            &student_access,
+            &student,
+            permission,
+            &json!({"studentNumber": "SC002"})
+        ));
+        assert!(!tuition_fee_record_in_scope(
+            &student_access,
+            &student,
+            permission,
+            &json!({"student": "Shared Name"})
         ));
     }
 

@@ -2944,8 +2944,10 @@ impl PostgresCrmRepository {
     ) -> Result<PgRow, CrmError> {
         let row = sqlx::query(
             r#"INSERT INTO crm.communications
-               (tenant_id, lead_id, channel, template_key, subject, content, outcome, actor_id)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *"#,
+               (tenant_id, lead_id, channel, template_key, subject, content, outcome, status, actor_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7,
+                       CASE WHEN $3 IN ('call', 'note') THEN 'completed' ELSE 'queued' END,
+                       $8) RETURNING *"#,
         )
         .bind(tenant_id)
         .bind(lead_id)

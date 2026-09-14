@@ -46,6 +46,7 @@ pub struct GuardianDecisionInput {
 /// Called when a hosteller raises an outpass. Failure to deliver is recorded
 /// but never fails the request: the pass is validly raised either way, and a
 /// student should not have their outpass rejected because a phone was off.
+#[allow(clippy::too_many_arguments)]
 pub async fn issue_guardian_link(
     state: &AppState,
     tenant_slug: &str,
@@ -167,9 +168,7 @@ pub async fn decide_as_guardian(
     .execute(&mut *tx)
     .await?;
     if spent.rows_affected() == 0 {
-        return Err(ApiError::Conflict(
-            "This link has already been used".into(),
-        ));
+        return Err(ApiError::Conflict("This link has already been used".into()));
     }
 
     let outcome = advance_gatepass_step(
@@ -216,7 +215,23 @@ async fn resolve(state: &AppState, token: &str) -> ApiResult<(String, TokenRow, 
 
     for slug in state.registered_tenant_slugs().await? {
         let db = state.tenant_database(&slug).await?;
-        let row = sqlx::query_as::<_, (Uuid, Uuid, Uuid, String, String, Option<DateTime<Utc>>, DateTime<Utc>, String, String, String, DateTime<Utc>, String)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                Uuid,
+                Uuid,
+                String,
+                String,
+                Option<DateTime<Utc>>,
+                DateTime<Utc>,
+                String,
+                String,
+                String,
+                DateTime<Utc>,
+                String,
+            ),
+        >(
             r#"SELECT token.id, token.tenant_id, token.request_id,
                       token.guardian_name, token.guardian_phone,
                       token.used_at, token.expires_at,
@@ -234,9 +249,7 @@ async fn resolve(state: &AppState, token: &str) -> ApiResult<(String, TokenRow, 
         let Some(row) = row else { continue };
 
         if row.5.is_some() {
-            return Err(ApiError::Conflict(
-                "This link has already been used".into(),
-            ));
+            return Err(ApiError::Conflict("This link has already been used".into()));
         }
         if row.6 < Utc::now() {
             return Err(ApiError::Conflict("This link has expired".into()));

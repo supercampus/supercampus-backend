@@ -226,6 +226,12 @@ fn normalise(number: &str) -> String {
 /// credentials are still being gathered, and falling back to logging while
 /// *looking* configured is worse than naming the missing piece out loud.
 pub fn whatsapp_from_environment() -> anyhow::Result<Arc<dyn WhatsAppSender>> {
+    if std::env::var("WHATSAPP_ENABLED")
+        .map(|value| matches!(value.trim(), "0" | "false" | "FALSE"))
+        .unwrap_or(false)
+    {
+        return Ok(Arc::new(LogWhatsApp));
+    }
     fn present(key: &str) -> Option<String> {
         std::env::var(key)
             .ok()
@@ -244,9 +250,7 @@ pub fn whatsapp_from_environment() -> anyhow::Result<Arc<dyn WhatsAppSender>> {
     // reaches for when a restricted key has turned out to have no permissions,
     // and silently preferring the broken key would waste the fix.
     let credentials = match (&auth_token, &api_key_sid, &api_key_secret) {
-        (Some(token), _, _) => account_sid
-            .as_ref()
-            .map(|sid| (sid.clone(), token.clone())),
+        (Some(token), _, _) => account_sid.as_ref().map(|sid| (sid.clone(), token.clone())),
         (None, Some(sid), Some(secret)) => Some((sid.clone(), secret.clone())),
         _ => None,
     };
@@ -254,7 +258,10 @@ pub fn whatsapp_from_environment() -> anyhow::Result<Arc<dyn WhatsAppSender>> {
     let configured = [
         ("TWILIO_ACCOUNT_SID", &account_sid),
         ("TWILIO_WHATSAPP_FROM", &whatsapp_from),
-        ("TWILIO_AUTH_TOKEN or TWILIO_API_KEY_SID+SECRET", &credentials.as_ref().map(|_| String::new())),
+        (
+            "TWILIO_AUTH_TOKEN or TWILIO_API_KEY_SID+SECRET",
+            &credentials.as_ref().map(|_| String::new()),
+        ),
     ];
     let missing: Vec<&str> = configured
         .iter()

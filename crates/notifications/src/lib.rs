@@ -9,6 +9,8 @@
 //! - [`LogMailer`] writes the message to the tracing log and is the development default.
 //! - [`DisabledMailer`] discards messages when email is explicitly disabled.
 
+pub mod push;
+pub mod sms;
 pub mod whatsapp;
 
 use std::sync::Arc;
@@ -169,12 +171,9 @@ impl Mailer for SmtpMailer {
 /// local development works with no mail server. Outside development a misconfigured
 /// SMTP block is a hard error rather than a silent downgrade to logging.
 pub fn mailer_from_environment() -> anyhow::Result<Arc<dyn Mailer>> {
-    if std::env::var("EMAIL_TRANSPORT")
-        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("disabled"))
-    {
-        return Ok(Arc::new(DisabledMailer));
+    if channel_explicitly_disabled("EMAIL_ENABLED") {
+        return Ok(Arc::new(LogMailer));
     }
-
     let host = std::env::var("SMTP_HOST")
         .ok()
         .filter(|v| !v.trim().is_empty());
@@ -211,6 +210,12 @@ pub fn mailer_from_environment() -> anyhow::Result<Arc<dyn Mailer>> {
         implicit_tls,
     };
     Ok(Arc::new(SmtpMailer::new(config)?))
+}
+
+fn channel_explicitly_disabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.trim(), "0" | "false" | "FALSE"))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

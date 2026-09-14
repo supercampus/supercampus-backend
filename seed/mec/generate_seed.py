@@ -12,13 +12,18 @@ produces the same dataset and the SQL can be re-applied without duplicating
 anything.
 """
 
-import uuid
+import csv
 import json
 import io
+from pathlib import Path
+import uuid
 
 NS = uuid.UUID("6f2d1c40-0000-4000-8000-000000000000")
 DOMAIN = "mec.local"
 PASSWORD = "Mec@2026"
+SOURCE_DIR = Path(__file__).with_name("source")
+OUTPUT_DIR = SOURCE_DIR / "generated"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def uid(*parts):
@@ -41,15 +46,14 @@ def q(value):
 # ---------------------------------------------------------------- structure --
 
 DEPARTMENTS = [
-    ("AIDS", "Artificial Intelligence and Data Science"),
-    ("CSBS", "Computer Science and Business Systems"),
-    ("IT", "Information Technology"),
-    ("CYBER", "Cyber Security"),
-    ("CSE", "Computer Science and Engineering"),
-    ("AIML", "Artificial Intelligence and Machine Learning"),
+    ("AIDS", "B.Tech in Artificial Intelligence & Data Science"),
+    ("CSBS", "B.E in Computer Science & Business Systems"),
+    ("IT", "B.Tech in Information Technology"),
+    ("CYBER", "B.E in Computer Science & Engineering (Cyber Security)"),
+    ("CSE", "B.E in Computer Science & Engineering"),
+    ("AIML", "B.E in Computer Science & Engineering (Artificial Intelligence & Machine Learning)"),
 ]
-DEPT_INTAKE = {"AIDS": 33, "CSBS": 34, "IT": 33, "CYBER": 33, "CSE": 34, "AIML": 33}
-assert sum(DEPT_INTAKE.values()) == 200
+DEPARTMENT_BY_NAME = {name: code for code, name in DEPARTMENTS}
 
 ACADEMIC_YEAR = ("2026-27", "Academic Year 2026-27", "2026-07-01", "2027-05-31")
 TERMS = [
@@ -92,6 +96,14 @@ def person_name(index, female):
 def initials(name):
     bits = [p for p in name.split() if p]
     return ((bits[0][0] + (bits[-1][0] if len(bits) > 1 else "")) or "?").upper()
+
+
+def student_password(name, phone):
+    letters = "".join(character for character in name.upper() if character.isalpha())
+    digits = "".join(character for character in phone if character.isdigit())
+    if len(letters) < 4 or len(digits) < 4:
+        raise ValueError("a student credential needs four name letters and four phone digits")
+    return letters[:4] + digits[-4:]
 
 
 # -------------------------------------------------------------- permissions --
@@ -139,6 +151,13 @@ FACULTY_GRANTS = (
     + keys("library", "records.read", "visit_pass.create", "visit_pass.read", "qr_pass.read")
     + keys("documents", "records.read")
     + keys("students", "directory.read")
+)
+
+PARENT_GRANTS = (
+    keys("gatepass", "outpass.read", "outpass.approve")
+    + keys("academics", "attendance.read", "marks.read", "analysis.read")
+    + keys("attendance", "leave.read")
+    + keys("tuition_fee", "invoice.read", "payment.read")
 )
 
 # An advisor is the faculty bundle with more on it, never a separate role, so
@@ -258,6 +277,8 @@ SHOP_CAPTAIN_GRANTS = keys(
 ROLES = [
     ("student", "Student", "Students", "student", "own", STUDENT_GRANTS,
      "Sees their own academic record, orders, passes and fees"),
+    ("parent", "Parent / Guardian", "Parents", "parent", "own", PARENT_GRANTS,
+     "Verifies linked children and consents to their outpass requests"),
     ("staff", "Faculty", "Academics", "staff", "assigned", FACULTY_GRANTS,
      "Teaches assigned sections and records their attendance and marks"),
     ("class_advisor", "Class Advisor", "Academics", "staff", "assigned", ADVISOR_EXTRA,
@@ -311,7 +332,7 @@ if DEFINED:
 
 class Person(object):
     def __init__(self, email, name, roles, account_type, kind, extra=None):
-        self.email = "%s@%s" % (email, DOMAIN)
+        self.email = email if "@" in email else "%s@%s" % (email, DOMAIN)
         self.name = name
         self.roles = roles
         self.account_type = account_type
@@ -319,58 +340,52 @@ class Person(object):
         self.extra = extra or {}
         self.id = uid("user", self.email)
         self.dept = None
+        self.password = PASSWORD
 
 
 people = []
 students = []
 
 # Students --------------------------------------------------------------------
-# The roll is built in two passes. Deciding residency inside the department
-# loop would fill the hostels from the first departments alphabetically and
-# leave the rest entirely day scholars; taking every second student of each
-# gender instead spreads 50 boys and 50 girls evenly across all six.
-roster = []
-seq = 0
-for dept_code, _ in DEPARTMENTS:
-    for _ in range(DEPT_INTAKE[dept_code]):
-        seq += 1
-        roster.append((seq, dept_code, seq % 2 == 1))
+# The authoritative roster is the supplied MEC export.  Fields the institution
+# did not provide (gender, residence and hostel room) remain unassigned rather
+# than being inferred from a name or row position.
+with (SOURCE_DIR / "students.csv").open("r", encoding="utf-8-sig", newline="") as source:
+    roster = list(csv.DictReader(source))
 
-residency = {}
-for female in (False, True):
-    same_gender = [entry for entry in roster if entry[2] is female]
-    bed = 0
-    for position, (student_seq, _, _) in enumerate(same_gender):
-        if position % 2 == 0:
-            bed += 1
-            residency[student_seq] = bed
+if len(roster) != 201:
+    raise SystemExit("seed/mec/source/students.csv must contain 201 students")
 
-for student_seq, dept_code, female in roster:
-    bed = residency.get(student_seq)
+for row in roster:
+    dept_code = DEPARTMENT_BY_NAME.get(row["Department"].strip())
+    if dept_code is None:
+        raise SystemExit("unknown MEC department: " + row["Department"])
+    roll = row["Register No"].strip().upper()
+    email = row["email"].strip().lower()
     # roll, dept, year and team are read straight off identity.users.profile by
     # the login response -- an empty profile means an empty header in the app.
     profile = {
-        "gender": "female" if female else "male",
-        "residency": "hosteller" if bed else "day_scholar",
+        "source": "mec_student_roster_2026_08_23",
+        "residency": "unassigned",
         "dept": dept_code,
-        "roll": "MEC26%s%03d" % (dept_code[:2], student_seq),
-        "year": "I",
+        "department": row["Department"].strip(),
+        "roll": roll,
+        "phone": row["Phone"].strip(),
+        "year": "II",
         "team": "Students",
         "section": "A",
     }
-    if bed:
-        # Four heads to a room, filling rooms from 101 upward.
-        profile["hostel"] = "Girls Hostel" if female else "Boys Hostel"
-        profile["room"] = "%s-%d" % ("GH" if female else "BH",
-                                     100 + ((bed - 1) // 4) + 1)
-    person = Person("student%03d" % student_seq, person_name(student_seq, female),
+    person = Person(email, row["Name"].strip(),
                     ["student"], "student", "student", profile)
     person.dept = dept_code
-    person.number = "MEC26%s%03d" % (dept_code[:2], student_seq)
+    person.number = roll
+    person.phone = row["Phone"].strip()
+    person.password = student_password(person.name, person.phone)
     people.append(person)
     students.append(person)
 
-# Staff -- 20 in total: 1 principal, 6 HODs, 6 advisors, 7 plain faculty -------
+# Staff: one principal, six HODs, five people covering six advisor assignments,
+# and seven plain faculty. Hari Rama Krishna owns both CSE and Cyber.
 staff = []
 principal = Person("principal", person_name(3, False), ["principal"], "staff",
                    "employee", {"designation": "Principal"})
@@ -387,26 +402,52 @@ for i, (dept_code, _) in enumerate(DEPARTMENTS):
     staff.append(p)
     hods[dept_code] = p
 
+ADVISOR_PEOPLE = {
+    "AIDS": ("shobana", "Dr. G. Shobana"),
+    "CSBS": ("elakkiya", "Mrs. J. Elakkiya"),
+    "IT": ("devanath", "Dr. J. Devanath"),
+    "CSE": ("hariramakrishna", "Mr. S. Hari Rama Krishna"),
+    "CYBER": ("hariramakrishna", "Mr. S. Hari Rama Krishna"),
+    "AIML": ("karthikeyan", "Dr. M. Karthikeyan"),
+}
 advisors = {}
-for i, (dept_code, _) in enumerate(DEPARTMENTS):
-    p = Person("advisor.%s" % dept_code.lower(), person_name(70 + i, i % 2 == 1),
-               ["staff", "class_advisor"], "staff", "employee",
-               {"designation": "Class Advisor, %s" % dept_code})
-    p.dept = dept_code
-    people.append(p)
-    staff.append(p)
+advisor_people = {}
+for dept_code, _ in DEPARTMENTS:
+    login, name = ADVISOR_PEOPLE[dept_code]
+    p = advisor_people.get(login)
+    if p is None:
+        designation = ("Class Advisor, CSE & CYBER" if login == "hariramakrishna"
+                       else "Class Advisor, %s" % dept_code)
+        p = Person(login, name, ["staff", "class_advisor"], "staff", "employee",
+                   {"designation": designation})
+        p.dept = dept_code
+        people.append(p)
+        staff.append(p)
+        advisor_people[login] = p
     advisors[dept_code] = p
 
 plain_faculty = []
-for i in range(7):
-    p = Person("faculty%02d" % (i + 1), person_name(100 + i, i % 2 == 0), ["staff"],
-               "staff", "employee", {"designation": "Assistant Professor"})
-    p.dept = DEPARTMENTS[i % len(DEPARTMENTS)][0]
+FACULTY_PEOPLE = [
+    ("saranya", "Dr. N. Saranya", "IT"),
+    ("anitha", "Dr. S. M. Anitha", "CSBS"),
+    ("saranyaa", "Dr. P. Saranyaa", "AIML"),
+    ("deepika", "Dr. T. Deepika", "CSE"),
+    ("lakshmikanth", "Mr. J. Lakshmikanth", "AIDS"),
+    ("vijayakumar", "Mr. K. Vijayakumar", "CSE"),
+    ("arunmozhi", "Mr. K. Arunmozhi", "IT"),
+    ("ganesh", "Mr. S. Ganesh", "CSBS"),
+    ("santhosh", "Mr. S. Santhosh", "AIDS"),
+    ("preethi", "Mrs. Preethi", "CSE"),
+]
+for login, name, department in FACULTY_PEOPLE:
+    p = Person(login, name, ["staff"], "staff", "employee",
+               {"designation": "Assistant Professor"})
+    p.dept = department
     people.append(p)
     staff.append(p)
     plain_faculty.append(p)
 
-assert len(staff) == 20, len(staff)
+assert len(staff) == 22, len(staff)
 
 # Support ---------------------------------------------------------------------
 support = []
@@ -421,6 +462,15 @@ for key, label in (("boys", "Boys Hostel"), ("girls", "Girls Hostel")):
                           person_name(150 if key == "boys" else 151, key == "girls"),
                           ["warden"], "staff", "employee",
                           {"designation": "Warden, %s" % label, "hostel": label}))
+support.append(Person("warden", "MEC Hostel Warden", ["warden"], "staff",
+                      "employee", {"designation": "Hostel Warden"}))
+
+# Account-backed guardian used by the mobile approval-matrix demo. Unlike the
+# WhatsApp-only guardian rows below, this person signs in and is explicitly
+# linked to one student.
+parents = [Person("selvamoorthy@gmail.com", "Selvamoorthy", ["parent"],
+                  "parent", "parent", {"relationship": "Parent"})]
+people.extend(parents)
 
 # Management ------------------------------------------------------------------
 management = []
@@ -455,7 +505,7 @@ for shop_key, shop_name, category, captain_count in SHOPS:
         people.append(captain)
         vendor_people.append((captain, shop_key, "captain"))
 
-assert len(people) == 245, len(people)
+assert len(people) == 250, len(people)
 
 # The login response reads `team` and `dept` off the profile as well, so every
 # non-student account gets them from the most specific role it holds -- the last
@@ -491,11 +541,23 @@ w("-- Roles, their grants, the people, and which roles each person holds.\n")
 w("-- Generated by seed/mec/generate_seed.py. Re-running is safe.\n")
 w("\\set ON_ERROR_STOP on\n")
 w("BEGIN;\n\n")
-w("-- One bcrypt hash, reused for every account: this is a development dataset\n")
-w("-- with a single shared password, so per-account salts would buy nothing and\n")
-w("-- cost 245 rounds of key stretching.\n")
-w("CREATE TEMP TABLE mec_secret AS SELECT crypt(%s, gen_salt('bf', 12)) AS hash;\n\n"
-  % q(PASSWORD))
+w("-- Student passwords are derived from the institution-issued credential rule.\n")
+w("-- Every account is hashed independently; plaintext never enters a table.\n\n")
+
+w("""-- Retire the generated student identities from the previous MEC demo roll.
+-- They are disabled, not deleted, so historical audit/session references stay valid.
+UPDATE identity.tenant_memberships membership
+SET active = false, updated_at = now()
+FROM identity.users person
+WHERE membership.tenant_id = %s
+  AND person.id = membership.user_id
+  AND person.email ~ '^student[0-9]{3}@mec\\.local$';
+
+UPDATE identity.users
+SET active = false, updated_at = now()
+WHERE email ~ '^student[0-9]{3}@mec\\.local$';
+
+""" % TENANT)
 
 w("-- Roles ----------------------------------------------------------------------\n")
 for role_key, name, team, family, scope, grants, description in ROLES:
@@ -554,12 +616,13 @@ w("-- People -------------------------------------------------------------------
 for p in people:
     w("""INSERT INTO identity.users (id, email, password_hash, display_name, initials,
         account_type, active, profile)
-VALUES (%s::uuid, %s, (SELECT hash FROM mec_secret), %s, %s, %s, true, %s)
+VALUES (%s::uuid, %s, crypt(%s, gen_salt('bf', 12)), %s, %s, %s, true, %s)
 ON CONFLICT (email) DO UPDATE SET
+    password_hash = EXCLUDED.password_hash,
     display_name = EXCLUDED.display_name, initials = EXCLUDED.initials,
     account_type = EXCLUDED.account_type, active = true,
     profile = EXCLUDED.profile, updated_at = now();\n"""
-      % (q(p.id), q(p.email), q(p.name), q(initials(p.name)), q(p.account_type),
+      % (q(p.id), q(p.email), q(p.password), q(p.name), q(initials(p.name)), q(p.account_type),
          q(p.extra)))
 
 w("\n-- Memberships ----------------------------------------------------------------\n")
@@ -572,6 +635,19 @@ ON CONFLICT (tenant_id, user_id) DO UPDATE SET
     roles = EXCLUDED.roles, active = true, is_primary = true,
     profile = EXCLUDED.profile, updated_at = now();\n"""
       % (TENANT, q(p.id), roles_array, q(p.extra)))
+
+w("""
+-- Hari Rama Krishna now owns both CSE and Cyber through one account. Retire the
+-- former Cyber-only placeholder so it cannot continue to sign in.
+UPDATE identity.tenant_memberships membership
+SET active = false, updated_at = now()
+FROM identity.users person
+WHERE membership.tenant_id = %s
+  AND membership.user_id = person.id
+  AND person.email = 'advisor.cyber@mec.local';
+UPDATE identity.users SET active = false, updated_at = now()
+WHERE email = 'advisor.cyber@mec.local';
+""" % TENANT)
 
 w("""
 -- authz.user_roles mirrors the membership array; the admin console reads it.
@@ -595,8 +671,21 @@ WHERE definition.permission_key IS NULL
 ORDER BY 1, 2;
 """ % (TENANT, TENANT, TENANT))
 
-with io.open("seed/mec/01_control.sql", "w", encoding="utf-8", newline="\n") as fh:
+with (OUTPUT_DIR / "01_control.sql").open("w", encoding="utf-8", newline="\n") as fh:
     fh.write(out.getvalue())
+
+credentials_sql = io.StringIO()
+cw = credentials_sql.write
+cw("\\set ON_ERROR_STOP on\nBEGIN;\n")
+for p in students:
+    cw("UPDATE identity.users SET password_hash = crypt(%s, gen_salt('bf', 12)), updated_at = now() "
+       "WHERE id = %s::uuid AND email = %s;\n" % (q(p.password), q(p.id), q(p.email)))
+    cw("UPDATE identity.auth_sessions SET revoked_at = now() "
+       "WHERE user_id = %s AND revoked_at IS NULL;\n" % q(p.id))
+cw("COMMIT;\n")
+with (OUTPUT_DIR / "05_student_credentials.sql").open(
+        "w", encoding="utf-8", newline="\n") as fh:
+    fh.write(credentials_sql.getvalue())
 
 # -------------------------------------------------------------- tenant plane --
 
@@ -640,7 +729,7 @@ ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, active = true;
 
 INSERT INTO core.batches (id, tenant_id, programme_id, academic_year_id, code, name,
         starts_on, ends_on, active)
-VALUES (%s::uuid, %s, %s::uuid, %s::uuid, %s, %s, '2026-07-01'::date, '2030-05-31'::date, true)
+VALUES (%s::uuid, %s, %s::uuid, %s::uuid, %s, %s, '2025-07-01'::date, '2029-05-31'::date, true)
 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, active = true;
 
 INSERT INTO core.sections (id, tenant_id, batch_id, code, name, capacity, active)
@@ -649,8 +738,8 @@ ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, active = true;
 
 """ % (q(dept_ids[code]), TENANT, q(campus_id), q(code), q(name),
        q(prog_ids[code]), TENANT, q(dept_ids[code]), q("BE-" + code), q("B.E. " + name),
-       q(batch_ids[code]), TENANT, q(prog_ids[code]), q(year_id), q(code + "-2026"),
-       q(code + " Batch of 2026-2030"),
+       q(batch_ids[code]), TENANT, q(prog_ids[code]), q(year_id), q(code + "-2025"),
+       q(code + " Batch of 2025-2029"),
        q(section_ids[code]), TENANT, q(batch_ids[code]), q(code + " - Section A")))
 
 w("-- Subjects and offerings -------------------------------------------------------\n")
@@ -676,6 +765,19 @@ w("""-- Identity mirror --------------------------------------------------------
 -- rows exactly, so the two sides describe one person. No password lives here --
 -- authentication only ever reads the control plane.
 """)
+w("""-- Remove only the old generated MEC26 demo roll. The real MEC25 roster and
+-- independently-created student records are outside this predicate.
+DELETE FROM core.academic_enrollments
+WHERE student_id IN (
+    SELECT id FROM core.students
+    WHERE tenant_id = %s AND student_number ~ '^MEC26[A-Z]{2}[0-9]{3}$'
+);
+DELETE FROM core.students
+WHERE tenant_id = %s AND student_number ~ '^MEC26[A-Z]{2}[0-9]{3}$';
+UPDATE identity.users SET active = false
+WHERE email ~ '^student[0-9]{3}@mec\\.local$';
+
+""" % (TENANT, TENANT))
 for p in people:
     w("""INSERT INTO identity.users (id, email, password_hash, display_name, initials,
         account_type, active, profile)
@@ -687,20 +789,22 @@ ON CONFLICT (email) DO UPDATE SET
 
 w("\n-- The roll --------------------------------------------------------------------\n")
 for p in students:
-    w("""INSERT INTO core.students (id, tenant_id, student_number, full_name, email,
+    w("""INSERT INTO core.students (id, tenant_id, student_number, full_name, email, phone,
         applicant_id, application_id, admission_id, campus_id, department_id, program_id,
         batch_id, section_id, academic_year, admission_category, user_account_id, status, profile)
-VALUES (%s::uuid, %s, %s, %s, %s, %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid,
-        %s::uuid, %s::uuid, %s::uuid, %s, %s, %s::uuid, 'active', %s)
-ON CONFLICT (id) DO UPDATE SET
-    full_name = EXCLUDED.full_name, section_id = EXCLUDED.section_id,
-    department_id = EXCLUDED.department_id, status = 'active',
+VALUES (%s::uuid, %s, %s, %s, %s, %s, %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid,
+        %s::uuid, %s::uuid, %s::uuid, %s, 'regular', %s::uuid, 'active', %s)
+ON CONFLICT (tenant_id, student_number) DO UPDATE SET
+    full_name = EXCLUDED.full_name, email = EXCLUDED.email, phone = EXCLUDED.phone,
+    section_id = EXCLUDED.section_id, department_id = EXCLUDED.department_id,
+    program_id = EXCLUDED.program_id, batch_id = EXCLUDED.batch_id,
+    user_account_id = EXCLUDED.user_account_id, status = 'active',
     profile = EXCLUDED.profile, updated_at = now();\n"""
-      % (q(uid("student", p.email)), TENANT, q(p.number), q(p.name), q(p.email),
+      % (q(uid("student", p.email)), TENANT, q(p.number), q(p.name), q(p.email), q(p.phone),
          q(uid("applicant", p.email)), q(uid("application", p.email)),
          q(uid("admission", p.email)), q(campus_id), q(dept_ids[p.dept]),
          q(prog_ids[p.dept]), q(batch_ids[p.dept]), q(section_ids[p.dept]),
-         q(ACADEMIC_YEAR[0]), q(p.extra["residency"]), q(p.id), q(p.extra)))
+         q(ACADEMIC_YEAR[0]), q(p.id), q(p.extra)))
 
 w("""
 -- Enrolments --------------------------------------------------------------------
@@ -712,11 +816,11 @@ w("""
 for p in students:
     w("""INSERT INTO core.academic_enrollments (id, tenant_id, student_id, academic_year_id,
         term_id, campus_id, department_id, programme_id, batch_id, section_id, status, started_at)
-VALUES (%s::uuid, %s, %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid,
+VALUES (%s::uuid, %s, (SELECT id FROM core.students WHERE tenant_id = %s AND student_number = %s), %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid,
         %s::uuid, 'active', '2026-07-01T00:00:00Z'::timestamptz)
 ON CONFLICT (id) DO UPDATE SET
     section_id = EXCLUDED.section_id, status = 'active', updated_at = now();\n"""
-      % (q(uid("enrollment", p.email)), TENANT, q(uid("student", p.email)), q(year_id),
+      % (q(uid("enrollment", p.email)), TENANT, TENANT, q(p.number), q(year_id),
          q(uid("term", "ODD")), q(campus_id), q(dept_ids[p.dept]), q(prog_ids[p.dept]),
          q(batch_ids[p.dept]), q(section_ids[p.dept])))
 
@@ -748,6 +852,16 @@ ON CONFLICT (id) DO UPDATE SET
          q(guardian_name), q("+9190000%05d" % (index + 1)),
          q("guardian.%s" % learner.email), q(relation)))
 
+vishnu = next(student for student in students if student.number == "MEC25AD48")
+w("""
+-- Signed-in guardian relationship used by the parent approval portal.
+INSERT INTO campus_ops.parent_student_links
+    (tenant_id, parent_user_id, student_user_id, active)
+VALUES (%s, %s, %s, true)
+ON CONFLICT (tenant_id, parent_user_id, student_user_id)
+DO UPDATE SET active = true;
+""" % (TENANT, q(parents[0].id), q(vishnu.id)))
+
 w("\n-- Employees -------------------------------------------------------------------\n")
 for i, p in enumerate(employees, start=1):
     dept = "%s::uuid" % q(dept_ids[p.dept]) if p.dept else "NULL"
@@ -759,6 +873,24 @@ ON CONFLICT (id) DO UPDATE SET
     status = 'active', profile = EXCLUDED.profile, updated_at = now();\n"""
       % (q(uid("employee", p.email)), TENANT, q(p.id), q("MECEMP%03d" % i), dept,
          q(p.name), q(p.email), q(p.extra)))
+
+w("""
+UPDATE core.employees SET status = 'inactive', updated_at = now()
+WHERE tenant_id = %s AND email = 'advisor.cyber@mec.local';
+UPDATE identity.users SET active = false, updated_at = now()
+WHERE email = 'advisor.cyber@mec.local';
+""" % TENANT)
+
+w("\n-- Class advisor assignments --------------------------------------------------\n")
+for dept_code, _ in DEPARTMENTS:
+    advisor = advisors[dept_code]
+    w("""INSERT INTO core.class_advisor_assignments (id, tenant_id, department_id,
+        advisor_user_id, active, assigned_by)
+VALUES (%s::uuid, %s, %s::uuid, %s::uuid, true, %s::uuid)
+ON CONFLICT (tenant_id, department_id) DO UPDATE SET
+    advisor_user_id = EXCLUDED.advisor_user_id, active = true, updated_at = now();\n"""
+      % (q(uid("class-advisor", dept_code)), TENANT, q(dept_ids[dept_code]),
+         q(advisor.id), q(principal.id)))
 
 w("""
 -- Teaching assignments -----------------------------------------------------------
@@ -854,7 +986,7 @@ ON CONFLICT (tenant_id, shop_id, user_id) DO UPDATE SET
 
 w("\nCOMMIT;\n")
 
-with io.open("seed/mec/02_campus.sql", "w", encoding="utf-8", newline="\n") as fh:
+with (OUTPUT_DIR / "02_campus.sql").open("w", encoding="utf-8", newline="\n") as fh:
     fh.write(out.getvalue())
 
 # ------------------------------------------------------------- credentials --
@@ -864,26 +996,30 @@ with io.open("seed/mec/02_campus.sql", "w", encoding="utf-8", newline="\n") as f
 doc = io.StringIO()
 d = doc.write
 d("# Madras Engineering College - accounts\n\n")
-d("Generated by `seed/mec/generate_seed.py`. Every account below shares the\n")
-d("password `%s`, and every one is a local development account on the\n" % PASSWORD)
-d("`mec` tenant.\n\n")
+d("Generated by `seed/mec/generate_seed.py` for the `mec` tenant. Student\n")
+d("usernames accept their email address or mobile number. Their initial password\n")
+d("is the first four letters of the name in uppercase followed by the last four\n")
+d("mobile-number digits. Non-student seed accounts retain the development\n")
+d("password configured in the generator.\n\n")
 d("| count | who | email | roles |\n|---|---|---|---|\n")
 
 rows = [
     (len(students), "Students",
-     "student001@%s ... student%03d@%s" % (DOMAIN, len(students), DOMAIN), "student"),
+     "Personal email addresses in `source/students.csv`", "student"),
     (1, "Principal", "principal@%s" % DOMAIN, "principal"),
     (len(hods), "Heads of Department",
      ", ".join("hod.%s@%s" % (c.lower(), DOMAIN) for c, _ in DEPARTMENTS), "staff + hod"),
-    (len(advisors), "Class Advisors",
-     ", ".join("advisor.%s@%s" % (c.lower(), DOMAIN) for c, _ in DEPARTMENTS),
+    (len(advisor_people), "Class Advisors (six department assignments)",
+     ", ".join("%s@%s" % (login, DOMAIN) for login in advisor_people),
      "staff + class_advisor"),
     (len(plain_faculty), "Faculty",
-     "faculty01@%s ... faculty%02d@%s" % (DOMAIN, len(plain_faculty), DOMAIN), "staff"),
+     ", ".join("%s@%s" % (login, DOMAIN) for login, _, _ in FACULTY_PEOPLE), "staff"),
     (1, "Librarian", "librarian@%s" % DOMAIN, "librarian"),
     (3, "Security", "security1@%s, security2@%s, security3@%s" % (DOMAIN, DOMAIN, DOMAIN),
      "security"),
-    (2, "Wardens", "warden.boys@%s, warden.girls@%s" % (DOMAIN, DOMAIN), "warden"),
+    (3, "Wardens", "warden@%s, warden.boys@%s, warden.girls@%s" %
+     (DOMAIN, DOMAIN, DOMAIN), "warden"),
+    (1, "Parent / Guardian", "selvamoorthy@gmail.com", "parent"),
     (1, "Tenant Admin", "admin@%s" % DOMAIN, "tenant_admin"),
     (1, "Super Admin", "superadmin@%s" % DOMAIN, "superadmin"),
     (6, "Managers", "manager1@%s ... manager6@%s" % (DOMAIN, DOMAIN), "manager"),
@@ -906,18 +1042,16 @@ for role_key, name, _, _, scope, grants, description in ROLES:
     d("| `%s` | `%s` | %s |\n" % (role_key, scope, description))
 d("\n`assigned` is the wire value the app reads as `PermissionScope.section`.\n")
 
-with io.open("seed/mec/CREDENTIALS.md", "w", encoding="utf-8", newline="\n") as fh:
+with (OUTPUT_DIR / "CREDENTIALS.md").open("w", encoding="utf-8", newline="\n") as fh:
     fh.write(doc.getvalue())
 
-hostellers = sum(1 for s in students if s.extra["residency"] == "hosteller")
 print("people          : %d" % len(people))
-print("  students      : %d (%d hostellers, %d day scholars)"
-      % (len(students), hostellers, len(students) - hostellers))
-print("  staff         : %d (1 principal, %d HODs, %d advisors, %d faculty)"
-      % (len(staff), len(hods), len(advisors), len(plain_faculty)))
+print("  students      : %d (residency unassigned in the source roster)" % len(students))
+print("  staff         : %d (1 principal, %d HODs, %d advisor people / %d assignments, %d faculty)"
+      % (len(staff), len(hods), len(advisor_people), len(advisors), len(plain_faculty)))
 print("  support       : %d" % len(support))
 print("  management    : %d" % len(management))
 print("  vendor people : %d across %d shops" % (len(vendor_people), len(SHOPS)))
 print("roles           : %d (+ tenant_admin from bootstrap)" % len(ROLES))
 print("employees       : %d" % len(employees))
-print("wrote 01_control.sql, 02_campus.sql and CREDENTIALS.md into seed/mec/")
+print("wrote private SQL, credentials and student password updates into seed/mec/source/generated/")

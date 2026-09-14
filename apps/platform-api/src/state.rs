@@ -489,6 +489,7 @@ impl AppState {
                  AND tenant.slug = $1
                  AND student.id = $2
                RETURNING student.id,
+                         student.user_account_id,
                          student.full_name,
                          NULLIF(student.profile ->> 'photoUrl', '') AS photo_url"#,
         )
@@ -500,6 +501,51 @@ impl AppState {
         .context("failed to update the student photograph")?;
 
         let Some(row) = row else { return Ok(None) };
+        let user_account_id = row.try_get::<Option<Uuid>, _>("user_account_id")?;
+        if let (Some(control), Some(user_account_id)) = (&self.database, user_account_id) {
+            sqlx::query(
+                r#"UPDATE identity.users
+                   SET profile = CASE
+                           WHEN $2::text IS NULL THEN COALESCE(profile, '{}'::jsonb) - 'photoUrl'
+                           ELSE jsonb_set(
+                               COALESCE(profile, '{}'::jsonb),
+                               '{photoUrl}',
+                               to_jsonb($2::text),
+                               true
+                           )
+                       END,
+                       updated_at = now()
+                   WHERE id = $1"#,
+            )
+            .bind(user_account_id)
+            .bind(photo_url)
+            .execute(control.pool())
+            .await
+            .context("failed to sync the student photograph to the login identity")?;
+            sqlx::query(
+                r#"UPDATE identity.tenant_memberships membership
+                   SET profile = CASE
+                           WHEN $2::text IS NULL THEN COALESCE(membership.profile, '{}'::jsonb) - 'photoUrl'
+                           ELSE jsonb_set(
+                               COALESCE(membership.profile, '{}'::jsonb),
+                               '{photoUrl}',
+                               to_jsonb($2::text),
+                               true
+                           )
+                       END,
+                       updated_at = now()
+                   FROM platform.tenants tenant
+                   WHERE membership.user_id = $1
+                     AND tenant.id = membership.tenant_id
+                     AND tenant.slug = $3"#,
+            )
+            .bind(user_account_id)
+            .bind(photo_url)
+            .bind(tenant_slug)
+            .execute(control.pool())
+            .await
+            .context("failed to sync the student photograph to the tenant membership")?;
+        }
         Ok(Some(json!({
             "id": row.try_get::<Uuid, _>("id")?,
             "name": row.try_get::<String, _>("full_name")?,
@@ -519,6 +565,12 @@ impl AppState {
                           ''
                       ) AS department,
                       student.phone, student.email, student.status,
+                      COALESCE(
+                          NULLIF(student.profile ->> 'yearOfStudy', ''),
+                          NULLIF(student.profile ->> 'year', ''),
+                          NULLIF(student.academic_year, '')
+                      ) AS year_of_study,
+                      NULLIF(student.profile ->> 'section', '') AS section,
                       NULLIF(student.profile ->> 'photoUrl', '') AS photo_url,
                       student.created_at, student.updated_at
                FROM core.students student
@@ -546,6 +598,8 @@ impl AppState {
                     "mobileNumber": row.try_get::<Option<String>, _>("phone")?.unwrap_or_default(),
                     "email": row.try_get::<Option<String>, _>("email")?.unwrap_or_default(),
                     "status": row.try_get::<String, _>("status")?,
+                    "yearOfStudy": row.try_get::<Option<String>, _>("year_of_study")?,
+                    "section": row.try_get::<Option<String>, _>("section")?,
                     "photoUrl": row.try_get::<Option<String>, _>("photo_url")?,
                     "createdAt": row.try_get::<DateTime<Utc>, _>("created_at")?,
                     "updatedAt": row.try_get::<DateTime<Utc>, _>("updated_at")?,
@@ -878,9 +932,26 @@ impl AppState {
         password: &str,
         tenant_slug: Option<&str>,
     ) -> anyhow::Result<Option<AuthenticatedIdentity>> {
-        let email = email.trim().to_ascii_lowercase();
+        // The public request field remains `email` for wire compatibility, but
+        // an institution may issue either an email address or a mobile number
+        // as the username. Phone matching ignores formatting and country-code
+        // presentation while still requiring the tenant membership.
+        let identifier = email.trim().to_ascii_lowercase();
+        let phone_digits = if identifier.contains('@') {
+            String::new()
+        } else {
+            identifier
+                .chars()
+                .filter(|character| character.is_ascii_digit())
+                .collect::<String>()
+        };
+        let phone_digits = if phone_digits.len() >= 10 {
+            phone_digits
+        } else {
+            String::new()
+        };
         if let Some(database) = &self.database {
-            let throttle_key = login_throttle_key(&email, tenant_slug);
+            let throttle_key = login_throttle_key(&identifier, tenant_slug);
             let blocked = sqlx::query_scalar::<_, bool>(
                 r#"SELECT COALESCE(blocked_until > now(), false)
                    FROM identity.login_throttle
@@ -899,8 +970,9 @@ impl AppState {
                 return Ok(None);
             }
 
-            let row = sqlx::query(
-                r#"SELECT u.id::text AS user_id, u.email, u.display_name, u.initials,
+            let row = if phone_digits.is_empty() {
+                sqlx::query(
+                    r#"SELECT u.id::text AS user_id, u.email, u.display_name, u.initials,
                           m.roles, m.profile, t.slug, t.code, t.name, t.city
                    FROM identity.users u
                    JOIN identity.tenant_memberships m ON m.user_id = u.id
@@ -911,12 +983,44 @@ impl AppState {
                      AND u.active AND m.active AND t.status = 'active'
                    ORDER BY m.is_primary DESC, t.name
                    LIMIT 1"#,
-            )
-            .bind(&email)
-            .bind(password)
-            .bind(tenant_slug)
-            .fetch_optional(database.pool())
-            .await
+                )
+                .bind(&identifier)
+                .bind(password)
+                .bind(tenant_slug)
+                .fetch_optional(database.pool())
+                .await
+            } else {
+                // Materialize the inexpensive phone/tenant match before running
+                // bcrypt. Otherwise PostgreSQL may evaluate crypt() for every
+                // active membership while scanning the JSON profile column.
+                sqlx::query(
+                    r#"WITH candidates AS MATERIALIZED (
+                         SELECT u.id::text AS user_id, u.email, u.display_name, u.initials,
+                                u.password_hash, m.roles, m.profile,
+                                t.slug, t.code, t.name, t.city, m.is_primary
+                         FROM identity.users u
+                         JOIN identity.tenant_memberships m ON m.user_id = u.id
+                         JOIN platform.tenants t ON t.id = m.tenant_id
+                         WHERE right(regexp_replace(COALESCE(m.profile ->> 'phone', ''), '[^0-9]', '', 'g'), 10)
+                                   = right($1::text, 10)
+                           AND ($2::text IS NULL OR t.slug = $2)
+                           AND u.active AND m.active AND t.status = 'active'
+                         ORDER BY m.is_primary DESC, t.name
+                         LIMIT 20
+                       )
+                       SELECT user_id, email, display_name, initials,
+                              roles, profile, slug, code, name, city
+                       FROM candidates
+                       WHERE password_hash = crypt($3, password_hash)
+                       ORDER BY is_primary DESC, name
+                       LIMIT 1"#,
+                )
+                .bind(&phone_digits)
+                .bind(tenant_slug)
+                .bind(password)
+                .fetch_optional(database.pool())
+                .await
+            }
             .context("failed to authenticate identity")?;
             let Some(row) = row else {
                 sqlx::query(
@@ -1008,7 +1112,7 @@ impl AppState {
 
         let identities = self.identities.read().await;
         let identity = identities.values().find(|identity| {
-            identity.student.email == email
+            identity.student.email == identifier
                 && tenant_slug.is_none_or(|tenant| identity.student.tenant_id == tenant)
         });
         Ok(identity
@@ -1874,6 +1978,10 @@ impl AppState {
         let rows = sqlx::query(
             r#"SELECT user_account.id, user_account.email, user_account.display_name,
                       user_account.initials, user_account.account_type, user_account.active,
+                      COALESCE(
+                          NULLIF(membership.profile ->> 'yearOfStudy', ''),
+                          NULLIF(membership.profile ->> 'year', '')
+                      ) AS year_of_study,
                       COALESCE((
                           SELECT jsonb_agg(jsonb_build_object(
                               'id', role.id, 'key', role.role_key, 'name', role.name,
@@ -1905,6 +2013,7 @@ impl AppState {
                     "initials": row.try_get::<String, _>("initials")?,
                     "accountType": row.try_get::<String, _>("account_type")?,
                     "active": row.try_get::<bool, _>("active")?,
+                    "yearOfStudy": row.try_get::<Option<String>, _>("year_of_study")?,
                     "roles": row.try_get::<Value, _>("roles")?,
                 }))
             })
@@ -2860,6 +2969,9 @@ impl AppState {
         tenant_id: &str,
         student_id: &str,
     ) -> anyhow::Result<StoredAppState> {
+        if tenant_id == "supercampus-control" {
+            return Ok(default_app_state());
+        }
         if self.database.is_some() {
             let database = self.tenant_database(tenant_id).await?;
             let row = sqlx::query(
@@ -2895,6 +3007,9 @@ impl AppState {
         student_id: String,
         state: Value,
     ) -> anyhow::Result<StoredAppState> {
+        if tenant_id == "supercampus-control" {
+            return Ok(default_app_state());
+        }
         if self.database.is_some() {
             let database = self.tenant_database(&tenant_id).await?;
             let tenant_uuid = ensure_tenant(&database, &tenant_id).await?;
@@ -3375,7 +3490,7 @@ fn default_navigation_sections() -> Vec<NavigationSection> {
             "Fees & Finance",
             "Database",
             &[],
-            Some("fees"),
+            Some("tuition_fee"),
             false,
         ),
         (
@@ -3456,6 +3571,15 @@ fn default_navigation_sections() -> Vec<NavigationSection> {
             "Theme",
             "Palette",
             &["platform.configuration.update"],
+            None,
+            false,
+        ),
+        (
+            "campus",
+            "settings",
+            "Campus Boundary",
+            "MapPin",
+            &["platform.configuration.read"],
             None,
             false,
         ),

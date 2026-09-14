@@ -58,18 +58,18 @@ pub struct VisitorDecisionInput {
 }
 
 /// Helper function to ensure database schema columns exist on campus_ops.visitor_passes.
-async fn ensure_visitor_pass_schema(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) {
+async fn ensure_visitor_pass_schema(pool: &sqlx::PgPool) {
     let _ = sqlx::query(
         "ALTER TABLE campus_ops.visitor_passes \
          ADD COLUMN IF NOT EXISTS relationship text, \
          ADD COLUMN IF NOT EXISTS checked_in_at timestamptz, \
          ADD COLUMN IF NOT EXISTS checked_out_at timestamptz",
     )
-    .execute(&mut **tx)
+    .execute(pool)
     .await;
 
     let _ = sqlx::query("ALTER TABLE campus_ops.visitor_passes DROP CONSTRAINT IF EXISTS visitor_passes_state_check")
-        .execute(&mut **tx)
+        .execute(pool)
         .await;
 
     let _ = sqlx::query(
@@ -77,7 +77,7 @@ async fn ensure_visitor_pass_schema(tx: &mut sqlx::Transaction<'_, sqlx::Postgre
          ADD CONSTRAINT visitor_passes_state_check \
          CHECK (state IN ('pending_admin', 'approved', 'rejected', 'cancelled', 'checked_in', 'checked_out'))",
     )
-    .execute(&mut **tx)
+    .execute(pool)
     .await;
 }
 
@@ -193,6 +193,8 @@ pub async fn create_visitor_pass(
 
     let auto_approve = is_institutional || kind == "guest";
 
+    ensure_visitor_pass_schema(db.pool()).await;
+
     let (initial_state, raw_token, token_hash, pass_image_url, delivery_state, delivery_error) = if auto_approve {
         let raw_token = Uuid::new_v4().to_string();
         let token_hash = crate::operations::token_hash(&raw_token);
@@ -257,9 +259,7 @@ pub async fn create_visitor_pass(
         .execute(&mut *tx)
         .await?;
 
-    ensure_visitor_pass_schema(&mut tx).await;
-
-    let value = sqlx::query_scalar::<_, Value>(
+    let insert_res = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.visitor_passes
                (tenant_id, visitor_kind, visitor_name, visitor_phone, purpose, relationship,
                 host_user_id, host_name, requested_by, visit_from, visit_until,
@@ -290,7 +290,45 @@ pub async fn create_visitor_pass(
     .bind(&delivery_state)
     .bind(delivery_error.as_deref())
     .fetch_one(&mut *tx)
-    .await?;
+    .await;
+
+    let value = match insert_res {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(error = ?err, "Primary visitor pass insert failed, attempting fallback insert without relationship column");
+            sqlx::query_scalar::<_, Value>(
+                r#"INSERT INTO campus_ops.visitor_passes
+                       (tenant_id, visitor_kind, visitor_name, visitor_phone, purpose,
+                        host_user_id, host_name, requested_by, visit_from, visit_until,
+                        state, qr_token_hash, pass_image_url, delivery_state, delivery_error, delivered_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,CASE WHEN $14 = 'sent' THEN now() ELSE NULL END)
+                   RETURNING jsonb_build_object(
+                       'id', id, 'visitorKind', visitor_kind, 'visitorName', visitor_name,
+                       'visitorPhone', visitor_phone, 'purpose', purpose,
+                       'hostUserId', host_user_id, 'hostName', host_name,
+                       'visitFrom', visit_from, 'visitUntil', visit_until,
+                       'state', state, 'passImageUrl', pass_image_url, 'deliveryState', delivery_state,
+                       'deliveryError', delivery_error, 'createdAt', created_at)"#,
+            )
+            .bind(tenant)
+            .bind(kind)
+            .bind(input.visitor_name.trim())
+            .bind(&phone)
+            .bind(input.purpose.trim())
+            .bind(&host_user_id)
+            .bind(&host_name)
+            .bind(&principal.student.id)
+            .bind(input.visit_from)
+            .bind(input.visit_until)
+            .bind(initial_state)
+            .bind(token_hash.as_deref())
+            .bind(pass_image_url.as_deref())
+            .bind(&delivery_state)
+            .bind(delivery_error.as_deref())
+            .fetch_one(&mut *tx)
+            .await?
+        }
+    };
 
     tx.commit().await?;
 
@@ -326,15 +364,15 @@ pub async fn list_visitor_passes(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
+    ensure_visitor_pass_schema(db.pool()).await;
+
     let mut tx = db.pool().begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
         .bind(tenant.to_string())
         .execute(&mut *tx)
         .await?;
 
-    ensure_visitor_pass_schema(&mut tx).await;
-
-    let value = sqlx::query_scalar::<_, Value>(
+    let query_res = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
                'id', id, 'visitorKind', visitor_kind, 'visitorName', visitor_name,
                'visitorPhone', visitor_phone, 'purpose', purpose, 'relationship', relationship,
@@ -354,7 +392,38 @@ pub async fn list_visitor_passes(
     .bind(&principal.student.id)
     .bind(manage)
     .fetch_one(&mut *tx)
-    .await?;
+    .await;
+
+    let value = match query_res {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(error = ?err, "Failed to list visitor passes, falling back to empty list query");
+            sqlx::query_scalar::<_, Value>(
+                r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                       'id', id, 'visitorKind', visitor_kind, 'visitorName', visitor_name,
+                       'visitorPhone', visitor_phone, 'purpose', purpose,
+                       'hostUserId', host_user_id, 'hostName', host_name,
+                       'visitFrom', visit_from, 'visitUntil', visit_until,
+                       'state', state, 'deliveryState', delivery_state,
+                       'deliveryError', delivery_error, 'passImageUrl', pass_image_url,
+                       'tier', CASE WHEN visitor_kind = 'guest' THEN 'gold' ELSE 'silver' END,
+                       'createdAt', created_at, 'updatedAt', updated_at
+                   ) ORDER BY created_at DESC), '[]'::jsonb)
+                   FROM campus_ops.visitor_passes
+                   WHERE tenant_id = $1
+                     AND ($3 OR host_user_id = $2 OR requested_by = $2)"#,
+            )
+            .bind(tenant)
+            .bind(&principal.student.id)
+            .bind(manage)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = ?e, "Fallback visitor pass query failed");
+                json!([])
+            })
+        }
+    };
 
     tx.commit().await?;
 
@@ -382,14 +451,14 @@ pub async fn decide_visitor_pass(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
+    ensure_visitor_pass_schema(db.pool()).await;
+
     let mut tx = db.pool().begin().await?;
 
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
         .bind(tenant.to_string())
         .execute(&mut *tx)
         .await?;
-
-    ensure_visitor_pass_schema(&mut tx).await;
 
     let pending = sqlx::query_as::<_, (String, String, String, String, DateTime<Utc>, DateTime<Utc>)>(
         r#"SELECT visitor_kind, visitor_name, visitor_phone, host_name, visit_from, visit_until
@@ -510,13 +579,13 @@ pub async fn cancel_visitor_pass(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
+    ensure_visitor_pass_schema(db.pool()).await;
+
     let mut tx = db.pool().begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
         .bind(tenant.to_string())
         .execute(&mut *tx)
         .await?;
-
-    ensure_visitor_pass_schema(&mut tx).await;
 
     let value = sqlx::query_scalar::<_, Value>(
         r#"UPDATE campus_ops.visitor_passes

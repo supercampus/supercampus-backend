@@ -309,6 +309,12 @@ pub async fn list_visitor_passes(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
+    let mut tx = db.pool().begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await?;
+
     let value = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
                'id', id, 'visitorKind', visitor_kind, 'visitorName', visitor_name,
@@ -328,8 +334,10 @@ pub async fn list_visitor_passes(
     .bind(tenant)
     .bind(&principal.student.id)
     .bind(manage)
-    .fetch_one(db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok(Json(crate::models::ApiResponse::new(json!({
         "visitors": value,
@@ -354,6 +362,13 @@ pub async fn decide_visitor_pass(
 
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
+
+    // Set tenant context for RLS. Using false (session-level) so the setting
+    // persists across multiple queries on this pooled connection.
+    sqlx::query("SELECT set_config('app.tenant_id', $1, false)")
+        .bind(tenant.to_string())
+        .execute(db.pool())
+        .await?;
 
     let pending = sqlx::query_as::<_, (String, String, String, String, DateTime<Utc>, DateTime<Utc>)>(
         r#"SELECT visitor_kind, visitor_name, visitor_phone, host_name, visit_from, visit_until
@@ -468,6 +483,12 @@ pub async fn cancel_visitor_pass(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
+    let mut tx = db.pool().begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await?;
+
     let value = sqlx::query_scalar::<_, Value>(
         r#"UPDATE campus_ops.visitor_passes
            SET state = 'cancelled', updated_at = now()
@@ -476,9 +497,11 @@ pub async fn cancel_visitor_pass(
     )
     .bind(tenant)
     .bind(pass_id)
-    .fetch_optional(db.pool())
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::Conflict("This visitor pass cannot be cancelled".into()))?;
+
+    tx.commit().await?;
 
     Ok(Json(crate::models::ApiResponse::new(value)))
 }

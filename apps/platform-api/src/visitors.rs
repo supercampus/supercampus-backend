@@ -28,6 +28,30 @@ use crate::{
 };
 use supercampus_notifications::whatsapp::{DeliveryOutcome, WhatsAppMessage};
 
+/// Helper function to ensure database schema columns exist on campus_ops.visitor_passes.
+async fn ensure_visitor_pass_schema(pool: &sqlx::PgPool) {
+    let _ = sqlx::query(
+        "ALTER TABLE campus_ops.visitor_passes \
+         ADD COLUMN IF NOT EXISTS relationship text, \
+         ADD COLUMN IF NOT EXISTS checked_in_at timestamptz, \
+         ADD COLUMN IF NOT EXISTS checked_out_at timestamptz",
+    )
+    .execute(pool)
+    .await;
+
+    let _ = sqlx::query("ALTER TABLE campus_ops.visitor_passes DROP CONSTRAINT IF EXISTS visitor_passes_state_check")
+        .execute(pool)
+        .await;
+
+    let _ = sqlx::query(
+        "ALTER TABLE campus_ops.visitor_passes \
+         ADD CONSTRAINT visitor_passes_state_check \
+         CHECK (state IN ('pending_admin', 'approved', 'rejected', 'cancelled', 'checked_in', 'checked_out'))",
+    )
+    .execute(pool)
+    .await;
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VisitorPassInput {
@@ -193,6 +217,8 @@ pub async fn create_visitor_pass(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
+    ensure_visitor_pass_schema(db.pool()).await;
+
     let auto_approve = is_institutional || kind == "guest";
 
     let (initial_state, raw_token, token_hash, pass_image_url, delivery_state, delivery_error) = if auto_approve {
@@ -309,6 +335,8 @@ pub async fn list_visitor_passes(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
+    ensure_visitor_pass_schema(db.pool()).await;
+
     let mut tx = db.pool().begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
         .bind(tenant.to_string())
@@ -363,11 +391,13 @@ pub async fn decide_visitor_pass(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
-    // Set tenant context for RLS. Using false (session-level) so the setting
-    // persists across multiple queries on this pooled connection.
-    sqlx::query("SELECT set_config('app.tenant_id', $1, false)")
+    ensure_visitor_pass_schema(db.pool()).await;
+
+    let mut tx = db.pool().begin().await?;
+
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
         .bind(tenant.to_string())
-        .execute(db.pool())
+        .execute(&mut *tx)
         .await?;
 
     let pending = sqlx::query_as::<_, (String, String, String, String, DateTime<Utc>, DateTime<Utc>)>(
@@ -377,7 +407,7 @@ pub async fn decide_visitor_pass(
     )
     .bind(tenant)
     .bind(pass_id)
-    .fetch_optional(db.pool())
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::Conflict("This pass is not awaiting a decision".into()))?;
 
@@ -392,8 +422,10 @@ pub async fn decide_visitor_pass(
         .bind(pass_id)
         .bind(&principal.student.id)
         .bind(input.note.as_deref())
-        .fetch_one(db.pool())
+        .fetch_one(&mut *tx)
         .await?;
+
+        tx.commit().await?;
         return Ok(Json(crate::models::ApiResponse::new(value)));
     }
 
@@ -431,7 +463,7 @@ pub async fn decide_visitor_pass(
     .bind(&image_url)
     .bind(&principal.student.id)
     .bind(input.note.as_deref())
-    .execute(db.pool())
+    .execute(&mut *tx)
     .await?;
 
     let (delivery_state, delivery_error) = dispatch_visitor_whatsapp(
@@ -463,8 +495,10 @@ pub async fn decide_visitor_pass(
     .bind(pass_id)
     .bind(&delivery_state)
     .bind(delivery_error.as_deref())
-    .fetch_one(db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok(Json(crate::models::ApiResponse::new(value)))
 }
@@ -482,6 +516,8 @@ pub async fn cancel_visitor_pass(
     )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
+
+    ensure_visitor_pass_schema(db.pool()).await;
 
     let mut tx = db.pool().begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")

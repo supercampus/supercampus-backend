@@ -21,6 +21,8 @@ pub struct CreateOrderRequest {
     currency: Option<String>,
     receipt: Option<String>,
     purpose: Option<String>,
+    #[serde(rename = "shopKey")]
+    shop_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -122,6 +124,7 @@ pub async fn create_order(
                 "tenantId": principal.student.tenant_id,
                 "studentId": principal.student.id,
                 "purpose": purpose,
+                "shopKey": request.shop_key.as_deref().unwrap_or("mec-canteen"),
             },
         }))
         .send()
@@ -288,16 +291,18 @@ async fn credit_wallet(
             .ok_or_else(|| ApiError::NotFound("Tenant not found".into()))?;
     let mut transaction = database.pool().begin().await?;
     let idempotency_key = format!("razorpay:{payment_id}");
+    let shop_key = order.notes.get("shopKey").and_then(Value::as_str).unwrap_or("mec-canteen");
     let inserted = sqlx::query(
         r#"INSERT INTO campus_ops.canteen_wallet_transactions
-           (tenant_id,user_id,amount,transaction_type,description,reference_id,
+           (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,
             idempotency_key,actor_user_id)
-           VALUES($1,$2,$3,'online_top_up','Razorpay wallet top-up',$4,$5,$2)
+           VALUES($1,$2,$3,$4,'online_top_up','Razorpay wallet top-up',$5,$6,$2)
            ON CONFLICT(tenant_id,idempotency_key) DO NOTHING
            RETURNING id,created_at"#,
     )
     .bind(tenant_id)
     .bind(&principal.student.id)
+    .bind(shop_key)
     .bind(amount)
     .bind(order_id)
     .bind(&idempotency_key)
@@ -306,9 +311,9 @@ async fn credit_wallet(
 
     let balance = if inserted.is_some() {
         sqlx::query_scalar::<_, f64>(
-            r#"INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,balance,version)
-               VALUES($1,$2,$3,1)
-               ON CONFLICT(tenant_id,user_id) DO UPDATE SET
+            r#"INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version)
+               VALUES($1,$2,$3,$4,1)
+               ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET
                  balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,
                  version=campus_ops.canteen_wallets.version+1,
                  updated_at=now()
@@ -316,15 +321,17 @@ async fn credit_wallet(
         )
         .bind(tenant_id)
         .bind(&principal.student.id)
+        .bind(shop_key)
         .bind(amount)
         .fetch_one(&mut *transaction)
         .await?
     } else {
         sqlx::query_scalar::<_, f64>(
-            "SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2",
+            "SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 AND shop_key=$3",
         )
         .bind(tenant_id)
         .bind(&principal.student.id)
+        .bind(shop_key)
         .fetch_optional(&mut *transaction)
         .await?
         .unwrap_or(0.0)
@@ -341,6 +348,7 @@ async fn credit_wallet(
             .map(|id| id.to_string())
             .unwrap_or_else(|| payment_id.to_owned()),
         "amount": amount,
+        "shopKey": shop_key,
         "transactionType": "online_top_up",
         "description": "Razorpay wallet top-up",
         "referenceId": order_id,

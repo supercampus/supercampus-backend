@@ -1108,7 +1108,7 @@ async fn canteen_store(
       SELECT jsonb_build_object(
         'user', jsonb_build_object('id',$2::text,'name',$3::text,'email',$4::text,
           'rollNumber',$5::text,'department',$6::text),
-        'walletBalance', COALESCE((SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2),0),
+        'walletBalances', COALESCE((SELECT jsonb_object_agg(shop_key, balance::float8) FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2), '{}'::jsonb),
         'menu', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',item.id,'name',item.name,
           'description',item.description,'store',resolved_shop.shop_key,'category',item.category,
           'price',item.price::float8,'actualPrice',COALESCE(item.actual_price,item.price)::float8,
@@ -1140,7 +1140,7 @@ async fn canteen_store(
           ORDER BY created_at DESC) FROM campus_ops.canteen_orders
           WHERE tenant_id=$1 AND (($7 AND (NOT $9 OR store = ANY($11))) OR customer_user_id=$2)), '[]'::jsonb),
         'walletTransactions', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,
-          'amount',amount::float8,'transactionType',transaction_type,'description',description,
+          'shopKey',shop_key,'amount',amount::float8,'transactionType',transaction_type,'description',description,
           'referenceId',reference_id,'createdAt',created_at) ORDER BY created_at DESC)
           FROM campus_ops.canteen_wallet_transactions WHERE tenant_id=$1 AND user_id=$2), '[]'::jsonb),
         'staffState', jsonb_build_object(
@@ -1855,17 +1855,17 @@ async fn place_order(
         }
     }
 
-    // One wallet serves every shop, so the balance is checked once against the
-    // whole cart rather than shop by shop.
-    let balance=sqlx::query_scalar::<_,f64>("SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE")
-      .bind(tenant).bind(&principal.student.id).fetch_one(&mut *tx).await?;
-    if balance + 0.0001 < grand_total {
-        return Err(ApiError::Conflict("Wallet balance is insufficient".into()));
+    for (store, _store_lines, store_total) in &baskets {
+        let balance=sqlx::query_scalar::<_,f64>("SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 AND shop_key=$3 FOR UPDATE")
+          .bind(tenant).bind(&principal.student.id).bind(store).fetch_optional(&mut *tx).await?.unwrap_or(0.0);
+        if balance + 0.0001 < *store_total {
+            return Err(ApiError::Conflict(format!("Insufficient wallet balance for {}", store)));
+        }
     }
 
     let mut orders = Vec::new();
     let mut transactions = Vec::new();
-    let mut new_balance = balance;
+    let mut new_balance = 0.0;
     for (store, store_lines, store_total) in baskets {
         let raw_qr = Uuid::new_v4().to_string();
         let hash = token_hash(&raw_qr);
@@ -1885,8 +1885,8 @@ async fn place_order(
 
         // Debiting per order keeps the ledger aligned with what can be refunded:
         // rejecting one shop's order returns exactly that order's money.
-        new_balance=sqlx::query_scalar::<_,f64>("UPDATE campus_ops.canteen_wallets SET balance=balance-$3,version=version+1,updated_at=now() WHERE tenant_id=$1 AND user_id=$2 RETURNING balance::float8")
-          .bind(tenant).bind(&principal.student.id).bind(store_total).fetch_one(&mut *tx).await?;
+        new_balance=sqlx::query_scalar::<_,f64>("UPDATE campus_ops.canteen_wallets SET balance=balance-$3,version=version+1,updated_at=now() WHERE tenant_id=$1 AND user_id=$2 AND shop_key=$4 RETURNING balance::float8")
+          .bind(tenant).bind(&principal.student.id).bind(store_total).bind(&store).fetch_one(&mut *tx).await?;
 
         // The caller sends one key for the cart; each shop's debit needs its own
         // so the uniqueness guard does not collapse them into a single row.
@@ -1895,11 +1895,11 @@ async fn place_order(
             .as_ref()
             .map(|key| format!("{key}:{store}"));
         let transaction=sqlx::query_scalar::<_,Value>(r#"INSERT INTO campus_ops.canteen_wallet_transactions
-          (tenant_id,user_id,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id)
-          VALUES($1,$2,$3,'order_debit',$6,$4,$5,$2)
+          (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id)
+          VALUES($1,$2,$3,$4,'order_debit',$7,$5,$6,$2)
           RETURNING jsonb_build_object('id',id,'amount',amount::float8,'transactionType',transaction_type,
           'description',description,'referenceId',reference_id,'createdAt',created_at)"#)
-          .bind(tenant).bind(&principal.student.id).bind(-store_total).bind(order_id.to_string())
+          .bind(tenant).bind(&principal.student.id).bind(&store).bind(-store_total).bind(order_id.to_string())
           .bind(idempotency_key).bind(format!("{} order", shop_label(&store)))
           .fetch_one(&mut *tx).await?;
 
@@ -2235,23 +2235,23 @@ async fn pay_laundry_charge(
             "This laundry charge cannot be paid".into(),
         ));
     }
-    sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
+    sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key) VALUES($1,$2,'mec-laundry') ON CONFLICT DO NOTHING")
         .bind(tenant).bind(&principal.student.id).execute(&mut *tx).await?;
     let balance = sqlx::query_scalar::<_, f64>(
-        "SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE",
+        "SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 AND shop_key='mec-laundry' FOR UPDATE",
     )
     .bind(tenant).bind(&principal.student.id).fetch_one(&mut *tx).await?;
     if balance + 0.0001 < charge.2 {
         return Err(ApiError::Conflict("Wallet balance is insufficient".into()));
     }
     let new_balance = sqlx::query_scalar::<_, f64>(
-        "UPDATE campus_ops.canteen_wallets SET balance=balance-$3,version=version+1,updated_at=now() WHERE tenant_id=$1 AND user_id=$2 RETURNING balance::float8",
+        "UPDATE campus_ops.canteen_wallets SET balance=balance-$3,version=version+1,updated_at=now() WHERE tenant_id=$1 AND user_id=$2 AND shop_key='mec-laundry' RETURNING balance::float8",
     )
     .bind(tenant).bind(&principal.student.id).bind(charge.2).fetch_one(&mut *tx).await?;
     let transaction = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.canteen_wallet_transactions
-           (tenant_id,user_id,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id)
-           VALUES($1,$2,$3,'order_debit','Campus Laundry payment',$4,$5,$2)
+           (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id)
+           VALUES($1,$2,'mec-laundry',$3,'order_debit','Campus Laundry payment',$4,$5,$2)
            RETURNING jsonb_build_object('id',id,'amount',amount::float8,
              'transactionType',transaction_type,'description',description,
              'referenceId',reference_id,'createdAt',created_at)"#,
@@ -2334,10 +2334,10 @@ async fn update_order_status(
    'tokenNumber',token_number,'updatedAt',updated_at)"#).bind(tenant).bind(order_id).bind(&input.status).bind(&principal.student.id).bind(input.reason)
    .fetch_one(&mut *tx).await?;
     if input.status == "rejected" && current.0 != "rejected" {
-        sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,balance,version) VALUES($1,$2,$3,1) ON CONFLICT(tenant_id,user_id) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now()")
-            .bind(tenant).bind(&current.1).bind(current.2).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO campus_ops.canteen_wallet_transactions(tenant_id,user_id,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id) VALUES($1,$2,$3,'refund','Rejected canteen order refund',$4,$5,$6) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING")
-            .bind(tenant).bind(&current.1).bind(current.2).bind(order_id.to_string())
+        sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version) VALUES($1,$2,$3,$4,1) ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now()")
+            .bind(tenant).bind(&current.1).bind(&current.3).bind(current.2).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO campus_ops.canteen_wallet_transactions(tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id) VALUES($1,$2,$3,$4,'refund','Rejected canteen order refund',$5,$6,$7) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING")
+            .bind(tenant).bind(&current.1).bind(&current.3).bind(current.2).bind(order_id.to_string())
             .bind(format!("order-refund-{order_id}")).bind(&principal.student.id).execute(&mut *tx).await?;
         notify_tx(
             &mut tx,
@@ -2428,10 +2428,10 @@ async fn scan_order(
     let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.canteen_orders SET status=$3,handled_by=$4,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'status',status,'customerUserId',customer_user_id)")
  .bind(tenant).bind(current.0).bind(&desired).bind(&principal.student.id).fetch_one(&mut *tx).await?;
     if desired == "rejected" && current.1 != "rejected" {
-        sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,balance,version) VALUES($1,$2,$3,1) ON CONFLICT(tenant_id,user_id) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now()")
-            .bind(tenant).bind(&current.2).bind(current.3).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO campus_ops.canteen_wallet_transactions(tenant_id,user_id,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id) VALUES($1,$2,$3,'refund','Rejected canteen order refund',$4,$5,$6) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING")
-            .bind(tenant).bind(&current.2).bind(current.3).bind(current.0.to_string())
+        sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version) VALUES($1,$2,$3,$4,1) ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now()")
+            .bind(tenant).bind(&current.2).bind(&current.4).bind(current.3).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO campus_ops.canteen_wallet_transactions(tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id) VALUES($1,$2,$3,$4,'refund','Rejected canteen order refund',$5,$6,$7) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING")
+            .bind(tenant).bind(&current.2).bind(&current.4).bind(current.3).bind(current.0.to_string())
             .bind(format!("order-refund-{}", current.0)).bind(&principal.student.id).execute(&mut *tx).await?;
         notify_tx(
             &mut tx,
@@ -2472,6 +2472,7 @@ async fn scan_order(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TopUpRequest {
     amount: f64,
+    shop_key: Option<String>,
     source: Option<String>,
     reference: Option<String>,
     idempotency_key: Option<String>,
@@ -2620,8 +2621,8 @@ async fn wallet_directory(
               NULLIF(student.academic_year,'')
             ),
             'photoUrl', NULLIF(student.profile ->> 'photoUrl', ''),
-            'balance', COALESCE(wallet.balance, 0)::float8,
-            'updatedAt', wallet.updated_at,
+            'walletBalances', COALESCE((SELECT jsonb_object_agg(w.shop_key, w.balance::float8) FROM campus_ops.canteen_wallets w WHERE w.tenant_id=student.tenant_id AND w.user_id=student.user_account_id::text), '{}'::jsonb),
+            'updatedAt', (SELECT MAX(w.updated_at) FROM campus_ops.canteen_wallets w WHERE w.tenant_id=student.tenant_id AND w.user_id=student.user_account_id::text),
             'lastTransactionAt', (
               SELECT transaction.created_at
               FROM campus_ops.canteen_wallet_transactions transaction
@@ -2637,9 +2638,6 @@ async fn wallet_directory(
           LEFT JOIN core.departments department
             ON department.tenant_id=student.tenant_id
            AND department.id::text=student.department_id
-          LEFT JOIN campus_ops.canteen_wallets wallet
-            ON wallet.tenant_id=student.tenant_id
-           AND wallet.user_id=student.user_account_id::text
           WHERE student.tenant_id=$1
             AND student.user_account_id IS NOT NULL
             AND student.status IN ('provisional','active')
@@ -2674,6 +2672,7 @@ async fn wallet_transactions(
         FROM (
           SELECT jsonb_build_object(
             'id', transaction.id,
+            'shopKey', transaction.shop_key,
             'userId', transaction.user_id,
             'studentName', COALESCE(student.full_name, 'Campus user'),
             'studentNumber', COALESCE(student.student_number, ''),
@@ -2743,16 +2742,17 @@ async fn top_up_wallet(
         ));
     }
     let target_user_id = target_user_id.to_string();
+    let shop_key = input.shop_key.as_deref().unwrap_or("mec-canteen");
     let mut tx = db.pool().begin().await?;
-    let balance=sqlx::query_scalar::<_,f64>("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,balance,version) VALUES($1,$2,$3,1) ON CONFLICT(tenant_id,user_id) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now() RETURNING balance::float8")
- .bind(tenant).bind(&target_user_id).bind(input.amount).fetch_one(&mut *tx).await?;
+    let balance=sqlx::query_scalar::<_,f64>("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version) VALUES($1,$2,$3,$4,1) ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now() RETURNING balance::float8")
+ .bind(tenant).bind(&target_user_id).bind(shop_key).bind(input.amount).fetch_one(&mut *tx).await?;
     let kind = if input.source.as_deref() == Some("online") {
         "online_top_up"
     } else {
         "manual_top_up"
     };
-    let transaction=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.canteen_wallet_transactions(tenant_id,user_id,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id) VALUES($1,$2,$3,$4,'Wallet top-up',$5,$6,$7) RETURNING jsonb_build_object('id',id,'amount',amount::float8,'transactionType',transaction_type,'description',description,'createdAt',created_at)")
- .bind(tenant).bind(&target_user_id).bind(input.amount).bind(kind).bind(input.reference).bind(input.idempotency_key).bind(&principal.student.id).fetch_one(&mut *tx).await?;
+    let transaction=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.canteen_wallet_transactions(tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id) VALUES($1,$2,$3,$4,$5,'Wallet top-up',$6,$7,$8) RETURNING jsonb_build_object('id',id,'amount',amount::float8,'transactionType',transaction_type,'description',description,'createdAt',created_at)")
+ .bind(tenant).bind(&target_user_id).bind(shop_key).bind(input.amount).bind(kind).bind(input.reference).bind(input.idempotency_key).bind(&principal.student.id).fetch_one(&mut *tx).await?;
     let payload = json!({"userId":target_user_id,"balance":balance,"transaction":transaction});
     emit_tx(
         &mut tx,

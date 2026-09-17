@@ -33,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
         "apply-canteen-shop-availability" => apply_canteen_shop_availability().await,
         "apply-laundry-charge-workflow" => apply_laundry_charge_workflow().await,
         "align-mec-canteen-owner" => align_mec_canteen_owner().await,
+        "apply-separate-store-wallets" => apply_separate_store_wallets().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
@@ -1436,6 +1437,40 @@ async fn copy_query(
     sink.finish()
         .await
         .with_context(|| format!("failed to finish importing {table}"))?;
+    Ok(())
+}
+
+async fn apply_separate_store_wallets() -> anyhow::Result<()> {
+    const SQL: &str =
+        include_str!("../../../migrations/runtime/0109_separate_store_wallets.sql");
+    let control_url = required_environment("CONTROL_DATABASE_URL")?;
+    let control = Database::connect(&control_url).await?;
+
+    let databases: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT tenant.slug, registry.database_name
+           FROM platform.tenant_databases registry
+           JOIN platform.tenants tenant ON tenant.id = registry.tenant_id
+           WHERE registry.status = 'active' AND tenant.status = 'active'
+           ORDER BY tenant.slug"#,
+    )
+    .fetch_all(control.pool())
+    .await
+    .context("failed to list tenant databases")?;
+
+    for (slug, db_name) in &databases {
+        let tenant = control
+            .provision(slug, db_name)
+            .await
+            .with_context(|| format!("failed to provision {slug} database"))?;
+        sqlx::raw_sql(SQL)
+            .execute(tenant.pool())
+            .await
+            .with_context(|| format!("failed to apply separate store wallets to {slug}"))?;
+    }
+    println!(
+        "applied separate store wallets to control and {} tenant database(s)",
+        databases.len()
+    );
     Ok(())
 }
 

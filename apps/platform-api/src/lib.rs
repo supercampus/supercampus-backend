@@ -169,6 +169,7 @@ fn is_allowed_cors_origin(origin: &str, configured: &[HeaderValue], allow_local:
     if matches!(
         origin,
         "https://supercampusapplication-e0miwj-dcd788-200-141-5-86.sslip.io"
+            | "https://supercampusapplication-e0miwj-ffd5c5-200-141-5-86.sslip.io"
             | "https://supercampus.ai"
             | "https://www.supercampus.ai"
     ) {

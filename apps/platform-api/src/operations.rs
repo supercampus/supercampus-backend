@@ -3697,21 +3697,16 @@ async fn create_gatepass_request(
             "Enter valid pass dates and reason".into(),
         ));
     }
-    if input.pass_type == "leave_pass"
-        && input.departure_at.date_naive() != input.return_at.date_naive()
-    {
-        return Err(ApiError::BadRequest(
-            "Leave pass must start and finish on the same college day".into(),
-        ));
-    }
-    let destination = if input.pass_type == "leave_pass" {
+    let destination = if !input.destination.trim().is_empty() {
+        input.destination.trim()
+    } else if input.pass_type == "leave_pass" {
         if residency == "hosteller" {
             "Hostel"
         } else {
             "Home"
         }
     } else {
-        input.destination.trim()
+        "Campus"
     };
     let workflow = if input.pass_type == "outpass" {
         json!({"steps":["parent","warden","security"],"current":"parent"})

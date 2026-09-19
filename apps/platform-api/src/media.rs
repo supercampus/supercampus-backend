@@ -76,7 +76,7 @@ pub async fn upload(tenant_id: &str, mut multipart: Multipart) -> ApiResult<Valu
         .await
         .map_err(|error| {
             tracing::error!(error = ?error, tenant = tenant_id, "Cloudinary upload failed");
-            ApiError::BadGateway("Media storage rejected the upload".into())
+            ApiError::BadGateway(format!("Media storage rejected the upload: {error:#}"))
         })?;
 
     if !uploaded.secure_url.starts_with("https://")
@@ -132,7 +132,7 @@ pub async fn store_rendered_png(
     .await
     .map_err(|error| {
         tracing::error!(error = ?error, tenant = tenant_id, "Cloudinary upload failed");
-        ApiError::BadGateway("Media storage rejected the upload".into())
+        ApiError::BadGateway(format!("Media storage rejected the upload: {error:#}"))
     })?;
 
     Ok(json!({

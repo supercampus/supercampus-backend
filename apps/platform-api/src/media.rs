@@ -171,7 +171,7 @@ async fn read_media(multipart: &mut Multipart) -> ApiResult<ValidatedMedia> {
             ));
         }
         let content_type = detect_media_type(&bytes).ok_or_else(|| {
-            ApiError::BadRequest("Only JPEG, PNG, GIF, WebP, and PDF files are supported".into())
+            ApiError::BadRequest("Only JPEG, PNG, GIF, WebP, HEIC, and PDF files are supported".into())
         })?;
         selected = Some(ValidatedMedia {
             bytes: bytes.to_vec(),
@@ -192,7 +192,7 @@ async fn upload_to_cloudinary(
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
         .as_secs();
-    let allowed_formats = "jpg,jpeg,png,gif,webp,pdf";
+    let allowed_formats = "jpg,jpeg,png,gif,webp,pdf,heic,heif,avif";
     let signature = cloudinary_signature(
         &[
             ("allowed_formats", allowed_formats),
@@ -326,6 +326,24 @@ fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
         Some("image/webp")
     } else if bytes.starts_with(b"%PDF-") {
         Some("application/pdf")
+    } else if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(
+            &bytes[8..12],
+            b"heic" | b"heix" | b"heim" | b"heis" | b"hevc" | b"hevx"
+        )
+    {
+        Some("image/heic")
+    } else if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(&bytes[8..12], b"mif1" | b"msf1")
+    {
+        Some("image/heif")
+    } else if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(&bytes[8..12], b"avif" | b"avis")
+    {
+        Some("image/avif")
     } else {
         None
     }
@@ -341,6 +359,14 @@ mod tests {
         assert_eq!(
             detect_media_type(&[0xff, 0xd8, 0xff, 0xe0]),
             Some("image/jpeg")
+        );
+        assert_eq!(
+            detect_media_type(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00"),
+            Some("image/heic")
+        );
+        assert_eq!(
+            detect_media_type(b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00"),
+            Some("image/avif")
         );
         assert_eq!(detect_media_type(b"not really a photo.jpg"), None);
     }

@@ -106,7 +106,7 @@ async fn security_response_headers(
     );
     headers.insert(
         HeaderName::from_static("permissions-policy"),
-        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+        HeaderValue::from_static("camera=(self), microphone=(), geolocation=(self)"),
     );
     if matches!(
         std::env::var("APP_ENV").as_deref(),

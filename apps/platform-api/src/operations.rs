@@ -493,7 +493,7 @@ struct CampusGeofence {
 }
 
 const MIN_GEOFENCE_RADIUS_METRES: f64 = 50.0;
-const MAX_GEOFENCE_RADIUS_METRES: f64 = 20_000.0;
+const MAX_GEOFENCE_RADIUS_METRES: f64 = 100_000.0;
 
 async fn list_campuses(
     State(state): State<AppState>,
@@ -4337,7 +4337,27 @@ async fn activate_daily_access(
         .bind(&principal.student.id)
         .execute(db.pool())
         .await?;
-        return Err(ApiError::Forbidden);
+
+        let distance_info = if let Some((fence_lat, fence_lon, radius)) = fence_check.nearest_fence {
+            let dist = metres_between(input.latitude, input.longitude, fence_lat, fence_lon);
+            format!(
+                "You are outside the campus boundary ({:.0}m away, campus radius is {:.0}m). Today's entry QR activates once you are within the boundary.",
+                dist, radius
+            )
+        } else {
+            "You are outside the campus boundary, so today's entry QR cannot be activated yet.".into()
+        };
+
+        tracing::warn!(
+            student = %principal.student.email,
+            latitude = input.latitude,
+            longitude = input.longitude,
+            accuracy = ?input.accuracy_metres,
+            info = %distance_info,
+            "Daily access pass refused: outside campus fence"
+        );
+
+        return Err(ApiError::ForbiddenWithMessage(distance_info));
     }
     let mut tx = db.pool().begin().await?;
     // Browser location streams can deliver fixes many times per second. Lock

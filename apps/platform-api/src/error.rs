@@ -18,6 +18,7 @@ pub enum ApiError {
     InvalidRefreshToken,
     RefreshTokenReuse,
     Forbidden,
+    ForbiddenWithMessage(String),
     NotFound(String),
     ServiceUnavailable(String),
     BadGateway(String),
@@ -91,6 +92,9 @@ impl IntoResponse for ApiError {
                 "This session cannot access the requested tenant or resource".into(),
                 None,
             ),
+            Self::ForbiddenWithMessage(message) => {
+                (StatusCode::FORBIDDEN, "forbidden", message, None)
+            }
             Self::NotFound(error) => (StatusCode::NOT_FOUND, "not_found", error, None),
             Self::ServiceUnavailable(error) => (
                 StatusCode::SERVICE_UNAVAILABLE,

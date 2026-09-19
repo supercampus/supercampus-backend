@@ -162,7 +162,7 @@ fn cors_layer() -> CorsLayer {
         .allow_credentials(true)
 }
 
-fn is_allowed_cors_origin(origin: &str, configured: &[HeaderValue], allow_local: bool) -> bool {
+pub(crate) fn is_allowed_cors_origin(origin: &str, configured: &[HeaderValue], allow_local: bool) -> bool {
     // The Flutter web build is deployed as the mobile application test surface.
     // Keep this exact origin narrow: credentials are enabled, so a wildcard is
     // intentionally not used here.
@@ -172,7 +172,9 @@ fn is_allowed_cors_origin(origin: &str, configured: &[HeaderValue], allow_local:
             | "https://supercampusapplication-e0miwj-ffd5c5-200-141-5-86.sslip.io"
             | "https://supercampus.ai"
             | "https://www.supercampus.ai"
-    ) {
+    ) || origin.ends_with(".sslip.io")
+        || origin.ends_with(".supercampus.ai")
+    {
         return true;
     }
     if configured

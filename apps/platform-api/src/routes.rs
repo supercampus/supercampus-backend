@@ -1588,13 +1588,18 @@ fn enforce_cookie_request_origin(headers: &HeaderMap) -> ApiResult<()> {
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .ok_or(ApiError::Forbidden)?;
-    let allowed = std::env::var("CORS_ALLOWED_ORIGINS")
-        .unwrap_or_default()
+    let origins_var = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
+    let configured: Vec<HeaderValue> = origins_var
         .split(',')
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .any(|value| value == origin);
-    if allowed {
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| HeaderValue::from_str(s).ok())
+        .collect();
+    let allow_local = matches!(
+        std::env::var("APP_ENV").as_deref(),
+        Ok("development") | Ok("test") | Err(_)
+    );
+    if crate::is_allowed_cors_origin(origin, &configured, allow_local) {
         Ok(())
     } else {
         Err(ApiError::Forbidden)

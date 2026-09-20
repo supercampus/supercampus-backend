@@ -1823,7 +1823,7 @@ async fn place_order(
         // The line is a snapshot, so it carries everything history needs to stay
         // readable after the item is edited or removed — including whether it was
         // vegetarian, which the streak screens count.
-        let item=sqlx::query_as::<_,(String,String,String,f64,bool)>(r#"SELECT item.name,resolved_shop.shop_key,item.category,item.price::float8,item.is_vegetarian
+        let item=sqlx::query_as::<_,(String,String,String,f64,bool,bool)>(r#"SELECT item.name,resolved_shop.shop_key,item.category,item.price::float8,item.is_vegetarian,item.is_instant
           FROM campus_ops.canteen_menu_items item
           JOIN LATERAL (
             SELECT shop.shop_key
@@ -1845,7 +1845,7 @@ async fn place_order(
         let line_total = item.3 * f64::from(requested.quantity);
         grand_total += line_total;
         let line = json!({"itemId":requested.item_id,"name":item.0,"store":item.1,"category":item.2,
-            "price":item.3,"isVegetarian":item.4,"quantity":requested.quantity});
+            "price":item.3,"isVegetarian":item.4,"isInstant":item.5,"quantity":requested.quantity});
         match baskets.iter_mut().find(|(store, _, _)| *store == item.1) {
             Some(basket) => {
                 basket.1.push(line);
@@ -2407,8 +2407,8 @@ async fn scan_order(
     }
     let mut tx = db.pool().begin().await?;
     let order_id = Uuid::parse_str(input.qr_payload.trim()).ok();
-    let current = sqlx::query_as::<_, (Uuid, String, String, f64, String)>(
-        "SELECT id,status,customer_user_id,total::float8,store FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (qr_token_hash=$2 OR id=$3) FOR UPDATE",
+    let current = sqlx::query_as::<_, (Uuid, String, String, f64, String, Value, i64, Option<i32>)>(
+        "SELECT id,status,customer_user_id,total::float8,store,lines,order_number,token_number FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (qr_token_hash=$2 OR id=$3) FOR UPDATE",
     )
     .bind(tenant)
     .bind(token_hash(&input.qr_payload))
@@ -2425,7 +2425,41 @@ async fn scan_order(
         &access,
     )
     .await?;
-    let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.canteen_orders SET status=$3,handled_by=$4,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'status',status,'customerUserId',customer_user_id)")
+    if desired == "completed" {
+        let mut item_ids = Vec::new();
+        if let Some(arr) = current.5.as_array() {
+            for line in arr {
+                if let Some(id_str) = line
+                    .get("itemId")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| line.get("item_id").and_then(|v| v.as_str()))
+                {
+                    if let Ok(id) = Uuid::parse_str(id_str) {
+                        item_ids.push(id);
+                    }
+                }
+            }
+        }
+
+        let non_instant_count: i64 = if item_ids.is_empty() {
+            0
+        } else {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM campus_ops.canteen_menu_items WHERE tenant_id=$1 AND id = ANY($2) AND NOT is_instant",
+            )
+            .bind(tenant)
+            .bind(&item_ids)
+            .fetch_one(&mut *tx)
+            .await?
+        };
+
+        if non_instant_count > 0 {
+            return Err(ApiError::BadRequest(
+                "This order contains food that requires kitchen preparation. Please use the kitchen preparation flow.".into(),
+            ));
+        }
+    }
+    let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.canteen_orders SET status=$3,handled_by=$4,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'orderNumber',order_number,'tokenNumber',token_number,'status',status,'customerUserId',customer_user_id,'lines',lines,'total',total::float8,'isInstant',true,'updatedAt',updated_at)")
  .bind(tenant).bind(current.0).bind(&desired).bind(&principal.student.id).fetch_one(&mut *tx).await?;
     if desired == "rejected" && current.1 != "rejected" {
         sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version) VALUES($1,$2,$3,$4,1) ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now()")
@@ -2444,6 +2478,18 @@ async fn scan_order(
             &value,
         )
         .await?;
+    } else if desired == "completed" {
+        notify_tx(
+            &mut tx,
+            tenant,
+            Some(&current.2),
+            None,
+            "canteen",
+            "Your order is delivered",
+            "Your order has been handed over at the counter.",
+            &value,
+        )
+        .await?;
     }
     emit_tx(
         &mut tx,
@@ -2451,7 +2497,7 @@ async fn scan_order(
         "canteen",
         "order",
         value["id"].as_str().unwrap_or_default(),
-        "order.scanned",
+        "order.delivered",
         &principal.student.id,
         &value,
     )
@@ -2463,7 +2509,7 @@ async fn scan_order(
         "canteen",
         "order",
         value["id"].as_str().unwrap_or_default(),
-        "order.scanned",
+        "order.delivered",
     );
     Ok(Json(ApiResponse::new(value)))
 }

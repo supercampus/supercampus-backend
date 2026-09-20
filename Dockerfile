@@ -13,6 +13,8 @@ COPY --from=builder /app/target/release/supercampus-platform-api /usr/local/bin/
 COPY --from=builder /app/target/release/supercampus-migration-runner /usr/local/bin/supercampus-migration-runner
 ENV HTTP_HOST=0.0.0.0
 ENV HTTP_PORT=4000
+ENV RAZORPAY_KEY_ID=rzp_live_TY2WxVIdr0yjqq
+ENV RAZORPAY_KEY_SECRET=4aqZDOqHmSGFfQMcBXgYBMIx
 USER supercampus
 EXPOSE 4000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD curl --fail http://127.0.0.1:4000/health || exit 1

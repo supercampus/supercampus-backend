@@ -3579,6 +3579,8 @@ async fn gatepass_overview(
     )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let is_admin = access.roles.iter().any(|role| matches!(role.as_str(), "admin" | "superadmin"))
+        || (access.allows("gatepass.outpass.approve") && access.allows("gatepass.leave.approve"));
     let is_parent = access.roles.iter().any(|role| role == "parent");
     let is_warden = access.roles.iter().any(|role| role == "warden");
     let is_security = access.roles.iter().any(|role| role == "security");
@@ -3589,8 +3591,10 @@ async fn gatepass_overview(
             "class_advisor" | "hod" | "head_of_department"
         )
     });
-    let manage = is_parent || is_warden || is_security || access.allows("gatepass.leave.approve");
-    let viewer_kind = if is_parent {
+    let manage = is_admin || is_parent || is_warden || is_security || access.allows("gatepass.leave.approve");
+    let viewer_kind = if is_admin {
+        "admin"
+    } else if is_parent {
         "parent"
     } else if is_warden {
         "warden"
@@ -3631,6 +3635,7 @@ async fn gatepass_overview(
               ORDER BY request.created_at DESC)
             FROM campus_ops.gatepass_requests request
             WHERE request.tenant_id=$1 AND CASE $3::text
+              WHEN 'admin' THEN true
               WHEN 'parent' THEN EXISTS (
                 SELECT 1 FROM campus_ops.parent_student_links link
                 WHERE link.tenant_id=request.tenant_id AND link.active
@@ -4098,6 +4103,8 @@ async fn decide_gatepass_request(
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let is_admin = access.roles.iter().any(|role| matches!(role.as_str(), "admin" | "superadmin"))
+        || (access.allows("gatepass.outpass.approve") && access.allows("gatepass.leave.approve"));
     let is_parent = access.roles.iter().any(|role| role == "parent");
     let is_warden = access.roles.iter().any(|role| role == "warden");
     let is_principal = access.roles.iter().any(|role| role == "principal");
@@ -4107,7 +4114,9 @@ async fn decide_gatepass_request(
             "class_advisor" | "hod" | "head_of_department"
         )
     });
-    let expected_step = if is_parent {
+    let expected_step = if is_admin {
+        None
+    } else if is_parent {
         let parent_user_id = tenant_identity_user_id(db.pool(), &principal).await?;
         let linked = sqlx::query_scalar::<_, bool>(
             r#"SELECT EXISTS(

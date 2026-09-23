@@ -3059,17 +3059,20 @@ async fn library_announcements(
     let can_create = access.allows("library.announcement.create");
     let rows = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
-             'id',id,'announcementType',announcement_type,
-             'announcementDate',announcement_date,'title',title,'message',message,
-             'bookTitle',book_title,
-             'author',author,'status',status,'createdBy',created_by,
-             'attachmentName',attachment_name,'attachmentUrl',attachment_url,
-             'createdByName',created_by_name,'decisionNote',decision_note,
-             'decidedBy',decided_by,'decidedAt',decided_at,'createdAt',created_at)
-             ORDER BY created_at DESC),'[]'::jsonb)
-           FROM campus_ops.library_announcements
-           WHERE tenant_id=$1
-             AND (status='approved' OR $3 OR ($4 AND created_by=$2))"#,
+             'id',a.id,'announcementType',a.announcement_type,
+             'announcementDate',a.announcement_date,'title',a.title,'message',a.message,
+             'bookTitle',a.book_title,
+             'author',a.author,'status',a.status,'createdBy',a.created_by,
+             'createdByEmail',u.email,
+             'attachmentName',a.attachment_name,'attachmentUrl',a.attachment_url,
+             'createdByName',COALESCE(NULLIF(a.created_by_name,''), u.email, u.display_name, 'admin@mec.local'),
+             'decisionNote',a.decision_note,
+             'decidedBy',a.decided_by,'decidedAt',a.decided_at,'createdAt',a.created_at)
+             ORDER BY a.created_at DESC),'[]'::jsonb)
+           FROM campus_ops.library_announcements a
+           LEFT JOIN identity.users u ON u.id = a.created_by
+           WHERE a.tenant_id=$1
+             AND (a.status='approved' OR $3 OR ($4 AND a.created_by=$2))"#,
     )
     .bind(tenant)
     .bind(&principal.student.id)
@@ -3110,6 +3113,13 @@ async fn create_library_announcement(
         "pending"
     };
     let mut tx = db.pool().begin().await?;
+    let creator_display = if principal.student.email.trim().to_lowercase() == "admin@mec.local" {
+        "admin@mec.local".to_string()
+    } else if !principal.student.name.trim().is_empty() {
+        principal.student.name.trim().to_string()
+    } else {
+        principal.student.email.trim().to_string()
+    };
     let value = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.library_announcements
            (tenant_id,announcement_type,announcement_date,title,message,
@@ -3122,6 +3132,7 @@ async fn create_library_announcement(
              'bookTitle',book_title,'author',author,'status',status,
              'attachmentName',attachment_name,'attachmentUrl',attachment_url,
              'createdBy',created_by,'createdByName',created_by_name,
+             'createdByEmail', $14,
              'decidedBy',decided_by,'decidedAt',decided_at,'createdAt',created_at)"#,
     )
     .bind(tenant)
@@ -3158,9 +3169,10 @@ async fn create_library_announcement(
             .filter(|v| !v.is_empty()),
     )
     .bind(&principal.student.id)
-    .bind(&principal.student.name)
+    .bind(&creator_display)
     .bind(initial_status)
     .bind(publishes_immediately.then_some(principal.student.id.as_str()))
+    .bind(&principal.student.email)
     .fetch_one(&mut *tx)
     .await?;
     if !publishes_immediately {

@@ -65,6 +65,10 @@ pub fn router(state: AppState) -> Router {
             get(list_tenant_users).post(create_tenant_user),
         )
         .route(
+            "/authorization/users/{user_id}",
+            put(admin_users::update_tenant_user).patch(admin_users::update_tenant_user),
+        )
+        .route(
             "/authorization/users/{user_id}/roles",
             put(assign_tenant_user_roles),
         )

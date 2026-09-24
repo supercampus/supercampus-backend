@@ -2664,6 +2664,145 @@ impl AppState {
         Ok(true)
     }
 
+    pub async fn update_tenant_user_profile(
+        &self,
+        tenant_slug: &str,
+        actor_id: &str,
+        user_id: Uuid,
+        name: Option<&str>,
+        email: Option<&str>,
+    ) -> ApiResult<Option<Value>> {
+        let database = self.database.as_ref().ok_or_else(|| {
+            ApiError::ServiceUnavailable("PostgreSQL is required for user management".into())
+        })?;
+        let tenant_id = ensure_tenant(database, tenant_slug)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+        // 1. Verify user belongs to tenant and is active
+        let user_membership: Option<(String, String)> = sqlx::query_as(
+            r#"SELECT user_account.display_name, user_account.email
+               FROM identity.tenant_memberships membership
+               JOIN identity.users user_account ON user_account.id = membership.user_id
+               WHERE membership.tenant_id = $1 AND membership.user_id = $2 AND membership.active"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_optional(database.pool())
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+        let Some((current_name, current_email)) = user_membership else {
+            return Ok(None);
+        };
+
+        let new_name = name.unwrap_or(&current_name).trim();
+        let new_email = email
+            .map(|e| e.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| current_email.to_ascii_lowercase());
+
+        // 2. If email is being changed, check conflict across all users in identity.users
+        if new_email != current_email.to_ascii_lowercase() {
+            let conflict: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM identity.users WHERE id <> $1 AND lower(email) = lower($2))",
+            )
+            .bind(user_id)
+            .bind(&new_email)
+            .fetch_one(database.pool())
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+            if conflict {
+                return Err(ApiError::Conflict(
+                    "That email address already belongs to another account".into(),
+                ));
+            }
+        }
+
+        let new_initials = initials(new_name);
+
+        // 3. Update identity.users in control database
+        let mut transaction = database
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+        sqlx::query(
+            r#"UPDATE identity.users
+               SET display_name = $2,
+                   email = $3,
+                   initials = $4,
+                   updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(user_id)
+        .bind(new_name)
+        .bind(&new_email)
+        .bind(&new_initials)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+        // Update identity.tenant_memberships profile
+        sqlx::query(
+            r#"UPDATE identity.tenant_memberships
+               SET profile = profile || jsonb_build_object('name', $3::text, 'email', $4::text),
+                   updated_at = now()
+               WHERE tenant_id = $1 AND user_id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(new_name)
+        .bind(&new_email)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+        // 4. Update tenant database if core.students exists
+        if let Ok(tenant_db) = self.tenant_database(tenant_slug).await {
+            let _ = sqlx::query(
+                r#"UPDATE core.students
+                   SET full_name = $3,
+                       email = $4,
+                       profile = profile || jsonb_build_object('name', $3::text, 'email', $4::text),
+                       updated_at = now()
+                   WHERE tenant_id = $1 AND user_account_id = $2"#,
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(new_name)
+            .bind(&new_email)
+            .execute(tenant_db.pool())
+            .await;
+        }
+
+        self.validated_principals.write().await.clear();
+        self.invalidate_effective_access().await;
+
+        tracing::info!(
+            %user_id,
+            actor_id,
+            tenant_slug,
+            new_name,
+            new_email,
+            "tenant user profile updated by administrator"
+        );
+
+        Ok(Some(json!({
+            "id": user_id,
+            "name": new_name,
+            "email": new_email,
+            "initials": new_initials,
+            "updated": true,
+        })))
+    }
+
     pub async fn seed_test_identities_from_environment(&self) -> anyhow::Result<usize> {
         if !environment_flag("SEED_TEST_USERS") {
             return Ok(0);

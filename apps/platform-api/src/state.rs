@@ -695,8 +695,8 @@ impl AppState {
                       student.department_id AS department_id,
                       student.section_id AS section_id,
                       COALESCE(
-                          department.name,
                           NULLIF(student.profile ->> 'department', ''),
+                          department.name,
                           student.department_id::text,
                           ''
                       ) AS department,
@@ -1039,12 +1039,35 @@ impl AppState {
             }
         }
 
+        let dept_upper = department.to_uppercase();
+        let dept_abbr = if dept_upper.contains("ARTIFICIAL INTELLIGENCE & DATA")
+            || dept_upper.contains("ARTIFICIAL INTELLIGENCE AND DATA")
+            || dept_upper.contains("AIDS")
+        {
+            "AIDS"
+        } else if dept_upper.contains("MACHINE LEARNING") || dept_upper.contains("AIML") {
+            "AIML"
+        } else if dept_upper.contains("CYBER") {
+            "CYBER"
+        } else if dept_upper.contains("BUSINESS SYSTEMS") || dept_upper.contains("CSBS") {
+            "CSBS"
+        } else if dept_upper.contains("INFORMATION TECHNOLOGY")
+            || dept_upper.ends_with(" IT")
+            || dept_upper == "IT"
+        {
+            "IT"
+        } else if dept_upper.contains("COMPUTER SCIENCE") || dept_upper.contains("CSE") {
+            "CSE"
+        } else {
+            ""
+        };
+
         let profile = json!({
             "name": name,
             "roll": roll_no,
             "rollNumber": roll_no,
             "department": department,
-            "dept": department,
+            "dept": if dept_abbr.is_empty() { department } else { dept_abbr },
             "phone": mobile_number,
             "email": email,
             "year": academic_year,
@@ -1061,6 +1084,17 @@ impl AppState {
                    department_id = COALESCE(
                        (SELECT id::text FROM core.departments
                         WHERE tenant_id = $1 AND id = $12),
+                       (SELECT id::text FROM core.departments
+                        WHERE tenant_id = $1 AND (
+                            lower(name) = lower($7)
+                            OR lower(code) = lower($7)
+                            OR (NULLIF($14, '') IS NOT NULL AND lower(code) = lower($14))
+                            OR lower(name) = lower(split_part($7, ' in ', 2))
+                            OR lower(replace(name, '&', 'and')) = lower(replace(split_part($7, ' in ', 2), '&', 'and'))
+                            OR lower(replace(name, '&', 'and')) = lower(replace($7, '&', 'and'))
+                        )
+                        ORDER BY active DESC
+                        LIMIT 1),
                        student.department_id
                    ),
                    section_id = COALESCE(
@@ -1090,6 +1124,7 @@ impl AppState {
         .bind(&profile)
         .bind(request.department_id)
         .bind(request.section_id)
+        .bind(dept_abbr)
         .fetch_one(&mut *transaction)
         .await?;
 

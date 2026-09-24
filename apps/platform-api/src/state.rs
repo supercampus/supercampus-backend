@@ -2447,6 +2447,10 @@ impl AppState {
                           NULLIF(membership.profile ->> 'yearOfStudy', ''),
                           NULLIF(membership.profile ->> 'year', '')
                       ) AS year_of_study,
+                      COALESCE(
+                          NULLIF(membership.profile ->> 'department', ''),
+                          NULLIF(membership.profile ->> 'dept', '')
+                      ) AS department,
                       COALESCE((
                           SELECT jsonb_agg(jsonb_build_object(
                               'id', role.id, 'key', role.role_key, 'name', role.name,
@@ -2479,6 +2483,7 @@ impl AppState {
                     "accountType": row.try_get::<String, _>("account_type")?,
                     "active": row.try_get::<bool, _>("active")?,
                     "yearOfStudy": row.try_get::<Option<String>, _>("year_of_study")?,
+                    "department": row.try_get::<Option<String>, _>("department")?,
                     "roles": row.try_get::<Value, _>("roles")?,
                 }))
             })

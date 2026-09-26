@@ -42,8 +42,12 @@ pub const MINIMUM_PASSWORD_LENGTH: usize = 8;
 const REALTIME_TOKEN_TTL_SECONDS: i64 = 60;
 const REFRESH_ROTATION_GRACE_SECONDS: i64 = 10;
 const LOGIN_FAILURE_WINDOW_MINUTES: i64 = 15;
-const LOGIN_BLOCK_MINUTES: i64 = 15;
-const LOGIN_MAX_FAILURES: i32 = 8;
+/// The [`LOGIN_MAX_FAILURES`]th wrong password inside the window blocks the
+/// account for this long; each further failure doubles the block, up to
+/// [`LOGIN_MAX_BLOCK_SECONDS`]. Mirrored by the app's sign-in lockout.
+const LOGIN_BLOCK_SECONDS: f64 = 30.0;
+const LOGIN_MAX_BLOCK_SECONDS: f64 = 15.0 * 60.0;
+const LOGIN_MAX_FAILURES: i32 = 3;
 const FAILED_LOGIN_MINIMUM_DELAY_MS: u64 = 150;
 const SESSION_VALIDATION_CACHE_TTL: Duration = Duration::from_secs(5);
 const EFFECTIVE_ACCESS_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -1767,7 +1771,10 @@ impl AppState {
                                WHEN identity.login_throttle.window_started_at < now() - make_interval(mins => $2)
                                    THEN NULL
                                WHEN identity.login_throttle.failure_count + 1 >= $3
-                                   THEN now() + make_interval(mins => $4)
+                                   THEN now() + make_interval(secs => LEAST(
+                                       $4 * power(2, identity.login_throttle.failure_count + 1 - $3),
+                                       $5
+                                   ))
                                ELSE identity.login_throttle.blocked_until
                            END,
                            updated_at = now()"#,
@@ -1775,7 +1782,8 @@ impl AppState {
                 .bind(&throttle_key)
                 .bind(LOGIN_FAILURE_WINDOW_MINUTES as i32)
                 .bind(LOGIN_MAX_FAILURES)
-                .bind(LOGIN_BLOCK_MINUTES as i32)
+                .bind(LOGIN_BLOCK_SECONDS)
+                .bind(LOGIN_MAX_BLOCK_SECONDS)
                 .execute(database.pool())
                 .await
                 .context("failed to record login failure")?;

@@ -3408,22 +3408,30 @@ async fn library_announcements(
     }) || principal.student.email.trim().to_lowercase() == "admin@mec.local";
     let can_approve = is_admin || access.allows("library.announcement.approve");
     let can_create = is_admin || access.allows("library.announcement.create");
+    // Read each row through to_jsonb and compare ids as text: installations
+    // whose table predates later migrations (created_by stored as uuid, or
+    // columns such as created_by_name / decision_note missing) must still load
+    // the wall. A direct column reference there fails the whole request (500).
     let rows = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
-             'id',a.id,'announcementType',a.announcement_type,
-             'announcementDate',a.announcement_date,'title',a.title,'message',a.message,
-             'bookTitle',a.book_title,
-             'author',a.author,'status',a.status,'createdBy',a.created_by,
-             'createdByEmail',u.email,
-             'attachmentName',a.attachment_name,'attachmentUrl',a.attachment_url,
-             'createdByName',COALESCE(NULLIF(a.created_by_name,''), u.email, u.display_name, 'admin@mec.local'),
-             'decisionNote',a.decision_note,
-             'decidedBy',a.decided_by,'decidedAt',a.decided_at,'createdAt',a.created_at)
-             ORDER BY a.created_at DESC),'[]'::jsonb)
-           FROM campus_ops.library_announcements a
-           LEFT JOIN identity.users u ON u.id::text = a.created_by
-           WHERE a.tenant_id=$1
-             AND (a.status='approved' OR $3 OR ($4 AND a.created_by=$2))"#,
+             'id',x.r->>'id',
+             'announcementType',COALESCE(NULLIF(x.r->>'announcement_type',''),'Announcement'),
+             'announcementDate',x.r->'announcement_date','title',x.r->>'title',
+             'message',COALESCE(x.r->>'message',''),
+             'bookTitle',x.r->>'book_title',
+             'author',x.r->>'author','status',x.r->>'status','createdBy',x.r->>'created_by',
+             'createdByEmail',to_jsonb(u)->>'email',
+             'attachmentName',x.r->>'attachment_name','attachmentUrl',x.r->>'attachment_url',
+             'createdByName',COALESCE(NULLIF(x.r->>'created_by_name',''), to_jsonb(u)->>'email',
+                                      to_jsonb(u)->>'display_name', 'admin@mec.local'),
+             'decisionNote',x.r->>'decision_note',
+             'decidedBy',x.r->>'decided_by','decidedAt',x.r->'decided_at','createdAt',x.r->'created_at')
+             ORDER BY (x.r->>'created_at')::timestamptz DESC NULLS LAST),'[]'::jsonb)
+           FROM (SELECT to_jsonb(a) AS r
+                 FROM campus_ops.library_announcements a
+                 WHERE a.tenant_id=$1) x
+           LEFT JOIN identity.users u ON u.id::text = x.r->>'created_by'
+           WHERE x.r->>'status'='approved' OR $3 OR ($4 AND x.r->>'created_by'=$2)"#,
     )
     .bind(tenant)
     .bind(&principal.student.id)

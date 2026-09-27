@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
         "align-mec-canteen-owner" => align_mec_canteen_owner().await,
         "apply-separate-store-wallets" => apply_separate_store_wallets().await,
         "apply-wallet-pin-and-help-requests" => apply_wallet_pin_and_help_requests().await,
+        "apply-library-announcement-shape" => apply_library_announcement_shape().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
@@ -1455,6 +1456,14 @@ async fn apply_wallet_pin_and_help_requests() -> anyhow::Result<()> {
         include_str!("../../../migrations/runtime/0111_support_tickets.sql");
     apply_to_control_and_tenants(WALLET_PIN, "wallet PIN columns").await?;
     apply_to_control_and_tenants(HELP_REQUESTS, "help requests").await
+}
+
+/// Brings an older library_announcements table (uuid ids, missing columns) up
+/// to the current shape so the Campus Wall can read and publish on it.
+async fn apply_library_announcement_shape() -> anyhow::Result<()> {
+    const SQL: &str =
+        include_str!("../../../migrations/runtime/0112_library_announcement_shape.sql");
+    apply_to_control_and_tenants(SQL, "library announcement shape").await
 }
 
 fn required_environment(name: &str) -> anyhow::Result<String> {

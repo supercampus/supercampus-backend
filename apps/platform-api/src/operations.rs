@@ -21,6 +21,7 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(crate::library_lending::router())
+        .merge(crate::support::router())
         .route("/changes", get(changes))
         .route("/notifications", get(notifications))
         .route("/notifications/read-all", post(read_all_notifications))
@@ -1212,15 +1213,10 @@ async fn canteen_store(
         object.insert("laundryPricePerKg".into(), json!(laundry_price_per_kg));
         object.insert("laundryCharges".into(), laundry_charges);
         object.insert("assignedShopKeys".into(), json!(assigned_shop_keys));
-        let has_pin = sqlx::query_scalar::<_, bool>(
-            "SELECT wallet_pin_hash IS NOT NULL FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 LIMIT 1",
-        )
-        .bind(tenant)
-        .bind(&principal.student.id)
-        .fetch_optional(db.pool())
-        .await?
-        .unwrap_or(false);
-        object.insert("hasPin".into(), json!(has_pin));
+        let (pin_hash, pin_hint) =
+            wallet_pin_state(db.pool(), tenant, &principal.student.id).await?;
+        object.insert("hasPin".into(), json!(pin_hash.is_some()));
+        object.insert("hasPinHint".into(), json!(pin_hint.is_some()));
         object.insert(
             "capabilities".into(),
             json!({
@@ -2049,19 +2045,15 @@ async fn place_order(
     let mut tx = db.pool().begin().await?;
     sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
       .bind(tenant).bind(&principal.student.id).execute(&mut *tx).await?;
-    // Verify wallet PIN if one is set for this user.
-    let stored_pin_hash = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT wallet_pin_hash FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 LIMIT 1",
-    )
-    .bind(tenant)
-    .bind(&principal.student.id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .flatten();
+    // Verify the wallet PIN if any of this user's shop wallets carries one.
+    let (stored_pin_hash, _) = wallet_pin_state(&mut *tx, tenant, &principal.student.id).await?;
     if let Some(ref expected_hash) = stored_pin_hash {
         match &input.pin_hash {
             Some(provided) if provided == expected_hash => {}
-            _ => return Err(ApiError::BadRequest("Incorrect wallet PIN".into())),
+            _ => {
+                crate::state::failed_verification_delay().await;
+                return Err(ApiError::BadRequest("Incorrect wallet PIN".into()));
+            }
         }
     }
     // A cart can hold items from more than one shop, but each shop hands its
@@ -3300,7 +3292,7 @@ async fn library_announcements(
              'decidedBy',a.decided_by,'decidedAt',a.decided_at,'createdAt',a.created_at)
              ORDER BY a.created_at DESC),'[]'::jsonb)
            FROM campus_ops.library_announcements a
-           LEFT JOIN identity.users u ON u.id = a.created_by
+           LEFT JOIN identity.users u ON u.id::text = a.created_by
            WHERE a.tenant_id=$1
              AND (a.status='approved' OR $3 OR ($4 AND a.created_by=$2))"#,
     )
@@ -6988,7 +6980,7 @@ async fn emit_tx(
     Ok(())
 }
 #[allow(clippy::too_many_arguments)]
-async fn notify_tx(
+pub(crate) async fn notify_tx(
     tx: &mut Transaction<'_, Postgres>,
     tenant: Uuid,
     user: Option<&str>,
@@ -7072,6 +7064,12 @@ async fn notify_tx(
 
 
 // ── Wallet PIN handlers ──────────────────────────────────────────────────────
+//
+// The PIN belongs to the user, but wallets are one row per (tenant, user, shop).
+// Every read aggregates across all of the user's rows and every write updates all
+// of them, so no shop wallet can be used to skip the PIN.
+
+const WALLET_PIN_HINT_MAX_CHARS: usize = 30;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -7093,6 +7091,61 @@ struct ChangeWalletPinRequest {
     hint: Option<String>,
     /// Provided when method == "password" — the user's raw account password
     password: Option<String>,
+    /// Optional new recovery word; an empty string clears it.
+    new_hint: Option<String>,
+}
+
+fn is_wallet_pin_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_wallet_pin_hash(value: &str) -> ApiResult<()> {
+    if is_wallet_pin_hash(value) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "That PIN couldn't be read. Enter it again.".into(),
+        ))
+    }
+}
+
+/// Trims a recovery word; `None` means "no hint". Longer than 30 characters is refused.
+fn normalize_wallet_pin_hint(value: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > WALLET_PIN_HINT_MAX_CHARS {
+        return Err(ApiError::BadRequest(format!(
+            "Keep your recovery word to {WALLET_PIN_HINT_MAX_CHARS} characters or fewer."
+        )));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn wallet_pin_hint_matches(stored: &str, provided: &str) -> bool {
+    stored.trim().to_lowercase() == provided.trim().to_lowercase()
+}
+
+/// The user's PIN hash and recovery word, aggregated across every shop wallet row.
+async fn wallet_pin_state<'e, E>(
+    executor: E,
+    tenant: Uuid,
+    user_id: &str,
+) -> ApiResult<(Option<String>, Option<String>)>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    Ok(sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        r#"SELECT max(wallet_pin_hash), max(NULLIF(btrim(wallet_pin_hint),''))
+           FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2"#,
+    )
+    .bind(tenant)
+    .bind(user_id)
+    .fetch_one(executor)
+    .await?)
 }
 
 async fn set_wallet_pin(
@@ -7101,29 +7154,55 @@ async fn set_wallet_pin(
     Json(input): Json<SetWalletPinRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require_any_role(&principal)?;
-    if input.pin_hash.len() != 64 {
-        return Err(ApiError::BadRequest("Invalid PIN format".into()));
-    }
+    validate_wallet_pin_hash(&input.pin_hash)?;
+    let hint = normalize_wallet_pin_hint(input.hint.as_deref())?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    // Ensure wallet row exists, then set the PIN.
-    sqlx::query(
-        "INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+    let mut tx = db.pool().begin().await?;
+    // Lock the user's wallet rows so two first-time requests cannot both set a PIN.
+    let existing = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT wallet_pin_hash FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE",
     )
     .bind(tenant)
     .bind(&principal.student.id)
-    .execute(db.pool())
+    .fetch_all(&mut *tx)
     .await?;
+    if existing.iter().any(Option::is_some) {
+        return Err(ApiError::Conflict(
+            "A wallet PIN is already set. Use Change PIN in Settings.".into(),
+        ));
+    }
+    if existing.is_empty() {
+        // No wallet yet: hold the PIN on a wallet for this tenant's own first shop
+        // rather than assuming a shop key. The column default is only the fallback
+        // for a tenant without any shop configured.
+        sqlx::query(
+            r#"INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key)
+               SELECT $1,$2,COALESCE(
+                 (SELECT shop_key FROM campus_ops.shops
+                  WHERE tenant_id=$1 AND is_active
+                  ORDER BY (lower(category)='canteen') DESC, created_at, shop_key LIMIT 1),
+                 'mec-canteen')
+               ON CONFLICT DO NOTHING"#,
+        )
+        .bind(tenant)
+        .bind(&principal.student.id)
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query(
         "UPDATE campus_ops.canteen_wallets SET wallet_pin_hash=$3, wallet_pin_hint=$4 WHERE tenant_id=$1 AND user_id=$2",
     )
     .bind(tenant)
     .bind(&principal.student.id)
     .bind(&input.pin_hash)
-    .bind(&input.hint)
-    .execute(db.pool())
+    .bind(&hint)
+    .execute(&mut *tx)
     .await?;
-    Ok(Json(ApiResponse::new(json!({"ok": true}))))
+    tx.commit().await?;
+    Ok(Json(ApiResponse::new(
+        json!({"ok": true, "hasPinHint": hint.is_some()}),
+    )))
 }
 
 async fn change_wallet_pin(
@@ -7132,70 +7211,85 @@ async fn change_wallet_pin(
     Json(input): Json<ChangeWalletPinRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require_any_role(&principal)?;
-    if input.new_pin_hash.len() != 64 {
-        return Err(ApiError::BadRequest("Invalid PIN format".into()));
-    }
+    validate_wallet_pin_hash(&input.new_pin_hash)?;
+    // `Some(None)` clears the recovery word, `None` keeps whatever is stored.
+    let new_hint = input
+        .new_hint
+        .as_deref()
+        .map(|value| normalize_wallet_pin_hint(Some(value)))
+        .transpose()?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-        "SELECT wallet_pin_hash, wallet_pin_hint FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 LIMIT 1",
-    )
-    .bind(tenant)
-    .bind(&principal.student.id)
-    .fetch_optional(db.pool())
-    .await?;
-    let (stored_hash, stored_hint) = row.unwrap_or((None, None));
+    let (stored_hash, stored_hint) =
+        wallet_pin_state(db.pool(), tenant, &principal.student.id).await?;
+    let Some(stored_hash) = stored_hash else {
+        return Err(ApiError::BadRequest(
+            "You haven't set a wallet PIN yet.".into(),
+        ));
+    };
     match input.method.as_str() {
         "current_pin" => {
-            let provided = input.current_pin_hash.as_deref().unwrap_or("");
-            if stored_hash.as_deref() != Some(provided) {
-                return Err(ApiError::BadRequest("Incorrect current PIN".into()));
+            if input.current_pin_hash.as_deref() != Some(stored_hash.as_str()) {
+                crate::state::failed_verification_delay().await;
+                return Err(ApiError::BadRequest("That PIN is incorrect.".into()));
             }
         }
         "hint" => {
-            let provided = input.hint.as_deref().unwrap_or("").trim().to_lowercase();
-            let expected = stored_hint
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .to_lowercase();
-            if expected.is_empty() || provided != expected {
-                return Err(ApiError::BadRequest("Hint does not match".into()));
+            let Some(expected) = stored_hint.as_deref() else {
+                return Err(ApiError::BadRequest(
+                    "No recovery word is set for this wallet. Use your current PIN or account password."
+                        .into(),
+                ));
+            };
+            let provided = input.hint.as_deref().unwrap_or("");
+            if provided.trim().is_empty() || !wallet_pin_hint_matches(expected, provided) {
+                crate::state::failed_verification_delay().await;
+                return Err(ApiError::BadRequest(
+                    "That recovery word doesn't match.".into(),
+                ));
             }
         }
         "password" => {
-            // Verify the user's account password using pgcrypto crypt() on the identity db.
-            let raw_password = input
-                .password
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .ok_or_else(|| ApiError::BadRequest("Password required".into()))?;
-            let global_db = state
-                .database()
-                .ok_or_else(|| ApiError::BadRequest("Database unavailable".into()))?;
-            let ok = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM identity.users WHERE id=$1::uuid AND password_hash = crypt($2, password_hash))",
-            )
-            .bind(&principal.student.id)
-            .bind(raw_password)
-            .fetch_one(global_db.pool())
-            .await
-            .unwrap_or(false);
-            if !ok {
-                return Err(ApiError::BadRequest("Incorrect account password".into()));
+            let password = input.password.as_deref().unwrap_or("");
+            // verify_account_password applies the failed-login delay itself.
+            let verified = if password.is_empty() {
+                crate::state::failed_verification_delay().await;
+                false
+            } else {
+                state
+                    .verify_account_password(&principal.student.id, password)
+                    .await?
+            };
+            if !verified {
+                return Err(ApiError::BadRequest(
+                    "Your account password is incorrect.".into(),
+                ));
             }
         }
-        _ => return Err(ApiError::BadRequest("Unknown method".into())),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "Choose how to confirm it's you: current PIN, recovery word or account password."
+                    .into(),
+            ));
+        }
     }
+    if input.new_pin_hash == stored_hash {
+        return Err(ApiError::BadRequest("Choose a different PIN.".into()));
+    }
+    let hint = new_hint.unwrap_or(stored_hint);
+    // Every shop wallet row gets the same PIN and recovery word.
     sqlx::query(
-        "UPDATE campus_ops.canteen_wallets SET wallet_pin_hash=$3 WHERE tenant_id=$1 AND user_id=$2",
+        "UPDATE campus_ops.canteen_wallets SET wallet_pin_hash=$3, wallet_pin_hint=$4 WHERE tenant_id=$1 AND user_id=$2",
     )
     .bind(tenant)
     .bind(&principal.student.id)
     .bind(&input.new_pin_hash)
+    .bind(&hint)
     .execute(db.pool())
     .await?;
-    Ok(Json(ApiResponse::new(json!({"ok": true}))))
+    Ok(Json(ApiResponse::new(
+        json!({"ok": true, "hasPinHint": hint.is_some()}),
+    )))
 }
 
 fn require_any_role(principal: &AuthPrincipal) -> ApiResult<()> {
@@ -7272,6 +7366,34 @@ mod tests {
 
         assert!(!without_margin);
         assert!(with_margin);
+    }
+
+    #[test]
+    fn wallet_pin_hash_must_be_64_lowercase_hex() {
+        let valid = "a".repeat(64);
+        assert!(is_wallet_pin_hash(&valid));
+        assert!(is_wallet_pin_hash(&"0123456789abcdef".repeat(4)));
+        assert!(!is_wallet_pin_hash(&"A".repeat(64)));
+        assert!(!is_wallet_pin_hash(&"a".repeat(63)));
+        assert!(!is_wallet_pin_hash(&"g".repeat(64)));
+        assert!(!is_wallet_pin_hash("1234"));
+    }
+
+    #[test]
+    fn wallet_pin_hint_is_trimmed_limited_and_case_insensitive() {
+        assert_eq!(
+            normalize_wallet_pin_hint(Some("  Mango  ")).expect("valid"),
+            Some("Mango".into())
+        );
+        assert_eq!(normalize_wallet_pin_hint(Some("   ")).expect("valid"), None);
+        assert_eq!(normalize_wallet_pin_hint(None).expect("valid"), None);
+        assert!(normalize_wallet_pin_hint(Some(&"x".repeat(30))).is_ok());
+        assert!(matches!(
+            normalize_wallet_pin_hint(Some(&"x".repeat(31))),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(wallet_pin_hint_matches("Mango", " mango "));
+        assert!(!wallet_pin_hint_matches("Mango", "apple"));
     }
 
     #[test]

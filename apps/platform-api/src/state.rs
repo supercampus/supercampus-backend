@@ -333,6 +333,10 @@ impl AppState {
         self
     }
 
+    pub fn mailer(&self) -> Arc<dyn Mailer> {
+        self.mailer.clone()
+    }
+
     /// Adds an identity only to an in-memory `AppState` (used by isolated tests).
     pub fn with_memory_identity(
         mut self,
@@ -3629,6 +3633,95 @@ impl AppState {
         Ok(true)
     }
 
+    /// Changes a signed-in user's password after checking the current one.
+    ///
+    /// Returns `false` (after the failed-login delay) when the current password is
+    /// wrong. The hash is written exactly like [`Self::reset_password`] does; every
+    /// other device is signed out, but `current_session` stays valid.
+    pub async fn change_password(
+        &self,
+        user_id: &str,
+        current_session: Uuid,
+        current_password: &str,
+        new_password: &str,
+    ) -> anyhow::Result<bool> {
+        let database = self.database.as_ref().context("PostgreSQL is required")?;
+        let user_id = Uuid::parse_str(user_id).context("the session user id is not a uuid")?;
+        let mut transaction = database.pool().begin().await?;
+
+        let updated = sqlx::query(
+            r#"UPDATE identity.users
+               SET password_hash = crypt($3, gen_salt('bf', 12)), updated_at = now()
+               WHERE id = $1 AND active AND password_hash = crypt($2, password_hash)"#,
+        )
+        .bind(user_id)
+        .bind(current_password)
+        .bind(new_password)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to update the password")?;
+
+        if updated.rows_affected() == 0 {
+            transaction.rollback().await?;
+            failed_verification_delay().await;
+            return Ok(false);
+        }
+
+        // Outstanding reset links would otherwise still set a password.
+        sqlx::query(
+            r#"UPDATE identity.password_reset_tokens
+               SET consumed_at = now()
+               WHERE user_id = $1 AND consumed_at IS NULL"#,
+        )
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to invalidate outstanding reset tokens")?;
+
+        // Sign out every other device; the one making the change stays signed in.
+        sqlx::query(
+            r#"UPDATE identity.auth_sessions
+               SET revoked_at = now()
+               WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL"#,
+        )
+        .bind(user_id.to_string())
+        .bind(current_session)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to revoke other sessions after the password change")?;
+
+        transaction.commit().await?;
+        self.validated_principals.write().await.clear();
+        tracing::info!(%user_id, "password changed and other sessions revoked");
+        Ok(true)
+    }
+
+    /// Verifies a signed-in user's account password (used to authorise sensitive
+    /// changes such as a wallet PIN reset). Applies the failed-login delay on a miss.
+    pub async fn verify_account_password(
+        &self,
+        user_id: &str,
+        password: &str,
+    ) -> anyhow::Result<bool> {
+        let database = self.database.as_ref().context("PostgreSQL is required")?;
+        let ok = match Uuid::parse_str(user_id) {
+            Ok(user_id) => sqlx::query_scalar::<_, bool>(
+                r#"SELECT EXISTS(SELECT 1 FROM identity.users
+                   WHERE id = $1 AND active AND password_hash = crypt($2, password_hash))"#,
+            )
+            .bind(user_id)
+            .bind(password)
+            .fetch_one(database.pool())
+            .await
+            .context("failed to verify the account password")?,
+            Err(_) => false,
+        };
+        if !ok {
+            failed_verification_delay().await;
+        }
+        Ok(ok)
+    }
+
     pub async fn app_state(
         &self,
         tenant_id: &str,
@@ -3714,6 +3807,15 @@ impl AppState {
         states.insert(key, document.clone());
         Ok(document)
     }
+}
+
+/// The same small constant delay a failed sign-in gets, for any other failed
+/// secret check (current password, wallet PIN, recovery word).
+pub(crate) async fn failed_verification_delay() {
+    tokio::time::sleep(std::time::Duration::from_millis(
+        FAILED_LOGIN_MINIMUM_DELAY_MS,
+    ))
+    .await;
 }
 
 fn login_throttle_key(email: &str, tenant_slug: Option<&str>) -> Vec<u8> {

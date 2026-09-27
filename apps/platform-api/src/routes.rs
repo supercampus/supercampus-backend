@@ -21,13 +21,13 @@ use crate::{
     error::{ApiError, ApiResult},
     models::{
         ApiResponse, AssignUserRolesRequest, BootstrapDocument, BulkStudentImportRequest,
-        CreateAuthorizationRoleRequest, CreateRecordRequest, CreateTenantUserRequest,
-        ForgotPasswordRequest, HealthDocument, LoginData, LoginRequest, LogoutRequest,
-        NavigationItem, PutConfigurationRequest, RefreshRequest, ResetPasswordRequest,
-        SaveAppStateRequest, SessionData, SessionMode, SetRolePermissionsRequest,
-        SetUserAccessRequest, StudentPhotoRequest, StudentResidencyRequest,
-        UpdateAuthorizationRoleRequest, UpdateRecordRequest, UpdateStudentMasterRequest,
-        ValidateWorkflowTransitionRequest,
+        ChangePasswordRequest, CreateAuthorizationRoleRequest, CreateRecordRequest,
+        CreateTenantUserRequest, ForgotPasswordRequest, HealthDocument, LoginData, LoginRequest,
+        LogoutRequest, NavigationItem, PutConfigurationRequest, RefreshRequest,
+        ResetPasswordRequest, SaveAppStateRequest, SessionData, SessionMode,
+        SetRolePermissionsRequest, SetUserAccessRequest, StudentPhotoRequest,
+        StudentResidencyRequest, UpdateAuthorizationRoleRequest, UpdateRecordRequest,
+        UpdateStudentMasterRequest, ValidateWorkflowTransitionRequest,
     },
     realtime::RealtimePublication,
     state::{
@@ -92,6 +92,7 @@ pub fn router(state: AppState) -> Router {
             "/workflows/{module_key}/{feature_key}/transitions/validate",
             post(validate_workflow_transition),
         )
+        .route("/auth/change-password", post(change_password))
         .route("/navigation", get(get_navigation))
         .route("/dashboard/effective", get(get_effective_dashboard))
         .route("/student-master", get(list_student_master))
@@ -1361,6 +1362,43 @@ async fn reset_password(
     }
 }
 
+/// Signed-in password change. Keeps the caller's session; signs out other devices.
+async fn change_password(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<ChangePasswordRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    validate_password_change(&request.current_password, &request.new_password)?;
+    if !state
+        .change_password(
+            &principal.student.id,
+            principal.session_id,
+            &request.current_password,
+            &request.new_password,
+        )
+        .await?
+    {
+        return Err(ApiError::BadRequest(
+            "Your current password is incorrect.".into(),
+        ));
+    }
+    Ok(Json(ApiResponse::new(json!({ "ok": true }))))
+}
+
+fn validate_password_change(current_password: &str, new_password: &str) -> ApiResult<()> {
+    if new_password.chars().count() < MINIMUM_PASSWORD_LENGTH {
+        return Err(ApiError::BadRequest(format!(
+            "Use at least {MINIMUM_PASSWORD_LENGTH} characters for your new password."
+        )));
+    }
+    if new_password == current_password {
+        return Err(ApiError::BadRequest(
+            "Choose a password you haven't used here before.".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Origin used to build reset links. Must match where the frontend is served.
 pub(crate) fn public_base_url() -> String {
     std::env::var("APP_PUBLIC_URL")
@@ -1878,6 +1916,30 @@ mod tests {
             permissions: permissions.iter().map(|value| (*value).into()).collect(),
             scopes: HashMap::new(),
         }
+    }
+
+    fn bad_request_message(result: ApiResult<()>) -> String {
+        match result {
+            Err(ApiError::BadRequest(message)) => message,
+            other => panic!("expected a bad request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn password_change_requires_a_long_enough_new_password() {
+        assert_eq!(
+            bad_request_message(validate_password_change("Mec@2026", "short")),
+            "Use at least 8 characters for your new password."
+        );
+    }
+
+    #[test]
+    fn password_change_rejects_reusing_the_current_password() {
+        assert_eq!(
+            bad_request_message(validate_password_change("Mec@2026", "Mec@2026")),
+            "Choose a password you haven't used here before."
+        );
+        assert!(validate_password_change("Mec@2026", "Mec@2026-new").is_ok());
     }
 
     #[test]

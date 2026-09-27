@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
         "apply-laundry-charge-workflow" => apply_laundry_charge_workflow().await,
         "align-mec-canteen-owner" => align_mec_canteen_owner().await,
         "apply-separate-store-wallets" => apply_separate_store_wallets().await,
+        "apply-wallet-pin-and-help-requests" => apply_wallet_pin_and_help_requests().await,
         "repair-mec-geofence" => repair_mec_geofence().await,
         "split-control-plane" => split_control_plane().await,
         "sync-control-plane" => sync_control_plane().await,
@@ -1443,6 +1444,17 @@ async fn copy_query(
 async fn apply_separate_store_wallets() -> anyhow::Result<()> {
     const SQL: &str = include_str!("../../../migrations/runtime/0109_separate_store_wallets.sql");
     apply_to_control_and_tenants(SQL, "separate store wallets").await
+}
+
+/// Both files are idempotent, so this is safe on a database that already has the
+/// wallet PIN columns (they were added by hand on some deployments).
+async fn apply_wallet_pin_and_help_requests() -> anyhow::Result<()> {
+    const WALLET_PIN: &str =
+        include_str!("../../../migrations/runtime/0110_wallet_pin_columns.sql");
+    const HELP_REQUESTS: &str =
+        include_str!("../../../migrations/runtime/0111_support_tickets.sql");
+    apply_to_control_and_tenants(WALLET_PIN, "wallet PIN columns").await?;
+    apply_to_control_and_tenants(HELP_REQUESTS, "help requests").await
 }
 
 fn required_environment(name: &str) -> anyhow::Result<String> {

@@ -12,6 +12,7 @@ pub mod operations;
 pub mod passes;
 pub mod platform_admin;
 pub mod razorpay;
+pub mod support;
 pub mod visitors;
 
 pub mod realtime;

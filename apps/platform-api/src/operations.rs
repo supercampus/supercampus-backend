@@ -70,6 +70,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/canteen/wallets/{user_id}/top-ups", post(top_up_wallet))
         .route("/canteen/wallet-pin", post(set_wallet_pin).put(change_wallet_pin))
+        .route("/canteen/wallet-pin/verify", post(verify_wallet_owner))
         .route("/canteen/staff-state", put(update_canteen_staff_state))
         .route(
             "/library/requests",
@@ -7227,21 +7228,64 @@ async fn change_wallet_pin(
             "You haven't set a wallet PIN yet.".into(),
         ));
     };
-    match input.method.as_str() {
+    confirm_wallet_owner(
+        &state,
+        &principal,
+        &input.method,
+        input.current_pin_hash.as_deref(),
+        input.hint.as_deref(),
+        input.password.as_deref(),
+        &stored_hash,
+        stored_hint.as_deref(),
+    )
+    .await?;
+    if input.new_pin_hash == stored_hash {
+        return Err(ApiError::BadRequest("Choose a different PIN.".into()));
+    }
+    let hint = new_hint.unwrap_or(stored_hint);
+    // Every shop wallet row gets the same PIN and recovery word.
+    sqlx::query(
+        "UPDATE campus_ops.canteen_wallets SET wallet_pin_hash=$3, wallet_pin_hint=$4 WHERE tenant_id=$1 AND user_id=$2",
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&input.new_pin_hash)
+    .bind(&hint)
+    .execute(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(
+        json!({"ok": true, "hasPinHint": hint.is_some()}),
+    )))
+}
+
+/// Checks the proof a user gives before touching their wallet PIN: the current
+/// PIN, the recovery word, or the account password.
+#[allow(clippy::too_many_arguments)]
+async fn confirm_wallet_owner(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    method: &str,
+    current_pin_hash: Option<&str>,
+    hint: Option<&str>,
+    password: Option<&str>,
+    stored_hash: &str,
+    stored_hint: Option<&str>,
+) -> ApiResult<()> {
+    match method {
         "current_pin" => {
-            if input.current_pin_hash.as_deref() != Some(stored_hash.as_str()) {
+            if current_pin_hash != Some(stored_hash) {
                 crate::state::failed_verification_delay().await;
                 return Err(ApiError::BadRequest("That PIN is incorrect.".into()));
             }
         }
         "hint" => {
-            let Some(expected) = stored_hint.as_deref() else {
+            let Some(expected) = stored_hint else {
                 return Err(ApiError::BadRequest(
                     "No recovery word is set for this wallet. Use your current PIN or account password."
                         .into(),
                 ));
             };
-            let provided = input.hint.as_deref().unwrap_or("");
+            let provided = hint.unwrap_or("");
             if provided.trim().is_empty() || !wallet_pin_hint_matches(expected, provided) {
                 crate::state::failed_verification_delay().await;
                 return Err(ApiError::BadRequest(
@@ -7250,7 +7294,7 @@ async fn change_wallet_pin(
             }
         }
         "password" => {
-            let password = input.password.as_deref().unwrap_or("");
+            let password = password.unwrap_or("");
             // verify_account_password applies the failed-login delay itself.
             let verified = if password.is_empty() {
                 crate::state::failed_verification_delay().await;
@@ -7273,23 +7317,48 @@ async fn change_wallet_pin(
             ));
         }
     }
-    if input.new_pin_hash == stored_hash {
-        return Err(ApiError::BadRequest("Choose a different PIN.".into()));
-    }
-    let hint = new_hint.unwrap_or(stored_hint);
-    // Every shop wallet row gets the same PIN and recovery word.
-    sqlx::query(
-        "UPDATE campus_ops.canteen_wallets SET wallet_pin_hash=$3, wallet_pin_hint=$4 WHERE tenant_id=$1 AND user_id=$2",
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VerifyWalletOwnerRequest {
+    /// One of: "current_pin" | "hint" | "password"
+    method: String,
+    current_pin_hash: Option<String>,
+    hint: Option<String>,
+    password: Option<String>,
+}
+
+/// Confirms the proof up front, so Change PIN can reject a wrong current PIN
+/// before the user picks a new one. The change itself re-checks the proof.
+async fn verify_wallet_owner(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(input): Json<VerifyWalletOwnerRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any_role(&principal)?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let (stored_hash, stored_hint) =
+        wallet_pin_state(db.pool(), tenant, &principal.student.id).await?;
+    let Some(stored_hash) = stored_hash else {
+        return Err(ApiError::BadRequest(
+            "You haven't set a wallet PIN yet.".into(),
+        ));
+    };
+    confirm_wallet_owner(
+        &state,
+        &principal,
+        &input.method,
+        input.current_pin_hash.as_deref(),
+        input.hint.as_deref(),
+        input.password.as_deref(),
+        &stored_hash,
+        stored_hint.as_deref(),
     )
-    .bind(tenant)
-    .bind(&principal.student.id)
-    .bind(&input.new_pin_hash)
-    .bind(&hint)
-    .execute(db.pool())
     .await?;
-    Ok(Json(ApiResponse::new(
-        json!({"ok": true, "hasPinHint": hint.is_some()}),
-    )))
+    Ok(Json(ApiResponse::new(json!({"ok": true}))))
 }
 
 fn require_any_role(principal: &AuthPrincipal) -> ApiResult<()> {

@@ -22,7 +22,8 @@ use crate::{
 };
 
 /// Where `app` requests are also emailed.
-const SUPPORT_EMAIL: &str = "support@supercampus.ai";
+/// The monitored SuperCampus mailbox (support@ and privacy@ are not set up).
+const SUPPORT_EMAIL: &str = "dev@supercampus.ai";
 /// Every tenant has this role, so a request is never left without an owner.
 const FALLBACK_ROLE: &str = "tenant_admin";
 const SUBJECT_CHARS: std::ops::RangeInclusive<usize> = 3..=120;

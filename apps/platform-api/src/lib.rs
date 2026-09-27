@@ -71,10 +71,32 @@ pub fn app(state: AppState) -> axum::Router {
             StatusCode::GATEWAY_TIMEOUT,
             Duration::from_secs(request_timeout),
         ))
+        .layer(middleware::from_fn(log_refused_requests))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(TraceLayer::new_for_http())
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(middleware::from_fn(security_response_headers))
+}
+
+/// Logs every refused request (4xx, and 5xx such as timeouts) with its method,
+/// path and status, so a failure a user sees can be found in the logs. Only the
+/// path is logged — query strings can carry realtime tokens.
+async fn log_refused_requests(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    let status = response.status();
+    if status.is_client_error() || status.is_server_error() {
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            status = status.as_u16(),
+            latency_ms = started.elapsed().as_millis() as u64,
+            "request refused"
+        );
+    }
+    response
 }
 
 async fn security_response_headers(

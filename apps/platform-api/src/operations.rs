@@ -65,6 +65,10 @@ pub fn router() -> Router<AppState> {
         .route("/canteen/wallets", get(wallet_directory))
         .route("/canteen/wallet-transactions", get(wallet_transactions))
         .route(
+            "/canteen/wallet-transactions/{transaction_id}",
+            get(own_wallet_transaction),
+        )
+        .route(
             "/canteen/wallet-settings",
             get(wallet_top_up_settings).put(update_wallet_top_up_settings),
         )
@@ -2987,6 +2991,130 @@ async fn wallet_transactions(
     .await?;
     Ok(Json(ApiResponse::new(
         json!({"transactions": transactions}),
+    )))
+}
+
+/// The gateway payment id of an online top-up, recovered from the ledger row's
+/// idempotency key (`razorpay:<payment id>`). Other kinds carry no payment id.
+fn razorpay_payment_id(transaction_type: &str, idempotency_key: Option<&str>) -> Option<String> {
+    if transaction_type != "online_top_up" {
+        return None;
+    }
+    idempotency_key
+        .and_then(|key| key.strip_prefix("razorpay:"))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+/// One of the signed-in user's own wallet transactions, with everything a
+/// receipt needs: the order it paid for (with its line snapshot), the laundry
+/// charge, the gateway references of a top-up, and the balance it left.
+///
+/// Scoped to the caller's own ledger rows by tenant and user, whatever role
+/// they hold — the tenant-wide ledger stays behind `wallet_transactions`.
+async fn own_wallet_transaction(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(transaction_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(
+        &access,
+        &[
+            "canteen.menu.read",
+            "canteen.order.read",
+            "canteen.order.create",
+            "canteen.wallet.top_up",
+        ],
+    )?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let row = sqlx::query_as::<_, (Value, String, Option<String>)>(
+        r#"
+        SELECT jsonb_build_object(
+          'id', t.id,
+          'shopKey', t.shop_key,
+          'shopName', (SELECT shop.name FROM campus_ops.shops shop
+                        WHERE shop.tenant_id=t.tenant_id AND shop.shop_key=t.shop_key LIMIT 1),
+          'amount', t.amount::float8,
+          'transactionType', t.transaction_type,
+          'description', t.description,
+          'referenceId', t.reference_id,
+          'createdAt', t.created_at,
+          -- Every balance change writes a ledger row, so the balance a row left
+          -- is today's balance less everything that came after it. Rows that
+          -- share its instant in the same wallet make the order ambiguous, so
+          -- then no figure is given rather than a guessed one.
+          'balanceAfter', CASE WHEN EXISTS (
+              SELECT 1 FROM campus_ops.canteen_wallet_transactions tie
+              WHERE tie.tenant_id=t.tenant_id AND tie.user_id=t.user_id
+                AND tie.shop_key=t.shop_key AND tie.created_at=t.created_at AND tie.id<>t.id)
+            THEN NULL
+            ELSE (SELECT wallet.balance::float8 FROM campus_ops.canteen_wallets wallet
+                  WHERE wallet.tenant_id=t.tenant_id AND wallet.user_id=t.user_id
+                    AND wallet.shop_key=t.shop_key)
+              - COALESCE((SELECT sum(later.amount)::float8
+                  FROM campus_ops.canteen_wallet_transactions later
+                  WHERE later.tenant_id=t.tenant_id AND later.user_id=t.user_id
+                    AND later.shop_key=t.shop_key AND later.created_at>t.created_at), 0)
+          END,
+          'order', (SELECT jsonb_build_object('id',o.id,'orderNumber',o.order_number,
+                      'lines',o.lines,'total',o.total::float8,'status',o.status,
+                      'fulfilmentMode',o.fulfilment_mode,'tokenNumber',o.token_number,
+                      'store',o.store,'createdAt',o.created_at)
+                    FROM campus_ops.canteen_orders o
+                    WHERE o.tenant_id=t.tenant_id AND o.customer_user_id=t.user_id
+                      AND t.transaction_type IN ('order_debit','refund')
+                      AND o.id::text=t.reference_id
+                    LIMIT 1),
+          'laundryCharge', (SELECT jsonb_build_object('id',c.id,'serviceType',c.service_type,
+                      'name',c.name,'description',c.description,'quantity',c.quantity::float8,
+                      'unitLabel',c.unit_label,'unitPrice',c.unit_price::float8,
+                      'total',c.total::float8,'status',c.status,'paidAt',c.paid_at)
+                    FROM campus_ops.laundry_charges c
+                    WHERE c.tenant_id=t.tenant_id AND c.claimed_by=t.user_id
+                      AND t.transaction_type='order_debit'
+                      AND c.id::text=t.reference_id
+                    LIMIT 1),
+          'customer', (SELECT jsonb_build_object('name',student.full_name,
+                      'studentNumber',student.student_number,'email',student.email)
+                    FROM core.students student
+                    WHERE student.tenant_id=t.tenant_id
+                      AND student.user_account_id::text=t.user_id
+                    LIMIT 1),
+          'institutionName', (SELECT tenant.name FROM platform.tenants tenant WHERE tenant.id=t.tenant_id)
+        ), t.transaction_type, t.idempotency_key
+        FROM campus_ops.canteen_wallet_transactions t
+        WHERE t.tenant_id=$1 AND t.user_id=$2 AND t.id=$3"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(transaction_id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Transaction not found".into()))?;
+    let (mut transaction, transaction_type, idempotency_key) = row;
+    if let Some(object) = transaction.as_object_mut() {
+        if let Some(payment_id) = razorpay_payment_id(&transaction_type, idempotency_key.as_deref())
+        {
+            object.insert("paymentId".into(), json!(payment_id));
+        }
+        // The student record is the source of truth for campus identity; the
+        // session fills in only for accounts that have none.
+        if object.get("customer").is_none_or(Value::is_null) {
+            object.insert(
+                "customer".into(),
+                json!({
+                    "name": principal.student.name,
+                    "studentNumber": principal.student.roll,
+                    "email": principal.student.email,
+                }),
+            );
+        }
+    }
+    Ok(Json(ApiResponse::new(
+        json!({ "transaction": transaction }),
     )))
 }
 
@@ -7372,6 +7500,21 @@ fn require_any_role(principal: &AuthPrincipal) -> ApiResult<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn razorpay_payment_id_is_read_only_from_online_top_ups() {
+        assert_eq!(
+            razorpay_payment_id("online_top_up", Some("razorpay:pay_ABC123")),
+            Some("pay_ABC123".into())
+        );
+        assert_eq!(razorpay_payment_id("online_top_up", Some("razorpay:")), None);
+        assert_eq!(razorpay_payment_id("online_top_up", Some("mobile-1")), None);
+        assert_eq!(razorpay_payment_id("online_top_up", None), None);
+        assert_eq!(
+            razorpay_payment_id("order_debit", Some("razorpay:pay_ABC123")),
+            None
+        );
+    }
 
     fn access(portal_family: &str, permissions: &[&str]) -> EffectiveAccess {
         EffectiveAccess {

@@ -219,6 +219,10 @@ ACCOUNTANT_GRANTS = (
     + keys("tuition_fee", "invoice.create", "invoice.read", "payment.create", "payment.read")
     + keys("examination", "eligibility.read")
     + keys("canteen", "analytics.read")
+    # The accountant portal recharges every campus user's store wallets and sets
+    # the online top-up limits (migrations 0071 and 0087 grant the same keys to
+    # accountant roles that already exist when they run).
+    + keys("canteen", "wallet.read", "wallet.top_up", "wallet.configure")
     + keys("vendor_management", "payments.create", "payments.read", "payments.approve",
            "contracts.read", "purchase_orders.read")
     + keys("dashboard", "fee_readiness.read")

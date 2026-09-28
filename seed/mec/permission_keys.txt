@@ -69,6 +69,7 @@ canteen.order.create
 canteen.order.read
 canteen.orders.manage
 canteen.order.update
+canteen.wallet.configure
 canteen.wallet.read
 canteen.wallet.top_up
 canteen.wallet.update

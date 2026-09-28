@@ -77,6 +77,10 @@ pub fn router(state: AppState) -> Router {
             put(admin_users::set_tenant_user_password),
         )
         .route(
+            "/authorization/users/{user_id}/status",
+            put(admin_users::set_tenant_user_status),
+        )
+        .route(
             "/authorization/users/{user_id}/access",
             get(get_tenant_user_access).put(set_tenant_user_access),
         )
@@ -460,11 +464,27 @@ async fn list_authorization_roles(
     Extension(access): Extension<EffectiveAccess>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require_effective_permission(&access, "authorization.roles.read")?;
-    Ok(Json(ApiResponse::new(
-        state
-            .authorization_roles(&principal.student.tenant_id)
-            .await?,
-    )))
+    let mut roles = state
+        .authorization_roles(&principal.student.tenant_id)
+        .await?;
+    // Tell clients which roles this caller may hand out, so a tenant admin is
+    // never offered a platform or super-administrator role to assign.
+    let platform_admin = crate::platform_admin::is_platform_admin(&access);
+    if let Some(list) = roles.as_array_mut() {
+        for role in list {
+            let key = role.get("key").and_then(Value::as_str).unwrap_or_default();
+            let family = role
+                .get("portalFamily")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let assignable =
+                admin_users::may_change_role(&access.roles, platform_admin, key, family);
+            if let Some(object) = role.as_object_mut() {
+                object.insert("assignable".into(), Value::Bool(assignable));
+            }
+        }
+    }
+    Ok(Json(ApiResponse::new(roles)))
 }
 
 async fn create_authorization_role(
@@ -474,6 +494,15 @@ async fn create_authorization_role(
     Json(request): Json<CreateAuthorizationRoleRequest>,
 ) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
     require_effective_permission(&access, "authorization.roles.create")?;
+    admin_users::guard_role_definition(
+        &state,
+        &principal.student.tenant_id,
+        &access,
+        None,
+        Some(request.key.trim()),
+        Some(request.portal_family.trim()),
+    )
+    .await?;
     if request.name.trim().is_empty() || !valid_role_key(&request.key) {
         return Err(ApiError::BadRequest(
             "name is required and key must use lowercase letters, numbers, or underscores".into(),
@@ -510,6 +539,15 @@ async fn update_authorization_role(
     Json(request): Json<UpdateAuthorizationRoleRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require_effective_permission(&access, "authorization.roles.update")?;
+    admin_users::guard_role_definition(
+        &state,
+        &principal.student.tenant_id,
+        &access,
+        Some(role_id),
+        None,
+        request.portal_family.as_deref().map(str::trim),
+    )
+    .await?;
     Ok(Json(ApiResponse::new(
         state
             .update_authorization_role(
@@ -529,6 +567,15 @@ async fn delete_authorization_role(
     Path(role_id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     require_effective_permission(&access, "authorization.roles.delete")?;
+    admin_users::guard_role_definition(
+        &state,
+        &principal.student.tenant_id,
+        &access,
+        Some(role_id),
+        None,
+        None,
+    )
+    .await?;
     state
         .delete_authorization_role(&principal.student.tenant_id, &principal.student.id, role_id)
         .await?;
@@ -543,6 +590,15 @@ async fn set_authorization_role_permissions(
     Json(request): Json<SetRolePermissionsRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require_effective_permission(&access, "authorization.roles.update")?;
+    admin_users::guard_role_definition(
+        &state,
+        &principal.student.tenant_id,
+        &access,
+        Some(role_id),
+        None,
+        None,
+    )
+    .await?;
     validate_surface(&request.surface)?;
     if request
         .permissions
@@ -617,6 +673,14 @@ async fn create_tenant_user(
             "name, valid email, at least one role, and a password between {MINIMUM_PASSWORD_LENGTH} characters and 72 bytes are required"
         )));
     }
+    admin_users::guard_role_assignment(
+        &state,
+        &principal.student.tenant_id,
+        &access,
+        None,
+        &request.role_ids,
+    )
+    .await?;
     let user = state
         .create_tenant_user(
             &principal.student.tenant_id,
@@ -644,6 +708,14 @@ async fn assign_tenant_user_roles(
     if request.role_ids.is_empty() {
         return Err(ApiError::BadRequest("at least one role is required".into()));
     }
+    admin_users::guard_role_assignment(
+        &state,
+        &principal.student.tenant_id,
+        &access,
+        Some(user_id),
+        &request.role_ids,
+    )
+    .await?;
     Ok(Json(ApiResponse::new(
         state
             .assign_tenant_user_roles(

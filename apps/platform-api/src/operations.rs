@@ -98,6 +98,10 @@ pub fn router() -> Router<AppState> {
             get(library_announcements).post(create_library_announcement),
         )
         .route(
+            "/library/announcements/{announcement_id}",
+            put(update_library_announcement).delete(delete_library_announcement),
+        )
+        .route(
             "/library/announcements/{announcement_id}/decision",
             post(decide_library_announcement),
         )
@@ -693,10 +697,9 @@ async fn changes(
     Extension(access): Extension<EffectiveAccess>,
     Query(query): Query<ChangeQuery>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
+    // Campus announcements are read by everyone in the tenant, so their
+    // change events (type names only, never payloads) reach every feed.
     let modules = authorized_change_modules(&access);
-    if modules.is_empty() {
-        return Ok(Json(ApiResponse::new(json!({"changes": []}))));
-    }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let rows = sqlx::query_scalar::<_, Value>(
@@ -706,7 +709,9 @@ async fn changes(
           SELECT jsonb_build_object('sequence', sequence, 'module', module_key,
             'eventType', event_type, 'createdAt', created_at) item
           FROM campus_ops.events
-          WHERE tenant_id = $1 AND sequence > $2 AND module_key = ANY($3)
+          WHERE tenant_id = $1 AND sequence > $2
+            AND (module_key = ANY($3)
+                 OR (module_key = 'library' AND aggregate_type = 'announcement'))
           ORDER BY sequence LIMIT $4
         ) feed"#,
     )
@@ -1242,6 +1247,51 @@ async fn canteen_store(
     Ok(Json(ApiResponse::new(data)))
 }
 
+/// Orders bucketed by where they ended up. `active` is everything still in
+/// the queue (pending, accepted, preparing, ready).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrderStatusDistribution {
+    completed: i64,
+    active: i64,
+    cancelled: i64,
+}
+
+impl OrderStatusDistribution {
+    fn from_counts(completed: i64, active: i64, cancelled: i64) -> Self {
+        Self {
+            completed: completed.max(0),
+            active: active.max(0),
+            cancelled: cancelled.max(0),
+        }
+    }
+
+    fn total(&self) -> i64 {
+        self.completed + self.active + self.cancelled
+    }
+
+    /// Whole-number share of the bucketed orders; 0 when there are none.
+    fn percentage(&self, count: i64) -> f64 {
+        let total = self.total();
+        if total <= 0 {
+            return 0.0;
+        }
+        ((count as f64 / total as f64) * 100.0).round()
+    }
+}
+
+/// Food-counter vs other-store share of completed revenue. Both are 0 when
+/// nothing has sold yet, rather than claiming 100% of nothing.
+fn revenue_split_percentages(food: f64, other: f64) -> (f64, f64) {
+    let food = food.max(0.0);
+    let other = other.max(0.0);
+    let total = food + other;
+    if total <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let food_pct = ((food / total) * 100.0).round();
+    (food_pct, (100.0 - food_pct).max(0.0))
+}
+
 async fn sales_dashboard(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -1307,7 +1357,7 @@ async fn sales_dashboard(
     .unwrap_or(0.0);
 
     let db_today_online = sqlx::query_scalar::<_, f64>(
-        "SELECT COALESCE(sum(amount)::float8, 0) FROM campus_ops.canteen_wallet_transactions WHERE tenant_id=$1 AND transaction_type='top_up' AND created_at::date = CURRENT_DATE",
+        "SELECT COALESCE(sum(amount)::float8, 0) FROM campus_ops.canteen_wallet_transactions WHERE tenant_id=$1 AND transaction_type='online_top_up' AND created_at::date = CURRENT_DATE",
     )
     .bind(tenant)
     .fetch_one(db.pool())
@@ -1315,7 +1365,7 @@ async fn sales_dashboard(
     .unwrap_or(0.0);
 
     let db_month_online = sqlx::query_scalar::<_, f64>(
-        "SELECT COALESCE(sum(amount)::float8, 0) FROM campus_ops.canteen_wallet_transactions WHERE tenant_id=$1 AND transaction_type='top_up' AND date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)",
+        "SELECT COALESCE(sum(amount)::float8, 0) FROM campus_ops.canteen_wallet_transactions WHERE tenant_id=$1 AND transaction_type='online_top_up' AND date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)",
     )
     .bind(tenant)
     .fetch_one(db.pool())
@@ -1348,31 +1398,38 @@ async fn sales_dashboard(
     .await
     .unwrap_or(0);
 
+    // A shop can reject an order and a student can cancel one; both end the
+    // order without a sale, so the distribution counts them together.
     let db_cancelled_orders = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND status='cancelled'",
+        "SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND status IN ('cancelled','rejected')",
     )
     .bind(tenant)
     .fetch_one(db.pool())
     .await
     .unwrap_or(0);
 
-    let total_orders_f = if db_total_orders > 0 { db_total_orders as f64 } else { 1.0 };
-    let completed_pct = if db_total_orders > 0 { ((db_completed_orders as f64 / total_orders_f) * 100.0).round() } else { 0.0 };
-    let cancelled_pct = if db_total_orders > 0 { ((db_cancelled_orders as f64 / total_orders_f) * 100.0).round() } else { 0.0 };
-    let pending_pct = if db_total_orders > 0 { ((db_pending_orders as f64 / total_orders_f) * 100.0).round() } else { 0.0 };
+    let distribution = OrderStatusDistribution::from_counts(
+        db_completed_orders,
+        db_pending_orders,
+        db_cancelled_orders,
+    );
 
-    let total_top_ups = sqlx::query_scalar::<_, f64>(
-        "SELECT COALESCE(sum(amount)::float8, 0) FROM campus_ops.canteen_wallet_transactions WHERE tenant_id=$1 AND transaction_type='top_up'",
+    // Completed sales split by the kind of shop that made them: food counters
+    // against the QR-paid stores (stationery, laundry). Top-ups are money
+    // moving into wallets, not sales, and do not belong in this split.
+    let (food_revenue, other_revenue) = sqlx::query_as::<_, (f64, f64)>(
+        r#"SELECT
+             COALESCE(sum(o.total) FILTER (WHERE lower(COALESCE(s.category, 'canteen')) = 'canteen'), 0)::float8,
+             COALESCE(sum(o.total) FILTER (WHERE lower(COALESCE(s.category, 'canteen')) <> 'canteen'), 0)::float8
+           FROM campus_ops.canteen_orders o
+           LEFT JOIN campus_ops.shops s ON s.tenant_id = o.tenant_id AND s.shop_key = o.store
+           WHERE o.tenant_id=$1 AND o.status='completed'"#,
     )
     .bind(tenant)
     .fetch_one(db.pool())
     .await
-    .unwrap_or(0.0);
-
-    let combined_total = total_revenue + total_top_ups;
-    let combined_f = if combined_total > 0.0 { combined_total } else { 1.0 };
-    let orders_pct = if combined_total > 0.0 { ((total_revenue / combined_f) * 100.0).round() } else { 100.0 };
-    let adhoc_pct = if combined_total > 0.0 { (100.0 - orders_pct).max(0.0) } else { 0.0 };
+    .unwrap_or((0.0, 0.0));
+    let (orders_pct, adhoc_pct) = revenue_split_percentages(food_revenue, other_revenue);
 
     let recent_orders = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -1452,13 +1509,19 @@ async fn sales_dashboard(
         "pendingRequests": pending_actions,
         "pendingActionsTrend": format!("0 approvals · {} requests", pending_actions),
         "orderStatusDistribution": {
-            "completed": completed_pct,
-            "cancelled": cancelled_pct,
-            "pending": pending_pct
+            "completed": distribution.percentage(distribution.completed),
+            "cancelled": distribution.percentage(distribution.cancelled),
+            "pending": distribution.percentage(distribution.active),
+            "completedCount": distribution.completed,
+            "cancelledCount": distribution.cancelled,
+            "pendingCount": distribution.active,
+            "totalCount": distribution.total()
         },
         "paymentSplit": {
             "ordersPercentage": orders_pct,
-            "adhocPercentage": adhoc_pct
+            "adhocPercentage": adhoc_pct,
+            "ordersRevenue": food_revenue,
+            "adhocRevenue": other_revenue
         },
         "shops": shops,
         "recentOrders": recent_orders
@@ -2777,6 +2840,375 @@ struct TopUpRequest {
 struct WalletDirectoryQuery {
     search: Option<String>,
     limit: Option<i64>,
+    offset: Option<i64>,
+    /// `all` (default), `students` or `staff` (everyone who is not a student).
+    #[serde(alias = "role")]
+    audience: Option<String>,
+    /// Year of study (1–6); only students match a year filter.
+    year: Option<i64>,
+}
+
+/// Store categories that hold a prepaid campus wallet.
+const WALLET_STORE_CATEGORIES: [&str; 3] = ["canteen", "stationery", "laundry"];
+const WALLET_DIRECTORY_DEFAULT_LIMIT: usize = 50;
+const WALLET_DIRECTORY_MAX_LIMIT: usize = 200;
+
+/// A control-plane membership row of the tenant (active or not).
+#[derive(Debug, Clone, Default)]
+struct WalletMemberRow {
+    user_id: String,
+    email: String,
+    display_name: String,
+    roles: Vec<String>,
+    eligible: bool,
+    photo_url: Option<String>,
+    roll: Option<String>,
+    department: Option<String>,
+    year: Option<String>,
+}
+
+/// An active/provisional tenant student record with a login account.
+#[derive(Debug, Clone, Default)]
+struct WalletStudentRow {
+    user_id: String,
+    student_id: String,
+    student_number: String,
+    full_name: String,
+    email: Option<String>,
+    department: String,
+    year: Option<String>,
+    photo_url: Option<String>,
+    tenant_user_active: bool,
+}
+
+/// One person the accountant can recharge.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct WalletPerson {
+    user_id: String,
+    name: String,
+    display_name: String,
+    email: String,
+    roles: Vec<String>,
+    is_student: bool,
+    student_id: Option<String>,
+    student_number: String,
+    department: String,
+    year_of_study: Option<u8>,
+    year_label: Option<String>,
+    photo_url: Option<String>,
+}
+
+impl WalletPerson {
+    fn audience(&self) -> &'static str {
+        if self.is_student { "student" } else { "staff" }
+    }
+
+    fn primary_role(&self) -> String {
+        if self.is_student {
+            return "student".into();
+        }
+        // A specific role (HOD, warden ...) says more than the generic `staff`.
+        self.roles
+            .iter()
+            .find(|role| !matches!(role.as_str(), "student" | "staff" | "member"))
+            .or_else(|| self.roles.iter().find(|role| role.as_str() != "student"))
+            .cloned()
+            .unwrap_or_else(|| "member".into())
+    }
+
+    fn search_text(&self) -> String {
+        let labels: Vec<String> = self.roles.iter().map(|role| role_label(role)).collect();
+        [
+            self.name.as_str(),
+            self.display_name.as_str(),
+            self.email.as_str(),
+            self.student_number.as_str(),
+            self.department.as_str(),
+            &self.roles.join(" "),
+            &labels.join(" "),
+        ]
+        .join(" ")
+        .to_lowercase()
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Year of study (1–6) from free text such as `2`, `II`, `2nd`, `Second year`.
+/// Academic sessions such as `2026-27` are not a year of study.
+fn parse_year_of_study(value: &str) -> Option<u8> {
+    let text = value.trim().to_lowercase();
+    if text.is_empty() {
+        return None;
+    }
+    let digits_run = text
+        .split(|c: char| !c.is_ascii_digit())
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    if digits_run >= 3 {
+        return None;
+    }
+    let cleaned: String = text
+        .replace("year", " ")
+        .replace("yr", " ")
+        .replace(['-', '_', '.'], " ");
+    let cleaned = cleaned.trim();
+    let in_range = |n: u8| (1..=6).contains(&n).then_some(n);
+    if let Ok(n) = cleaned.parse::<u8>() {
+        return in_range(n);
+    }
+    for token in cleaned.split_whitespace() {
+        let numeric: String = token.chars().take_while(char::is_ascii_digit).collect();
+        if !numeric.is_empty() {
+            let rest = &token[numeric.len()..];
+            if matches!(rest, "" | "st" | "nd" | "rd" | "th") {
+                return numeric.parse::<u8>().ok().and_then(in_range);
+            }
+        }
+        let word = match token {
+            "i" | "first" => Some(1),
+            "ii" | "second" => Some(2),
+            "iii" | "third" => Some(3),
+            "iv" | "fourth" => Some(4),
+            "v" | "fifth" => Some(5),
+            "vi" | "sixth" => Some(6),
+            _ => None,
+        };
+        if word.is_some() {
+            return word;
+        }
+    }
+    None
+}
+
+/// Human label for a membership role key (`hod` → `HOD`, `stationery_operator`
+/// → `Stationery Operator`).
+fn role_label(role: &str) -> String {
+    match role.trim().to_lowercase().as_str() {
+        "hod" => "HOD".into(),
+        "tenant_admin" | "admin" | "administrator" => "Admin".into(),
+        "super_admin" | "superadmin" => "Super Admin".into(),
+        other => other
+            .split(['_', '-', '.', ' '])
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn is_wallet_store_category(category: &str) -> bool {
+    let category = category.trim().to_lowercase();
+    WALLET_STORE_CATEGORIES.contains(&category.as_str())
+}
+
+/// Everyone whose wallet an accountant may recharge: every active member of
+/// the tenant (control-plane membership + account both active), enriched with
+/// the tenant's student record when there is one. Student records whose account
+/// the control plane does not know at all are kept (older tenants whose
+/// students were provisioned only in the tenant database); a student whose
+/// membership or account is deactivated is left out.
+fn merge_wallet_people(
+    members: Vec<WalletMemberRow>,
+    students: Vec<WalletStudentRow>,
+) -> Vec<WalletPerson> {
+    use std::collections::HashMap;
+    let mut students_by_user: HashMap<String, WalletStudentRow> = HashMap::new();
+    for student in students {
+        students_by_user
+            .entry(student.user_id.to_lowercase())
+            .or_insert(student);
+    }
+    let mut known = std::collections::HashSet::new();
+    let mut people = Vec::new();
+    for member in members {
+        let key = member.user_id.to_lowercase();
+        if !known.insert(key.clone()) || !member.eligible {
+            continue;
+        }
+        let student = students_by_user.get(&key);
+        let is_student = student.is_some() || member.roles.iter().any(|role| role == "student");
+        let display_name = non_empty(Some(&member.display_name)).unwrap_or_default();
+        let raw_year = student
+            .and_then(|s| s.year.clone())
+            .or_else(|| member.year.clone())
+            .and_then(|year| non_empty(Some(&year)));
+        let name = student
+            .and_then(|s| non_empty(Some(&s.full_name)))
+            .or_else(|| non_empty(Some(&display_name)))
+            .unwrap_or_else(|| member.email.clone());
+        people.push(WalletPerson {
+            user_id: member.user_id.clone(),
+            name,
+            display_name,
+            email: student
+                .and_then(|s| non_empty(s.email.as_deref()))
+                .unwrap_or_else(|| member.email.clone()),
+            roles: member.roles.clone(),
+            is_student,
+            student_id: student.map(|s| s.student_id.clone()),
+            student_number: student
+                .map(|s| s.student_number.clone())
+                .or_else(|| is_student.then(|| member.roll.clone()).flatten())
+                .unwrap_or_default(),
+            department: student
+                .and_then(|s| non_empty(Some(&s.department)))
+                .or_else(|| member.department.clone())
+                .unwrap_or_default(),
+            year_of_study: if is_student {
+                raw_year.as_deref().and_then(parse_year_of_study)
+            } else {
+                None
+            },
+            year_label: if is_student { raw_year } else { None },
+            photo_url: student
+                .and_then(|s| s.photo_url.clone())
+                .or(member.photo_url.clone()),
+        });
+    }
+    for (key, student) in students_by_user {
+        if known.contains(&key) || !student.tenant_user_active {
+            continue;
+        }
+        let raw_year = student.year.as_deref().and_then(|y| non_empty(Some(y)));
+        people.push(WalletPerson {
+            user_id: student.user_id.clone(),
+            name: non_empty(Some(&student.full_name))
+                .or_else(|| student.email.clone())
+                .unwrap_or_else(|| student.student_number.clone()),
+            display_name: student.full_name.clone(),
+            email: student.email.clone().unwrap_or_default(),
+            roles: vec!["student".into()],
+            is_student: true,
+            student_id: Some(student.student_id.clone()),
+            student_number: student.student_number.clone(),
+            department: student.department.clone(),
+            year_of_study: raw_year.as_deref().and_then(parse_year_of_study),
+            year_label: raw_year,
+            photo_url: student.photo_url.clone(),
+        });
+    }
+    people
+}
+
+/// Directory order: name A–Z (case-insensitive), then register number, then
+/// user id, so paging is stable.
+fn sort_wallet_people(people: &mut [WalletPerson]) {
+    people.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.student_number.cmp(&right.student_number))
+            .then_with(|| left.user_id.cmp(&right.user_id))
+    });
+}
+
+fn search_terms(search: &str) -> Vec<String> {
+    search
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+fn matches_search(person: &WalletPerson, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let text = person.search_text();
+    terms.iter().all(|term| text.contains(term.as_str()))
+}
+
+fn matches_audience(person: &WalletPerson, audience: &str) -> bool {
+    match audience {
+        "students" | "student" => person.is_student,
+        "staff" | "others" => !person.is_student,
+        _ => true,
+    }
+}
+
+fn normalized_audience(value: Option<&str>) -> ApiResult<&'static str> {
+    match value.map(|v| v.trim().to_lowercase()).as_deref() {
+        None | Some("") | Some("all") => Ok("all"),
+        Some("students") | Some("student") => Ok("students"),
+        Some("staff") | Some("others") | Some("non-students") => Ok("staff"),
+        Some(_) => Err(ApiError::BadRequest(
+            "Audience must be all, students or staff".into(),
+        )),
+    }
+}
+
+/// The public JSON of one directory row. Keeps the field names older app builds
+/// read (`studentName`, `studentNumber`, `walletBalances`, ...).
+fn wallet_person_json(
+    person: &WalletPerson,
+    balances: Option<&Value>,
+    updated_at: Option<&Value>,
+    last_transaction_at: Option<&Value>,
+) -> Value {
+    let balances = balances.cloned().unwrap_or_else(|| json!({}));
+    let total: f64 = balances
+        .as_object()
+        .map(|map| map.values().filter_map(Value::as_f64).sum())
+        .unwrap_or(0.0);
+    let role = person.primary_role();
+    json!({
+        "userId": person.user_id,
+        "studentId": person.student_id,
+        "studentNumber": person.student_number,
+        "studentName": person.name,
+        "name": person.name,
+        "displayName": person.display_name,
+        "email": person.email,
+        "department": person.department,
+        "yearOfStudy": person.year_of_study,
+        "yearLabel": person.year_label,
+        "photoUrl": person.photo_url,
+        "isStudent": person.is_student,
+        "audience": person.audience(),
+        "role": role,
+        "roleLabel": role_label(&role),
+        "roles": person.roles,
+        "roleLabels": person.roles.iter().map(|r| role_label(r)).collect::<Vec<_>>(),
+        "walletBalances": balances,
+        "balance": total,
+        "updatedAt": updated_at.cloned().unwrap_or(Value::Null),
+        "lastTransactionAt": last_transaction_at.cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// Formats a rupee amount without trailing zeros (`500`, `99.50`).
+fn format_wallet_amount(amount: f64) -> String {
+    if (amount - amount.round()).abs() < 0.005 {
+        format!("{:.0}", amount.round())
+    } else {
+        format!("{amount:.2}")
+    }
+}
+
+fn top_up_notification_body(amount: f64, store_name: &str) -> String {
+    let store = store_name.trim();
+    let store = if store.is_empty() { "campus" } else { store };
+    let store = store
+        .strip_suffix(" wallet")
+        .or_else(|| store.strip_suffix(" Wallet"))
+        .unwrap_or(store);
+    format!(
+        "₹{} was added to your {store} wallet",
+        format_wallet_amount(amount)
+    )
 }
 
 #[derive(Deserialize)]
@@ -2893,61 +3325,351 @@ async fn wallet_directory(
     Query(query): Query<WalletDirectoryQuery>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require(&access, "canteen.wallet.top_up")?;
+    let audience = normalized_audience(query.audience.as_deref())?;
+    let year = match query.year {
+        None => None,
+        Some(year) if (1..=6).contains(&year) => Some(year as u8),
+        Some(_) => {
+            return Err(ApiError::BadRequest(
+                "Year of study must be between 1 and 6".into(),
+            ));
+        }
+    };
+    let limit = query
+        .limit
+        .map(|limit| limit.clamp(1, WALLET_DIRECTORY_MAX_LIMIT as i64) as usize)
+        .unwrap_or(WALLET_DIRECTORY_DEFAULT_LIMIT);
+    let offset = query.offset.unwrap_or(0).max(0) as usize;
+    let terms = search_terms(query.search.as_deref().unwrap_or_default());
+
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let search = query.search.unwrap_or_default().trim().to_lowercase();
-    let pattern = format!("%{search}%");
-    let limit = query.limit.unwrap_or(500).clamp(1, 2000);
-    let wallets = sqlx::query_scalar::<_, Value>(
-        r#"
-        SELECT COALESCE(jsonb_agg(row ORDER BY row->>'studentNumber', lower(row->>'studentName')), '[]'::jsonb)
-        FROM (
-          SELECT jsonb_build_object(
-            'userId', student.user_account_id::text,
-            'studentId', student.id,
-            'studentNumber', student.student_number,
-            'studentName', student.full_name,
-            'email', student.email,
-            'department', COALESCE(department.code, student.department_id, ''),
-            'yearOfStudy', COALESCE(
-              NULLIF(student.profile->>'yearOfStudy',''),
-              NULLIF(student.profile->>'year',''),
-              NULLIF(student.academic_year,'')
-            ),
-            'photoUrl', NULLIF(student.profile ->> 'photoUrl', ''),
-            'walletBalances', COALESCE((SELECT jsonb_object_agg(w.shop_key, w.balance::float8) FROM campus_ops.canteen_wallets w WHERE w.tenant_id=student.tenant_id AND w.user_id=student.user_account_id::text), '{}'::jsonb),
-            'updatedAt', (SELECT MAX(w.updated_at) FROM campus_ops.canteen_wallets w WHERE w.tenant_id=student.tenant_id AND w.user_id=student.user_account_id::text),
-            'lastTransactionAt', (
-              SELECT transaction.created_at
-              FROM campus_ops.canteen_wallet_transactions transaction
-              WHERE transaction.tenant_id=student.tenant_id
-                AND transaction.user_id=student.user_account_id::text
-              ORDER BY transaction.created_at DESC LIMIT 1
-            )
-          ) AS row
-          FROM core.students student
-          JOIN identity.users user_account
-            ON user_account.id=student.user_account_id
-           AND user_account.active
-          LEFT JOIN core.departments department
-            ON department.tenant_id=student.tenant_id
-           AND department.id::text=student.department_id
-          WHERE student.tenant_id=$1
-            AND student.user_account_id IS NOT NULL
-            AND student.status IN ('provisional','active')
-            AND ($2='' OR lower(concat_ws(' ', student.student_number,
-              student.full_name, student.email, department.code)) LIKE $3)
-          ORDER BY student.student_number, lower(student.full_name)
-          LIMIT $4
-        ) directory"#,
+    let mut people = wallet_people(&state, &db, tenant, &principal.student.tenant_id).await?;
+    people.retain(|person| matches_search(person, &terms));
+    sort_wallet_people(&mut people);
+
+    // Counts reflect the search but not the audience/year filters, so the
+    // filter chips can say how many each would show.
+    let students = people.iter().filter(|p| p.is_student).count();
+    let mut years = serde_json::Map::new();
+    for person in people.iter().filter(|p| p.is_student) {
+        let key = person
+            .year_of_study
+            .map(|y| y.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let count = years.get(&key).and_then(Value::as_u64).unwrap_or(0) + 1;
+        years.insert(key, json!(count));
+    }
+    let counts = json!({
+        "all": people.len(),
+        "students": students,
+        "staff": people.len() - students,
+        "years": years,
+    });
+
+    people.retain(|person| {
+        matches_audience(person, audience)
+            && year.is_none_or(|year| person.is_student && person.year_of_study == Some(year))
+    });
+    let total = people.len();
+    let page: Vec<&WalletPerson> = people.iter().skip(offset).take(limit).collect();
+    let user_ids: Vec<String> = page.iter().map(|p| p.user_id.clone()).collect();
+
+    let wallet_rows = sqlx::query_as::<_, (String, Value, Option<Value>)>(
+        r#"SELECT w.user_id,
+                  jsonb_object_agg(w.shop_key, w.balance::float8),
+                  to_jsonb(MAX(w.updated_at))
+           FROM campus_ops.canteen_wallets w
+           WHERE w.tenant_id=$1 AND w.user_id = ANY($2)
+           GROUP BY w.user_id"#,
     )
     .bind(tenant)
-    .bind(&search)
-    .bind(pattern)
-    .bind(limit)
+    .bind(&user_ids)
+    .fetch_all(db.pool())
+    .await?;
+    let last_rows = sqlx::query_as::<_, (String, Value)>(
+        r#"SELECT t.user_id, to_jsonb(MAX(t.created_at))
+           FROM campus_ops.canteen_wallet_transactions t
+           WHERE t.tenant_id=$1 AND t.user_id = ANY($2)
+           GROUP BY t.user_id"#,
+    )
+    .bind(tenant)
+    .bind(&user_ids)
+    .fetch_all(db.pool())
+    .await?;
+    let wallets_by_user: std::collections::HashMap<String, (Value, Option<Value>)> = wallet_rows
+        .into_iter()
+        .map(|(user, balances, updated)| (user.to_lowercase(), (balances, updated)))
+        .collect();
+    let last_by_user: std::collections::HashMap<String, Value> = last_rows
+        .into_iter()
+        .map(|(user, at)| (user.to_lowercase(), at))
+        .collect();
+    let wallets: Vec<Value> = page
+        .iter()
+        .map(|person| {
+            let key = person.user_id.to_lowercase();
+            let wallet = wallets_by_user.get(&key);
+            wallet_person_json(
+                person,
+                wallet.map(|(balances, _)| balances),
+                wallet.and_then(|(_, updated)| updated.as_ref()),
+                last_by_user.get(&key),
+            )
+        })
+        .collect();
+
+    let stores = wallet_stores(db.pool(), tenant).await?;
+    let summary = sqlx::query_as::<_, (Value, f64, i64)>(
+        r#"SELECT COALESCE(jsonb_object_agg(shop_key, total), '{}'::jsonb),
+                  COALESCE(SUM(total), 0)::float8,
+                  COALESCE(SUM(holders), 0)::bigint
+           FROM (SELECT shop_key, SUM(balance)::float8 AS total,
+                        COUNT(*) FILTER (WHERE balance <> 0) AS holders
+                 FROM campus_ops.canteen_wallets WHERE tenant_id=$1
+                 GROUP BY shop_key) per_store"#,
+    )
+    .bind(tenant)
     .fetch_one(db.pool())
     .await?;
-    Ok(Json(ApiResponse::new(json!({"wallets": wallets}))))
+
+    Ok(Json(ApiResponse::new(json!({
+        "wallets": wallets,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "hasMore": offset + wallets.len() < total,
+        "order": "name",
+        "counts": counts,
+        "stores": stores,
+        "summary": {
+            "totalBalance": summary.1,
+            "balancesByStore": summary.0,
+            "fundedWallets": summary.2,
+        },
+    }))))
+}
+
+/// The control-plane database (memberships live there), or the tenant database
+/// when the API runs on a single database.
+fn control_database(
+    state: &AppState,
+    tenant_db: &supercampus_database::Database,
+) -> supercampus_database::Database {
+    state.database().unwrap_or_else(|| tenant_db.clone())
+}
+
+async fn wallet_member_rows(
+    control: &sqlx::PgPool,
+    tenant_slug: &str,
+    user_id: Option<Uuid>,
+) -> ApiResult<Vec<WalletMemberRow>> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Vec<String>,
+            bool,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        r#"SELECT user_account.id::text, user_account.email, user_account.display_name,
+                  membership.roles, (membership.active AND user_account.active),
+                  COALESCE(NULLIF(membership.profile->>'photoUrl',''),
+                           NULLIF(user_account.profile->>'photoUrl','')),
+                  COALESCE(NULLIF(membership.profile->>'roll',''),
+                           NULLIF(membership.profile->>'rollNumber',''),
+                           NULLIF(user_account.profile->>'roll',''),
+                           NULLIF(user_account.profile->>'rollNumber','')),
+                  COALESCE(NULLIF(membership.profile->>'department',''),
+                           NULLIF(membership.profile->>'dept',''),
+                           NULLIF(user_account.profile->>'department',''),
+                           NULLIF(user_account.profile->>'dept','')),
+                  COALESCE(NULLIF(membership.profile->>'yearOfStudy',''),
+                           NULLIF(membership.profile->>'year',''),
+                           NULLIF(user_account.profile->>'yearOfStudy',''),
+                           NULLIF(user_account.profile->>'year',''))
+           FROM identity.tenant_memberships membership
+           JOIN platform.tenants tenant ON tenant.id=membership.tenant_id
+           JOIN identity.users user_account ON user_account.id=membership.user_id
+           WHERE tenant.slug=$1 AND ($2::uuid IS NULL OR membership.user_id=$2)"#,
+    )
+    .bind(tenant_slug)
+    .bind(user_id)
+    .fetch_all(control)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(user_id, email, display_name, roles, eligible, photo_url, roll, department, year)| {
+                WalletMemberRow {
+                    user_id,
+                    email,
+                    display_name,
+                    roles,
+                    eligible,
+                    photo_url,
+                    roll,
+                    department,
+                    year,
+                }
+            },
+        )
+        .collect())
+}
+
+async fn wallet_student_rows(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    user_id: Option<Uuid>,
+) -> ApiResult<Vec<WalletStudentRow>> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+        ),
+    >(
+        r#"SELECT student.user_account_id::text, student.id::text, student.student_number,
+                  student.full_name, student.email,
+                  COALESCE(department.code, student.department_id, ''),
+                  COALESCE(NULLIF(student.profile->>'yearOfStudy',''),
+                           NULLIF(student.profile->>'year',''),
+                           NULLIF(student.academic_year,'')),
+                  NULLIF(student.profile->>'photoUrl',''),
+                  COALESCE(user_account.active, false)
+           FROM core.students student
+           LEFT JOIN identity.users user_account ON user_account.id=student.user_account_id
+           LEFT JOIN core.departments department
+             ON department.tenant_id=student.tenant_id
+            AND department.id::text=student.department_id
+           WHERE student.tenant_id=$1
+             AND student.user_account_id IS NOT NULL
+             AND student.status IN ('provisional','active')
+             AND ($2::uuid IS NULL OR student.user_account_id=$2)
+           ORDER BY student.student_number"#,
+    )
+    .bind(tenant)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                user_id,
+                student_id,
+                student_number,
+                full_name,
+                email,
+                department,
+                year,
+                photo_url,
+                tenant_user_active,
+            )| WalletStudentRow {
+                user_id,
+                student_id,
+                student_number,
+                full_name,
+                email,
+                department,
+                year,
+                photo_url,
+                tenant_user_active,
+            },
+        )
+        .collect())
+}
+
+/// Everyone (or one user) whose wallet can be recharged in this tenant.
+async fn wallet_people_for(
+    state: &AppState,
+    db: &supercampus_database::Database,
+    tenant: Uuid,
+    tenant_slug: &str,
+    user_id: Option<Uuid>,
+) -> ApiResult<Vec<WalletPerson>> {
+    let control = control_database(state, db);
+    let members = wallet_member_rows(control.pool(), tenant_slug, user_id).await?;
+    let students = wallet_student_rows(db.pool(), tenant, user_id).await?;
+    Ok(merge_wallet_people(members, students))
+}
+
+async fn wallet_people(
+    state: &AppState,
+    db: &supercampus_database::Database,
+    tenant: Uuid,
+    tenant_slug: &str,
+) -> ApiResult<Vec<WalletPerson>> {
+    wallet_people_for(state, db, tenant, tenant_slug, None).await
+}
+
+/// The tenant's active stores that hold wallets, canteen first.
+async fn wallet_stores(pool: &sqlx::PgPool, tenant: Uuid) -> ApiResult<Vec<Value>> {
+    Ok(sqlx::query_scalar::<_, Value>(
+        r#"SELECT jsonb_build_object('shopKey', shop.shop_key, 'name', shop.name,
+                  'category', lower(shop.category), 'active', shop.is_active,
+                  'isOpen', shop.shop_open)
+           FROM campus_ops.shops shop
+           WHERE shop.tenant_id=$1 AND shop.is_active
+             AND lower(shop.category) = ANY($2)
+           ORDER BY array_position($2, lower(shop.category)), shop.created_at, shop.shop_key"#,
+    )
+    .bind(tenant)
+    .bind(WALLET_STORE_CATEGORIES.map(str::to_owned).to_vec())
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Resolves the store wallet a top-up credits. A given `shopKey` must be an
+/// active canteen, stationery or laundry store of this tenant. Clients that
+/// predate store wallets send none; they keep crediting the canteen wallet.
+async fn resolve_top_up_store(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    shop_key: Option<&str>,
+) -> ApiResult<(String, String)> {
+    let stores = wallet_stores(pool, tenant).await?;
+    let store_of = |value: &Value| {
+        Some((
+            value.get("shopKey")?.as_str()?.to_owned(),
+            value.get("name")?.as_str()?.to_owned(),
+            value.get("category")?.as_str()?.to_owned(),
+        ))
+    };
+    match shop_key.map(str::trim) {
+        Some("") => Err(ApiError::BadRequest(
+            "Choose which store wallet to top up".into(),
+        )),
+        Some(key) => stores
+            .iter()
+            .filter_map(store_of)
+            .find(|(shop_key, _, category)| shop_key == key && is_wallet_store_category(category))
+            .map(|(shop_key, name, _)| (shop_key, name))
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "'{key}' is not an active canteen, stationery or laundry store of this campus"
+                ))
+            }),
+        None => stores
+            .iter()
+            .filter_map(store_of)
+            .find(|(_, _, category)| category == "canteen")
+            .map(|(shop_key, name, _)| (shop_key, name))
+            .ok_or_else(|| ApiError::BadRequest("Choose which store wallet to top up".into())),
+    }
 }
 
 async fn wallet_transactions(
@@ -2960,35 +3682,127 @@ async fn wallet_transactions(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let transactions = sqlx::query_scalar::<_, Value>(
+    let mut transactions = sqlx::query_scalar::<_, Value>(
         r#"
-        SELECT COALESCE(jsonb_agg(row ORDER BY row->>'createdAt' DESC), '[]'::jsonb)
-        FROM (
-          SELECT jsonb_build_object(
-            'id', transaction.id,
-            'shopKey', transaction.shop_key,
-            'userId', transaction.user_id,
-            'studentName', COALESCE(student.full_name, 'Campus user'),
-            'studentNumber', COALESCE(student.student_number, ''),
-            'amount', transaction.amount::float8,
-            'transactionType', transaction.transaction_type,
-            'description', transaction.description,
-            'referenceId', transaction.reference_id,
-            'createdAt', transaction.created_at
-          ) AS row
-          FROM campus_ops.canteen_wallet_transactions transaction
-          LEFT JOIN core.students student
-            ON student.tenant_id=transaction.tenant_id
-           AND student.user_account_id::text=transaction.user_id
-          WHERE transaction.tenant_id=$1
-          ORDER BY transaction.created_at DESC
-          LIMIT $2
-        ) activity"#,
+        SELECT jsonb_build_object(
+          'id', transaction.id,
+          'shopKey', transaction.shop_key,
+          'shopName', shop.name,
+          'shopCategory', lower(shop.category),
+          'userId', transaction.user_id,
+          'studentName', student.full_name,
+          'studentNumber', COALESCE(student.student_number, ''),
+          'isStudent', student.id IS NOT NULL,
+          'localName', NULLIF(user_account.display_name, ''),
+          'localEmail', user_account.email,
+          'amount', transaction.amount::float8,
+          'transactionType', transaction.transaction_type,
+          'description', transaction.description,
+          'referenceId', transaction.reference_id,
+          'actorUserId', transaction.actor_user_id,
+          'createdAt', transaction.created_at
+        )
+        FROM campus_ops.canteen_wallet_transactions transaction
+        LEFT JOIN core.students student
+          ON student.tenant_id=transaction.tenant_id
+         AND student.user_account_id::text=transaction.user_id
+        LEFT JOIN identity.users user_account
+          ON user_account.id::text=transaction.user_id
+        LEFT JOIN campus_ops.shops shop
+          ON shop.tenant_id=transaction.tenant_id
+         AND shop.shop_key=transaction.shop_key
+        WHERE transaction.tenant_id=$1
+        ORDER BY transaction.created_at DESC
+        LIMIT $2"#,
     )
     .bind(tenant)
     .bind(limit)
-    .fetch_one(db.pool())
+    .fetch_all(db.pool())
     .await?;
+    // Non-students are named from the control-plane account (the tenant copy
+    // of identity.users can lag behind it).
+    let user_ids: Vec<Uuid> = transactions
+        .iter()
+        .filter_map(|row| row.get("userId").and_then(Value::as_str))
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect();
+    let control = control_database(&state, &db);
+    let accounts: std::collections::HashMap<String, (String, String, Vec<String>)> =
+        sqlx::query_as::<_, (String, String, String, Option<Vec<String>>)>(
+            r#"SELECT user_account.id::text, user_account.display_name, user_account.email,
+                      membership.roles
+               FROM identity.users user_account
+               LEFT JOIN platform.tenants tenant ON tenant.slug=$2
+               LEFT JOIN identity.tenant_memberships membership
+                 ON membership.user_id=user_account.id AND membership.tenant_id=tenant.id
+               WHERE user_account.id = ANY($1)"#,
+        )
+        .bind(&user_ids)
+        .bind(&principal.student.tenant_id)
+        .fetch_all(control.pool())
+        .await?
+        .into_iter()
+        .map(|(id, name, email, roles)| {
+            (id.to_lowercase(), (name, email, roles.unwrap_or_default()))
+        })
+        .collect();
+    for row in &mut transactions {
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        let user_id = object
+            .get("userId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        let account = accounts.get(&user_id);
+        let student_name = object
+            .get("studentName")
+            .and_then(Value::as_str)
+            .and_then(|name| non_empty(Some(name)));
+        let local_name = object
+            .get("localName")
+            .and_then(Value::as_str)
+            .and_then(|name| non_empty(Some(name)));
+        let local_email = object
+            .get("localEmail")
+            .and_then(Value::as_str)
+            .and_then(|email| non_empty(Some(email)));
+        let name = student_name
+            .or_else(|| account.and_then(|(name, _, _)| non_empty(Some(name))))
+            .or(local_name)
+            .or_else(|| account.and_then(|(_, email, _)| non_empty(Some(email))))
+            .or(local_email.clone())
+            .unwrap_or_else(|| "Campus user".into());
+        let email = account
+            .and_then(|(_, email, _)| non_empty(Some(email)))
+            .or(local_email);
+        let is_student = object.get("isStudent").and_then(Value::as_bool) == Some(true)
+            || account.is_some_and(|(_, _, roles)| roles.iter().any(|r| r == "student"));
+        let role = if is_student {
+            "student".to_owned()
+        } else {
+            account
+                .and_then(|(_, _, roles)| roles.first().cloned())
+                .unwrap_or_else(|| "member".into())
+        };
+        if object.get("shopName").is_none_or(Value::is_null) {
+            let key = object
+                .get("shopKey")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            object.insert("shopName".into(), json!(role_label(&key)));
+        }
+        object.remove("localName");
+        object.remove("localEmail");
+        object.insert("studentName".into(), json!(name.clone()));
+        object.insert("name".into(), json!(name));
+        object.insert("email".into(), json!(email));
+        object.insert("isStudent".into(), json!(is_student));
+        object.insert("roleLabel".into(), json!(role_label(&role)));
+        object.insert("role".into(), json!(role));
+    }
     Ok(Json(ApiResponse::new(
         json!({"transactions": transactions}),
     )))
@@ -3126,52 +3940,138 @@ async fn top_up_wallet(
     Json(input): Json<TopUpRequest>,
 ) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
     require(&access, "canteen.wallet.top_up")?;
-    if input.amount <= 0.0 || input.amount > 100000.0 {
+    if !input.amount.is_finite() || input.amount <= 0.0 || input.amount > 100000.0 {
+        return Err(ApiError::BadRequest(
+            "Top-up amount must be greater than zero and at most 100000".into(),
+        ));
+    }
+    let amount = (input.amount * 100.0).round() / 100.0;
+    if amount <= 0.0 {
         return Err(ApiError::BadRequest(
             "Top-up amount must be greater than zero".into(),
         ));
     }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let target_user_id = Uuid::parse_str(&user_id)
+    let target_user_id = Uuid::parse_str(user_id.trim())
         .map_err(|_| ApiError::BadRequest("Wallet user id is invalid".into()))?;
-    // The recharge directory is sourced from active/provisional student
-    // records. Validate against that same source so an accountant can credit
-    // every student the UI actually lists; a stale/inactive membership row
-    // must not make a visible wallet impossible to recharge.
-    let active_student = sqlx::query_scalar::<_, bool>(
-        r#"SELECT EXISTS (
-               SELECT 1
-               FROM core.students student
-               JOIN identity.users user_account ON user_account.id = student.user_account_id
-               WHERE student.tenant_id = $1
-                 AND student.user_account_id = $2
-                 AND student.status IN ('provisional', 'active')
-                 AND user_account.active
-           )"#,
+    // Same rule as the recharge directory: any active member of this campus
+    // (students, staff, faculty, parents ...), never someone deactivated.
+    let person = wallet_people_for(
+        &state,
+        &db,
+        tenant,
+        &principal.student.tenant_id,
+        Some(target_user_id),
     )
-    .bind(tenant)
-    .bind(target_user_id)
-    .fetch_one(db.pool())
-    .await?;
-    if !active_student {
-        return Err(ApiError::NotFound(
-            "Active student wallet was not found".into(),
-        ));
-    }
-    let target_user_id = target_user_id.to_string();
-    let shop_key = input.shop_key.as_deref().unwrap_or("mec-canteen");
-    let mut tx = db.pool().begin().await?;
-    let balance=sqlx::query_scalar::<_,f64>("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version) VALUES($1,$2,$3,$4,1) ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now() RETURNING balance::float8")
- .bind(tenant).bind(&target_user_id).bind(shop_key).bind(input.amount).fetch_one(&mut *tx).await?;
+    .await?
+    .into_iter()
+    .next()
+    .ok_or_else(|| ApiError::NotFound("No active campus user with this wallet was found".into()))?;
+    let (shop_key, shop_name) =
+        resolve_top_up_store(db.pool(), tenant, input.shop_key.as_deref()).await?;
+    let target_user_id = person.user_id.to_lowercase();
+    let idempotency_key = input
+        .idempotency_key
+        .as_deref()
+        .and_then(|key| non_empty(Some(key)));
     let kind = if input.source.as_deref() == Some("online") {
         "online_top_up"
     } else {
         "manual_top_up"
     };
-    let transaction=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.canteen_wallet_transactions(tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id) VALUES($1,$2,$3,$4,$5,'Wallet top-up',$6,$7,$8) RETURNING jsonb_build_object('id',id,'amount',amount::float8,'transactionType',transaction_type,'description',description,'createdAt',created_at)")
- .bind(tenant).bind(&target_user_id).bind(shop_key).bind(input.amount).bind(kind).bind(input.reference).bind(input.idempotency_key).bind(&principal.student.id).fetch_one(&mut *tx).await?;
-    let payload = json!({"userId":target_user_id,"balance":balance,"transaction":transaction});
+    let reference = input.reference.as_deref().and_then(|r| non_empty(Some(r)));
+    let mut tx = db.pool().begin().await?;
+    // The ledger row goes first so a retried request (same idempotency key)
+    // credits nothing twice: it replays the original result instead.
+    let transaction = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.canteen_wallet_transactions
+             (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,
+              idempotency_key,actor_user_id)
+           VALUES($1,$2,$3,$4,$5,'Wallet top-up',$6,$7,$8)
+           ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+           RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'amount',amount::float8,
+             'transactionType',transaction_type,'description',description,
+             'referenceId',reference_id,'createdAt',created_at)"#,
+    )
+    .bind(tenant)
+    .bind(&target_user_id)
+    .bind(&shop_key)
+    .bind(amount)
+    .bind(kind)
+    .bind(&reference)
+    .bind(&idempotency_key)
+    .bind(&principal.student.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(transaction) = transaction else {
+        tx.rollback().await?;
+        let (existing, existing_user, existing_shop, existing_amount) =
+            sqlx::query_as::<_, (Value, String, String, f64)>(
+                r#"SELECT jsonb_build_object('id',id,'shopKey',shop_key,'amount',amount::float8,
+                     'transactionType',transaction_type,'description',description,
+                     'referenceId',reference_id,'createdAt',created_at),
+                     user_id, shop_key, amount::float8
+                   FROM campus_ops.canteen_wallet_transactions
+                   WHERE tenant_id=$1 AND idempotency_key=$2"#,
+            )
+            .bind(tenant)
+            .bind(&idempotency_key)
+            .fetch_one(db.pool())
+            .await?;
+        if !existing_user.eq_ignore_ascii_case(&target_user_id)
+            || existing_shop != shop_key
+            || (existing_amount - amount).abs() > 0.004
+        {
+            return Err(ApiError::Conflict(
+                "This idempotency key was already used for a different top-up".into(),
+            ));
+        }
+        let balance = sqlx::query_scalar::<_, f64>(
+            "SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 AND shop_key=$3",
+        )
+        .bind(tenant)
+        .bind(&target_user_id)
+        .bind(&shop_key)
+        .fetch_optional(db.pool())
+        .await?
+        .unwrap_or(0.0);
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::new(json!({
+                "userId": target_user_id,
+                "shopKey": shop_key,
+                "shopName": shop_name,
+                "balance": balance,
+                "transaction": existing,
+                "replayed": true,
+            }))),
+        ));
+    };
+    let balance = sqlx::query_scalar::<_, f64>(
+        r#"INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version)
+           VALUES($1,$2,$3,$4,1)
+           ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET
+             balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,
+             version=campus_ops.canteen_wallets.version+1,
+             updated_at=now()
+           RETURNING balance::float8"#,
+    )
+    .bind(tenant)
+    .bind(&target_user_id)
+    .bind(&shop_key)
+    .bind(amount)
+    .fetch_one(&mut *tx)
+    .await?;
+    let payload = json!({
+        "userId": target_user_id,
+        "name": person.name,
+        "shopKey": shop_key,
+        "shopName": shop_name,
+        "balance": balance,
+        "transaction": transaction,
+        "replayed": false,
+    });
     emit_tx(
         &mut tx,
         tenant,
@@ -3190,10 +4090,7 @@ async fn top_up_wallet(
         None,
         "canteen",
         "Wallet credited",
-        &format!(
-            "{:.2} credits were added to your canteen wallet",
-            input.amount
-        ),
+        &top_up_notification_body(amount, &shop_name),
         &payload,
     )
     .await?;
@@ -3587,6 +4484,133 @@ async fn create_library_announcement(
     .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
+}
+
+/// Editing or removing a published announcement is moderation: it needs the
+/// same grant that approves one (tenant admins hold it through `*`).
+fn require_announcement_moderation(access: &EffectiveAccess) -> ApiResult<()> {
+    require(access, "library.announcement.approve")
+}
+
+async fn update_library_announcement(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(announcement_id): Path<Uuid>,
+    Json(input): Json<LibraryAnnouncementRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_announcement_moderation(&access)?;
+    if input.announcement_type.trim().is_empty()
+        || input.title.trim().is_empty()
+        || input.message.trim().is_empty()
+    {
+        return Err(ApiError::BadRequest(
+            "Enter an announcement type, date, title and description".into(),
+        ));
+    }
+    let trimmed = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.library_announcements
+           SET announcement_type=$3, announcement_date=$4, title=$5, message=$6,
+               book_title=$7, author=$8, attachment_name=$9, attachment_url=$10,
+               updated_at=now()
+           WHERE tenant_id=$1 AND id=$2
+           RETURNING jsonb_build_object('id',id,'announcementType',announcement_type,
+             'announcementDate',announcement_date,'title',title,'message',message,
+             'bookTitle',book_title,'author',author,'status',status,
+             'attachmentName',attachment_name,'attachmentUrl',attachment_url,
+             'createdBy',created_by,'createdByName',created_by_name,
+             'decidedBy',decided_by,'decidedAt',decided_at,'createdAt',created_at)"#,
+    )
+    .bind(tenant)
+    .bind(announcement_id)
+    .bind(input.announcement_type.trim())
+    .bind(input.announcement_date)
+    .bind(input.title.trim())
+    .bind(input.message.trim())
+    .bind(trimmed(&input.book_title))
+    .bind(trimmed(&input.author))
+    .bind(trimmed(&input.attachment_name))
+    .bind(trimmed(&input.attachment_url))
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Announcement not found".into()))?;
+    emit_tx(
+        &mut tx,
+        tenant,
+        "library",
+        "announcement",
+        &announcement_id.to_string(),
+        "announcement.updated",
+        &principal.student.id,
+        &value,
+    )
+    .await?;
+    tx.commit().await?;
+    publish_announcement_change(&state, &principal.student.tenant_id, "announcement.updated", announcement_id);
+    Ok(Json(ApiResponse::new(value)))
+}
+
+async fn delete_library_announcement(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(announcement_id): Path<Uuid>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_announcement_moderation(&access)?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let deleted = sqlx::query(
+        "DELETE FROM campus_ops.library_announcements WHERE tenant_id=$1 AND id=$2",
+    )
+    .bind(tenant)
+    .bind(announcement_id)
+    .execute(&mut *tx)
+    .await?;
+    if deleted.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Announcement not found".into()));
+    }
+    let payload = json!({"id": announcement_id});
+    emit_tx(
+        &mut tx,
+        tenant,
+        "library",
+        "announcement",
+        &announcement_id.to_string(),
+        "announcement.deleted",
+        &principal.student.id,
+        &payload,
+    )
+    .await?;
+    tx.commit().await?;
+    publish_announcement_change(&state, &principal.student.tenant_id, "announcement.deleted", announcement_id);
+    Ok(Json(ApiResponse::new(json!({"id": announcement_id, "deleted": true}))))
+}
+
+/// Tells open walls to reload. The event type is the bare
+/// `announcement.*` name the apps listen for (the change feed carries the same
+/// name from `campus_ops.events`).
+fn publish_announcement_change(state: &AppState, tenant_slug: &str, event: &str, id: Uuid) {
+    state.publish_realtime(RealtimePublication::tenant(
+        tenant_slug,
+        event,
+        json!({
+            "module": "library",
+            "resource": "announcement",
+            "resourceId": id,
+            "invalidate": true,
+        }),
+    ));
 }
 
 async fn decide_library_announcement(
@@ -7508,6 +8532,223 @@ fn require_any_role(principal: &AuthPrincipal) -> ApiResult<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn member(id: &str, name: &str, roles: &[&str], eligible: bool) -> WalletMemberRow {
+        WalletMemberRow {
+            user_id: id.into(),
+            email: format!("{id}@campus.test"),
+            display_name: name.into(),
+            roles: roles.iter().map(|r| (*r).to_owned()).collect(),
+            eligible,
+            ..WalletMemberRow::default()
+        }
+    }
+
+    fn student(id: &str, number: &str, name: &str, year: Option<&str>) -> WalletStudentRow {
+        WalletStudentRow {
+            user_id: id.into(),
+            student_id: format!("s-{id}"),
+            student_number: number.into(),
+            full_name: name.into(),
+            email: Some(format!("{id}@students.test")),
+            department: "CSE".into(),
+            year: year.map(str::to_owned),
+            photo_url: None,
+            tenant_user_active: true,
+        }
+    }
+
+    #[test]
+    fn year_of_study_parses_common_spellings_but_not_sessions() {
+        for (text, year) in [
+            ("2", Some(2)),
+            ("II", Some(2)),
+            ("ii", Some(2)),
+            ("2nd", Some(2)),
+            ("2nd Year", Some(2)),
+            ("Year III", Some(3)),
+            ("Second year", Some(2)),
+            ("I", Some(1)),
+            ("4th", Some(4)),
+            ("VI", Some(6)),
+            ("2026-27", None),
+            ("2025", None),
+            ("7", None),
+            ("", None),
+            ("unknown", None),
+        ] {
+            assert_eq!(parse_year_of_study(text), year, "{text}");
+        }
+    }
+
+    #[test]
+    fn role_labels_are_human_readable() {
+        assert_eq!(role_label("hod"), "HOD");
+        assert_eq!(role_label("stationery_operator"), "Stationery Operator");
+        assert_eq!(role_label("faculty"), "Faculty");
+        assert_eq!(role_label("tenant_admin"), "Admin");
+        assert_eq!(role_label("mec-canteen"), "Mec Canteen");
+    }
+
+    #[test]
+    fn wallet_store_categories_are_case_insensitive() {
+        assert!(is_wallet_store_category("Stationery"));
+        assert!(is_wallet_store_category(" laundry "));
+        assert!(is_wallet_store_category("canteen"));
+        assert!(!is_wallet_store_category("library"));
+    }
+
+    #[test]
+    fn directory_lists_every_active_member_with_student_details() {
+        let people = merge_wallet_people(
+            vec![
+                member("u1", "Priya", &["student"], true),
+                member("u2", "Warden Boys", &["warden"], true),
+                member("u3", "Former Staff", &["faculty"], false),
+                member("u4", "Deactivated Student", &["student"], false),
+                member("u5", "", &["accountant"], true),
+            ],
+            vec![
+                student("u1", "MEC26AI001", "Priya Kumar", Some("II")),
+                student("u4", "MEC26AI004", "Hari", Some("I")),
+                // Known only to the tenant database: kept.
+                student("u9", "MEC24CS009", "Legacy Student", Some("3rd year")),
+            ],
+        );
+        let ids: Vec<&str> = people.iter().map(|p| p.user_id.as_str()).collect();
+        assert!(ids.contains(&"u1"));
+        assert!(ids.contains(&"u2"));
+        assert!(ids.contains(&"u5"));
+        assert!(ids.contains(&"u9"));
+        assert!(!ids.contains(&"u3"), "inactive membership is excluded");
+        assert!(!ids.contains(&"u4"), "a deactivated member stays excluded");
+
+        let priya = people.iter().find(|p| p.user_id == "u1").unwrap();
+        assert!(priya.is_student);
+        assert_eq!(priya.name, "Priya Kumar");
+        assert_eq!(priya.student_number, "MEC26AI001");
+        assert_eq!(priya.year_of_study, Some(2));
+        assert_eq!(priya.primary_role(), "student");
+
+        let warden = people.iter().find(|p| p.user_id == "u2").unwrap();
+        assert!(!warden.is_student);
+        assert_eq!(warden.primary_role(), "warden");
+        assert_eq!(warden.year_of_study, None);
+        assert_eq!(warden.student_number, "");
+
+        let nameless = people.iter().find(|p| p.user_id == "u5").unwrap();
+        assert_eq!(nameless.name, "u5@campus.test", "falls back to email");
+
+        let legacy = people.iter().find(|p| p.user_id == "u9").unwrap();
+        assert_eq!(legacy.year_of_study, Some(3));
+    }
+
+    #[test]
+    fn directory_filters_sort_and_search() {
+        let mut people = merge_wallet_people(
+            vec![
+                member("u1", "zara", &["student"], true),
+                member("u2", "Arun", &["faculty", "hod"], true),
+                member("u3", "Meena", &["stationery_operator"], true),
+            ],
+            vec![student("u1", "MEC26CS010", "Zara Khan", Some("1"))],
+        );
+        sort_wallet_people(&mut people);
+        let names: Vec<&str> = people.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Arun", "Meena", "Zara Khan"]);
+
+        let find = |search: &str| -> Vec<String> {
+            let terms = search_terms(search);
+            people
+                .iter()
+                .filter(|p| matches_search(p, &terms))
+                .map(|p| p.user_id.clone())
+                .collect()
+        };
+        assert_eq!(find("mec26cs010"), ["u1"]);
+        assert_eq!(find("HOD"), ["u2"]);
+        assert_eq!(find("stationery operator"), ["u3"]);
+        assert_eq!(find("cse zara"), ["u1"]);
+        assert_eq!(find("u3@campus"), ["u3"]);
+        assert_eq!(find("").len(), 3);
+
+        let students: Vec<_> = people
+            .iter()
+            .filter(|p| matches_audience(p, "students"))
+            .collect();
+        assert_eq!(students.len(), 1);
+        let staff: Vec<_> = people
+            .iter()
+            .filter(|p| matches_audience(p, "staff"))
+            .collect();
+        assert_eq!(staff.len(), 2);
+        assert_eq!(normalized_audience(Some("Students")).unwrap(), "students");
+        assert_eq!(normalized_audience(None).unwrap(), "all");
+        assert!(normalized_audience(Some("aliens")).is_err());
+    }
+
+    #[test]
+    fn directory_row_keeps_legacy_fields_and_totals_balances() {
+        let person = merge_wallet_people(
+            vec![member("u2", "Warden Boys", &["warden"], true)],
+            Vec::new(),
+        )
+        .remove(0);
+        let row = wallet_person_json(
+            &person,
+            Some(&json!({"mec-canteen": 100.0, "mec-laundry": 50.5})),
+            None,
+            None,
+        );
+        assert_eq!(row["studentName"], "Warden Boys");
+        assert_eq!(row["studentNumber"], "");
+        assert_eq!(row["isStudent"], false);
+        assert_eq!(row["role"], "warden");
+        assert_eq!(row["roleLabel"], "Warden");
+        assert_eq!(row["balance"], 150.5);
+        assert_eq!(row["walletBalances"]["mec-laundry"], 50.5);
+    }
+
+    #[test]
+    fn top_up_notification_names_the_store() {
+        assert_eq!(
+            top_up_notification_body(500.0, "Campus Stationery"),
+            "₹500 was added to your Campus Stationery wallet"
+        );
+        assert_eq!(
+            top_up_notification_body(99.5, "Laundry Wallet"),
+            "₹99.50 was added to your Laundry wallet"
+        );
+        assert_eq!(
+            top_up_notification_body(10.0, " "),
+            "₹10 was added to your campus wallet"
+        );
+    }
+
+    #[test]
+    fn order_status_distribution_buckets_queue_separately_from_cancellations() {
+        // Two orders waiting at the counter are neither completed nor
+        // cancelled: they are the whole of the active bucket.
+        let queued = OrderStatusDistribution::from_counts(0, 2, 0);
+        assert_eq!(queued.total(), 2);
+        assert_eq!(queued.percentage(queued.completed), 0.0);
+        assert_eq!(queued.percentage(queued.cancelled), 0.0);
+        assert_eq!(queued.percentage(queued.active), 100.0);
+
+        let mixed = OrderStatusDistribution::from_counts(3, 0, 1);
+        assert_eq!(mixed.percentage(mixed.completed), 75.0);
+        assert_eq!(mixed.percentage(mixed.cancelled), 25.0);
+
+        let empty = OrderStatusDistribution::from_counts(0, 0, 0);
+        assert_eq!(empty.percentage(empty.completed), 0.0);
+    }
+
+    #[test]
+    fn revenue_split_claims_nothing_before_the_first_sale() {
+        assert_eq!(revenue_split_percentages(0.0, 0.0), (0.0, 0.0));
+        assert_eq!(revenue_split_percentages(300.0, 100.0), (75.0, 25.0));
+        assert_eq!(revenue_split_percentages(0.0, 50.0), (0.0, 100.0));
+    }
 
     #[test]
     fn razorpay_payment_id_is_read_only_from_online_top_ups() {

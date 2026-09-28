@@ -482,6 +482,9 @@ INSERT INTO mec_requested VALUES ('warden', 'hostel.records.read', 'institution'
 INSERT INTO mec_requested VALUES ('warden', 'hostel.records.update', 'institution');
 INSERT INTO mec_requested VALUES ('warden', 'students.directory.read', 'institution');
 INSERT INTO mec_requested VALUES ('accountant', 'canteen.analytics.read', 'institution');
+INSERT INTO mec_requested VALUES ('accountant', 'canteen.wallet.configure', 'institution');
+INSERT INTO mec_requested VALUES ('accountant', 'canteen.wallet.read', 'institution');
+INSERT INTO mec_requested VALUES ('accountant', 'canteen.wallet.top_up', 'institution');
 INSERT INTO mec_requested VALUES ('accountant', 'dashboard.fee_readiness.read', 'institution');
 INSERT INTO mec_requested VALUES ('accountant', 'examination.eligibility.read', 'institution');
 INSERT INTO mec_requested VALUES ('accountant', 'fees.approvals.approve', 'institution');

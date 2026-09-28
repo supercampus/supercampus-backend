@@ -2489,7 +2489,8 @@ impl AppState {
         let database = self.database.as_ref().context("PostgreSQL is required")?;
         let rows = sqlx::query(
             r#"SELECT user_account.id, user_account.email, user_account.display_name,
-                      user_account.initials, user_account.account_type, user_account.active,
+                      user_account.initials, user_account.account_type,
+                      (user_account.active AND membership.active) AS active,
                       COALESCE(
                           NULLIF(membership.profile ->> 'yearOfStudy', ''),
                           NULLIF(membership.profile ->> 'year', '')
@@ -2512,7 +2513,9 @@ impl AppState {
                FROM identity.tenant_memberships membership
                JOIN platform.tenants tenant ON tenant.id = membership.tenant_id
                JOIN identity.users user_account ON user_account.id = membership.user_id
-               WHERE tenant.slug = $1 AND membership.active
+               -- Deactivated members stay listed (active = false) so an
+               -- administrator can find and reactivate them.
+               WHERE tenant.slug = $1
                ORDER BY user_account.display_name"#,
         )
         .bind(tenant_slug)
@@ -2654,6 +2657,106 @@ impl AppState {
         transaction.commit().await?;
         self.invalidate_effective_access().await;
         Ok(json!({ "userId": user_id, "roleIds": request.role_ids }))
+    }
+
+    /// `(role_key, portal_family)` for each of `role_ids` that belongs to the
+    /// tenant. Callers compare the length to detect foreign ids.
+    pub async fn tenant_role_descriptors(
+        &self,
+        tenant_slug: &str,
+        role_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let database = self.database.as_ref().context("PostgreSQL is required")?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT role.role_key, role.portal_family
+               FROM authz.roles role
+               JOIN platform.tenants tenant ON tenant.id = role.tenant_id
+               WHERE tenant.slug = $1 AND role.id = ANY($2)"#,
+        )
+        .bind(tenant_slug)
+        .bind(role_ids)
+        .fetch_all(database.pool())
+        .await
+        .context("failed to read tenant roles")?;
+        Ok(rows)
+    }
+
+    /// `(role_key, portal_family)` of every role the user currently holds in
+    /// the tenant.
+    pub async fn tenant_user_role_descriptors(
+        &self,
+        tenant_slug: &str,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let database = self.database.as_ref().context("PostgreSQL is required")?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT role.role_key, role.portal_family
+               FROM authz.user_roles user_role
+               JOIN authz.roles role
+                 ON role.id = user_role.role_id AND role.tenant_id = user_role.tenant_id
+               JOIN platform.tenants tenant ON tenant.id = user_role.tenant_id
+               WHERE tenant.slug = $1 AND user_role.user_id = $2"#,
+        )
+        .bind(tenant_slug)
+        .bind(user_id)
+        .fetch_all(database.pool())
+        .await
+        .context("failed to read the user's roles")?;
+        Ok(rows)
+    }
+
+    /// Turns a user's membership of this tenant on or off. Deactivation also
+    /// revokes every session the user holds in the tenant, so an open app is
+    /// signed out on its next request rather than when its token expires.
+    /// Returns `false` when the user is not a member of the tenant.
+    pub async fn set_tenant_user_active(
+        &self,
+        tenant_slug: &str,
+        actor_id: &str,
+        user_id: Uuid,
+        active: bool,
+    ) -> anyhow::Result<bool> {
+        let database = self.database.as_ref().context("PostgreSQL is required")?;
+        let tenant_id = ensure_tenant(database, tenant_slug).await?;
+        let mut transaction = database.pool().begin().await?;
+        let updated = sqlx::query(
+            r#"UPDATE identity.tenant_memberships
+               SET active = $3, updated_at = now()
+               WHERE tenant_id = $1 AND user_id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(active)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to update the tenant membership")?;
+        if updated.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        if !active {
+            sqlx::query(
+                r#"UPDATE identity.auth_sessions
+                   SET revoked_at = now()
+                   WHERE tenant_id = $1 AND user_id = $2 AND revoked_at IS NULL"#,
+            )
+            .bind(tenant_id)
+            .bind(user_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .context("failed to revoke the deactivated user's sessions")?;
+        }
+        transaction.commit().await?;
+        self.validated_principals.write().await.clear();
+        self.invalidate_effective_access().await;
+        tracing::info!(
+            %user_id,
+            actor_id,
+            tenant_slug,
+            active,
+            "tenant administrator changed a user's membership status"
+        );
+        Ok(true)
     }
 
     pub async fn set_tenant_user_password(

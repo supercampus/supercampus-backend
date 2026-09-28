@@ -31,12 +31,21 @@ pub fn router() -> Router<AppState> {
         .route("/audit", get(list_audit))
 }
 
+/// Whether the caller operates the platform itself, as opposed to one tenant.
+pub(crate) fn is_platform_admin(access: &EffectiveAccess) -> bool {
+    require_platform_admin(access).is_ok()
+}
+
+/// Both the platform role and the platform-control family are required. With
+/// either alone, a tenant could create a role keyed `platform_super_admin` (or
+/// put a role in the platform-control family) and pass as a platform operator
+/// across every tenant.
 fn require_platform_admin(access: &EffectiveAccess) -> ApiResult<()> {
     if access
         .roles
         .iter()
         .any(|role| role == "platform_super_admin")
-        || access
+        && access
             .portal_families
             .iter()
             .any(|family| family == "platform-control")

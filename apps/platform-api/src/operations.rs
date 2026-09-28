@@ -63,6 +63,10 @@ pub fn router() -> Router<AppState> {
             "/canteen/laundry/charges/{charge_id}/pay",
             post(pay_laundry_charge),
         )
+        .route(
+            "/canteen/laundry/charges/{charge_id}/cancel",
+            post(cancel_laundry_charge),
+        )
         .route("/canteen/wallets", get(wallet_directory))
         .route("/canteen/wallet-transactions", get(wallet_transactions))
         .route(
@@ -1283,6 +1287,28 @@ async fn unregister_push_device(
     )))
 }
 
+/// The shop a `campus_ops.canteen_orders` row belongs to, by the same rule the
+/// menu payload uses to resolve an item's store: an exact `shop_key` match,
+/// otherwise the oldest active shop of the store's category. Orders placed
+/// before shops existed carry legacy keys (`classic`, `stationery`); this is
+/// what lets each shop's wallet list only its own orders. Falls back to the
+/// raw store when no shop matches.
+macro_rules! order_shop_key_sql {
+    () => {
+        r#"COALESCE((SELECT shop.shop_key FROM campus_ops.shops shop
+            WHERE shop.tenant_id=canteen_orders.tenant_id AND shop.is_active
+              AND (shop.shop_key=canteen_orders.store
+                OR lower(shop.category)=CASE
+                  WHEN lower(canteen_orders.store) LIKE '%laundry%' THEN 'laundry'
+                  WHEN lower(canteen_orders.store) LIKE '%station%' THEN 'stationery'
+                  ELSE 'canteen'
+                END)
+            ORDER BY CASE WHEN shop.shop_key=canteen_orders.store THEN 0 ELSE 1 END,
+              shop.created_at, shop.shop_key
+            LIMIT 1), canteen_orders.store)"#
+    };
+}
+
 async fn canteen_store(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -1345,7 +1371,7 @@ async fn canteen_store(
         && (configures_shops || !restrict_to_assignments || !assigned_shop_keys.is_empty());
     sqlx::query("INSERT INTO campus_ops.canteen_wallets (tenant_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING")
         .bind(tenant).bind(&principal.student.id).execute(db.pool()).await?;
-    let mut data = sqlx::query_scalar::<_, Value>(r#"
+    let mut data = sqlx::query_scalar::<_, Value>(concat!(r#"
       SELECT jsonb_build_object(
         'user', jsonb_build_object('id',$2::text,'name',$3::text,'email',$4::text,
           'rollNumber',$5::text,'department',$6::text),
@@ -1379,7 +1405,8 @@ async fn canteen_store(
         'orders', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'orderNumber',order_number,
           'customerUserId',customer_user_id,'customerName',customer_name,'lines',lines,
           'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,
-          'tokenNumber',token_number,'qrPayload',id::text,'createdAt',created_at,'updatedAt',updated_at)
+          'tokenNumber',token_number,'qrPayload',id::text,'createdAt',created_at,'updatedAt',updated_at,
+          'store',store,'shopKey',"#, order_shop_key_sql!(), r#")
           ORDER BY created_at DESC) FROM campus_ops.canteen_orders
           WHERE tenant_id=$1 AND (($7 AND (NOT $9 OR store = ANY($11))) OR customer_user_id=$2)), '[]'::jsonb),
         'walletTransactions', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,
@@ -1397,7 +1424,7 @@ async fn canteen_store(
           'revenueToday',COALESCE((SELECT sum(total)::float8 FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($11)) AND status='completed' AND created_at::date=CURRENT_DATE),0),
           'pending',(SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($11)) AND status IN ('pending','accepted','preparing','ready'))
         ) ELSE null END
-      )"#)
+      )"#))
       .bind(tenant).bind(&principal.student.id).bind(&principal.student.name)
       .bind(&principal.student.email).bind(&principal.student.roll).bind(&principal.student.dept)
       .bind(can_manage).bind(can_read_analytics).bind(restrict_to_assignments).bind(&assigned_shop_keys)
@@ -1414,12 +1441,17 @@ async fn canteen_store(
     let can_manage_laundry = assigned_shop_keys.iter().any(|key| key == "mec-laundry")
         && (access.allows("canteen.menu.create") || access.allows("canteen.menu.update"));
     let laundry_charges = if can_manage_laundry {
+        ensure_laundry_charge_schema(db.pool(), &principal.student.tenant_id).await;
+        // The counter keeps an unpaid charge's QR on hand so it can be shown
+        // again until the student pays; paid and cancelled charges drop it.
         sqlx::query_scalar::<_, Value>(
             r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
                  'id',id,'serviceType',service_type,'name',name,'description',description,
                  'quantity',quantity::float8,'unitLabel',unit_label,'unitPrice',unit_price::float8,
                  'total',total::float8,'status',status,'claimedBy',claimed_by,
-                 'createdAt',created_at,'claimedAt',claimed_at,'paidAt',paid_at)
+                 'qrPayload',CASE WHEN status IN ('pending','claimed') THEN qr_payload END,
+                 'createdAt',created_at,'claimedAt',claimed_at,'paidAt',paid_at,
+                 'cancelledAt',cancelled_at)
                  ORDER BY created_at DESC),'[]'::jsonb)
                FROM campus_ops.laundry_charges
                WHERE tenant_id=$1 AND shop_key='mec-laundry'"#,
@@ -2134,7 +2166,7 @@ async fn place_order(
           (id,tenant_id,customer_user_id,customer_name,lines,total,fulfilment_mode,qr_token_hash,store)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$10) RETURNING jsonb_build_object('id',id,'orderNumber',order_number,
           'lines',lines,'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,
-          'qrPayload',$9::text,'createdAt',created_at)"#)
+          'qrPayload',$9::text,'createdAt',created_at,'store',store,'shopKey',store)"#)
           .bind(order_id).bind(tenant).bind(&principal.student.id).bind(&principal.student.name)
           .bind(Value::Array(store_lines)).bind(store_total).bind(input.fulfilment_mode()).bind(hash).bind(&raw_qr)
           .bind(&store)
@@ -2154,7 +2186,7 @@ async fn place_order(
         let transaction=sqlx::query_scalar::<_,Value>(r#"INSERT INTO campus_ops.canteen_wallet_transactions
           (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id)
           VALUES($1,$2,$3,$4,'order_debit',$7,$5,$6,$2)
-          RETURNING jsonb_build_object('id',id,'amount',amount::float8,'transactionType',transaction_type,
+          RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'amount',amount::float8,'transactionType',transaction_type,
           'description',description,'referenceId',reference_id,'createdAt',created_at)"#)
           .bind(tenant).bind(&principal.student.id).bind(&store).bind(-store_total).bind(order_id.to_string())
           .bind(idempotency_key).bind(format!("{} order", shop_label(&store)))
@@ -2356,13 +2388,14 @@ async fn create_laundry_charge(
         let total = (price * 100.0).round() / 100.0;
         ("clothes", total / input.quantity, total)
     };
+    ensure_laundry_charge_schema(db.pool(), &principal.student.tenant_id).await;
     let raw_token = Uuid::new_v4().to_string();
     let qr_payload = format!("supercampus://laundry/{raw_token}");
     let charge = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.laundry_charges
            (tenant_id,shop_key,service_type,name,description,quantity,unit_label,
-            unit_price,total,qr_token_hash,created_by)
-           VALUES($1,'mec-laundry',$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            unit_price,total,qr_token_hash,created_by,qr_payload)
+           VALUES($1,'mec-laundry',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
            RETURNING jsonb_build_object('id',id,'serviceType',service_type,'name',name,
              'description',description,'quantity',quantity::float8,'unitLabel',unit_label,
              'unitPrice',unit_price::float8,'total',total::float8,'status',status,
@@ -2461,16 +2494,150 @@ async fn claim_laundry_charge(
     Ok(Json(ApiResponse::new(charge)))
 }
 
-async fn pay_laundry_charge(
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaundryPayRequest {
+    /// SHA-256 hex of the 4-digit PIN. Required when a PIN has been set.
+    pin_hash: Option<String>,
+}
+
+/// Whether a wallet debit may go ahead: always when no PIN is set, otherwise
+/// only with the matching PIN hash.
+fn wallet_pin_matches(stored: Option<&str>, provided: Option<&str>) -> bool {
+    match stored {
+        None => true,
+        Some(expected) => provided == Some(expected),
+    }
+}
+
+/// Makes sure the laundry QR lifecycle columns exist on this tenant database.
+///
+/// Mirrors migrations/runtime/0114_laundry_charge_qr_lifecycle.sql for
+/// databases the (stuck) migrator cannot reach. DDL locks the table, so it
+/// runs once per tenant per process.
+async fn ensure_laundry_charge_schema(pool: &sqlx::PgPool, tenant_key: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static READY: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let ready = READY.get_or_init(|| Mutex::new(HashSet::new()));
+    if ready
+        .lock()
+        .map(|set| set.contains(tenant_key))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let added = sqlx::query(
+        "ALTER TABLE campus_ops.laundry_charges \
+         ADD COLUMN IF NOT EXISTS qr_payload text, \
+         ADD COLUMN IF NOT EXISTS cancelled_at timestamptz, \
+         ADD COLUMN IF NOT EXISTS cancelled_by text",
+    )
+    .execute(pool)
+    .await;
+    if added.is_ok()
+        && let Ok(mut set) = ready.lock()
+    {
+        set.insert(tenant_key.to_owned());
+    }
+}
+
+/// Voids a charge the student has not paid yet. The counter uses it when a
+/// QR was made by mistake or the student walks away.
+async fn cancel_laundry_charge(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
     Path(charge_id): Path<Uuid>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "canteen.menu.create")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    require_assigned_shop(
+        db.pool(),
+        tenant,
+        &principal.student.id,
+        &principal.student.email,
+        "mec-laundry",
+        &access,
+    )
+    .await?;
+    ensure_laundry_charge_schema(db.pool(), &principal.student.tenant_id).await;
+    let mut tx = db.pool().begin().await?;
+    let status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM campus_ops.laundry_charges WHERE tenant_id=$1 AND id=$2 AND shop_key='mec-laundry' FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(charge_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Laundry charge not found".into()))?;
+    match status.as_str() {
+        "pending" | "claimed" => {}
+        "paid" => {
+            return Err(ApiError::Conflict(
+                "This laundry charge is already paid".into(),
+            ));
+        }
+        _ => {
+            return Err(ApiError::Conflict(
+                "This laundry charge is already cancelled".into(),
+            ));
+        }
+    }
+    let charge = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.laundry_charges SET status='cancelled',cancelled_at=now(),
+             cancelled_by=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2
+           RETURNING jsonb_build_object('id',id,'serviceType',service_type,'name',name,
+             'description',description,'quantity',quantity::float8,'unitLabel',unit_label,
+             'unitPrice',unit_price::float8,'total',total::float8,'status',status,
+             'claimedBy',claimed_by,'createdAt',created_at,'claimedAt',claimed_at,
+             'cancelledAt',cancelled_at)"#,
+    )
+    .bind(tenant)
+    .bind(charge_id)
+    .bind(&principal.student.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "canteen",
+        "laundry_charge",
+        &charge_id.to_string(),
+        "laundry.charge.cancelled",
+    );
+    Ok(Json(ApiResponse::new(charge)))
+}
+
+async fn pay_laundry_charge(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(charge_id): Path<Uuid>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<ApiResponse<Value>>> {
     require_shop_customer(&access)?;
+    // Older apps post no body at all (sometimes still labelled JSON), so an
+    // empty body is simply "no PIN given".
+    let pin_hash = if body.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        serde_json::from_slice::<LaundryPayRequest>(&body)
+            .map_err(|_| ApiError::BadRequest("Invalid payment request".into()))?
+            .pin_hash
+    };
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let mut tx = db.pool().begin().await?;
+    // Same rule as checkout: once the user has a wallet PIN, every wallet
+    // debit must carry it.
+    let (stored_pin_hash, _) = wallet_pin_state(&mut *tx, tenant, &principal.student.id).await?;
+    if !wallet_pin_matches(stored_pin_hash.as_deref(), pin_hash.as_deref()) {
+        crate::state::failed_verification_delay().await;
+        return Err(ApiError::BadRequest("Incorrect wallet PIN".into()));
+    }
     let charge = sqlx::query_as::<_, (String, String, f64)>(
         "SELECT status,claimed_by,total::float8 FROM campus_ops.laundry_charges WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
     )
@@ -2509,7 +2676,7 @@ async fn pay_laundry_charge(
         r#"INSERT INTO campus_ops.canteen_wallet_transactions
            (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id)
            VALUES($1,$2,'mec-laundry',$3,'order_debit','Campus Laundry payment',$4,$5,$2)
-           RETURNING jsonb_build_object('id',id,'amount',amount::float8,
+           RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'amount',amount::float8,
              'transactionType',transaction_type,'description',description,
              'referenceId',reference_id,'createdAt',created_at)"#,
     )
@@ -8844,6 +9011,28 @@ mod tests {
     }
 
     #[test]
+    fn wallet_orders_resolve_legacy_stores_like_the_menu_does() {
+        // Each shop's wallet lists only its own orders, so an order row must
+        // name its shop even when it was stored under a legacy key.
+        let sql = order_shop_key_sql!();
+        for fragment in [
+            "shop.tenant_id=canteen_orders.tenant_id AND shop.is_active",
+            "shop.shop_key=canteen_orders.store",
+            "WHEN lower(canteen_orders.store) LIKE '%laundry%' THEN 'laundry'",
+            "WHEN lower(canteen_orders.store) LIKE '%station%' THEN 'stationery'",
+            "ELSE 'canteen'",
+            // An exact key wins; otherwise the oldest shop of the category.
+            "ORDER BY CASE WHEN shop.shop_key=canteen_orders.store THEN 0 ELSE 1 END",
+            "shop.created_at, shop.shop_key",
+            "LIMIT 1",
+        ] {
+            assert!(sql.contains(fragment), "missing `{fragment}`");
+        }
+        // No matching shop keeps the raw store rather than dropping the row.
+        assert!(sql.trim_end().ends_with("LIMIT 1), canteen_orders.store)"));
+    }
+
+    #[test]
     fn top_up_notification_names_the_store() {
         assert_eq!(
             top_up_notification_body(500.0, "Campus Stationery"),
@@ -8936,6 +9125,16 @@ mod tests {
 
         assert!(!without_margin);
         assert!(with_margin);
+    }
+
+    #[test]
+    fn laundry_payment_requires_the_pin_only_once_one_is_set() {
+        let pin = "a".repeat(64);
+        assert!(wallet_pin_matches(None, None));
+        assert!(wallet_pin_matches(None, Some("anything")));
+        assert!(wallet_pin_matches(Some(&pin), Some(&pin)));
+        assert!(!wallet_pin_matches(Some(&pin), None));
+        assert!(!wallet_pin_matches(Some(&pin), Some(&"b".repeat(64))));
     }
 
     #[test]

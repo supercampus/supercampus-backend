@@ -114,6 +114,85 @@ pub(super) async fn update_tenant_user(
     Ok(Json(ApiResponse::new(user)))
 }
 
+/// A student's year of study must be 1–6.
+pub(super) fn is_valid_student_year(year: Option<u8>) -> bool {
+    year.is_some_and(|year| (1..=6).contains(&year))
+}
+
+/// Whether any of `(role_key, portal_family)` makes the account a student
+/// record, which needs a year of study. This validates data, not access.
+pub(super) fn assigns_student_role(roles: &[(String, String)]) -> bool {
+    roles.iter().any(|(key, family)| {
+        key.eq_ignore_ascii_case("student") || family.eq_ignore_ascii_case("student")
+    })
+}
+
+/// Rejects creating a student account without a valid year of study (1–6).
+pub(super) async fn require_student_year(
+    state: &AppState,
+    tenant_slug: &str,
+    role_ids: &[Uuid],
+    year_of_study: Option<u8>,
+) -> ApiResult<()> {
+    if let Some(year) = year_of_study
+        && !(1..=6).contains(&year)
+    {
+        return Err(ApiError::BadRequest(
+            "Year of study must be between 1 and 6".into(),
+        ));
+    }
+    let roles = state.tenant_role_descriptors(tenant_slug, role_ids).await?;
+    if assigns_student_role(&roles) && !is_valid_student_year(year_of_study) {
+        return Err(ApiError::BadRequest(
+            "Year of study (1–6) is required for a student".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SetTenantUserYearRequest {
+    year_of_study: Option<u8>,
+}
+
+/// `PUT /authorization/users/{user_id}/year` — set a student's year of study
+/// (1–6) on the membership, the account and the linked student record.
+pub(super) async fn set_tenant_user_year(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(user_id): Path<Uuid>,
+    Json(request): Json<SetTenantUserYearRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "authorization.users.update")?;
+    let Some(year) = request.year_of_study.filter(|year| (1..=6).contains(year)) else {
+        return Err(ApiError::BadRequest(
+            "Year of study must be between 1 and 6".into(),
+        ));
+    };
+    let updated = state
+        .set_tenant_user_year(
+            &principal.student.tenant_id,
+            &principal.student.id,
+            user_id,
+            year,
+        )
+        .await?;
+    let Some(result) = updated else {
+        return Err(ApiError::NotFound("tenant user not found".into()));
+    };
+    state.publish_realtime(
+        RealtimePublication::tenant(
+            principal.student.tenant_id,
+            "identity.user.updated",
+            result.clone(),
+        )
+        .for_user(user_id.to_string()),
+    );
+    Ok(Json(ApiResponse::new(result)))
+}
+
 /// Roles that carry authority beyond a tenant administrator's: the platform's
 /// own roles and the tenant-level super administrator, which the API treats as
 /// an unconditional override in several places.
@@ -363,6 +442,32 @@ mod tests {
         let req2: UpdateTenantUserRequest = serde_json::from_str(json_name_only).unwrap();
         assert_eq!(req2.name.as_deref(), Some("Jane Smith"));
         assert_eq!(req2.email, None);
+    }
+
+    #[test]
+    fn student_year_must_be_one_to_six() {
+        assert!(!is_valid_student_year(None));
+        assert!(!is_valid_student_year(Some(0)));
+        assert!(!is_valid_student_year(Some(7)));
+        for year in 1..=6 {
+            assert!(is_valid_student_year(Some(year)));
+        }
+    }
+
+    #[test]
+    fn student_role_is_detected_by_key_or_family() {
+        assert!(assigns_student_role(&[role("student", "student")]));
+        assert!(assigns_student_role(&[role("ug_student", "student")]));
+        assert!(!assigns_student_role(&[role("staff", "staff")]));
+        assert!(!assigns_student_role(&[]));
+    }
+
+    #[test]
+    fn year_request_rejects_unknown_fields() {
+        let req: SetTenantUserYearRequest =
+            serde_json::from_str(r#"{"yearOfStudy": 3}"#).unwrap();
+        assert_eq!(req.year_of_study, Some(3));
+        assert!(serde_json::from_str::<SetTenantUserYearRequest>(r#"{"year": 3}"#).is_err());
     }
 }
 

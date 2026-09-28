@@ -28,13 +28,32 @@ use crate::{
 };
 use supercampus_notifications::whatsapp::{DeliveryOutcome, WhatsAppMessage};
 
-/// Helper function to ensure database schema columns exist on campus_ops.visitor_passes.
-async fn ensure_visitor_pass_schema(pool: &sqlx::PgPool) {
-    let _ = sqlx::query(
+/// Makes sure the visitor-pass columns exist on this tenant database.
+///
+/// Mirrors migrations 0108 and 0113 for databases the migrator cannot reach.
+/// DDL takes an exclusive lock on the table, so it runs once per tenant per
+/// process, not on every request.
+pub(crate) async fn ensure_visitor_pass_schema(pool: &sqlx::PgPool, tenant_key: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static READY: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let ready = READY.get_or_init(|| Mutex::new(HashSet::new()));
+    if ready
+        .lock()
+        .map(|set| set.contains(tenant_key))
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let added = sqlx::query(
         "ALTER TABLE campus_ops.visitor_passes \
          ADD COLUMN IF NOT EXISTS relationship text, \
          ADD COLUMN IF NOT EXISTS checked_in_at timestamptz, \
-         ADD COLUMN IF NOT EXISTS checked_out_at timestamptz",
+         ADD COLUMN IF NOT EXISTS checked_out_at timestamptz, \
+         ADD COLUMN IF NOT EXISTS entry_mode text NOT NULL DEFAULT 'invitation', \
+         ADD COLUMN IF NOT EXISTS vehicle_number text, \
+         ADD COLUMN IF NOT EXISTS id_note text",
     )
     .execute(pool)
     .await;
@@ -46,10 +65,17 @@ async fn ensure_visitor_pass_schema(pool: &sqlx::PgPool) {
     let _ = sqlx::query(
         "ALTER TABLE campus_ops.visitor_passes \
          ADD CONSTRAINT visitor_passes_state_check \
-         CHECK (state IN ('pending_admin', 'approved', 'rejected', 'cancelled', 'checked_in', 'checked_out'))",
+         CHECK (state IN ('pending_admin', 'approved', 'rejected', 'sent', 'active', \
+                          'checked_in', 'checked_out', 'cancelled', 'expired'))",
     )
     .execute(pool)
     .await;
+
+    if added.is_ok()
+        && let Ok(mut set) = ready.lock()
+    {
+        set.insert(tenant_key.to_owned());
+    }
 }
 
 #[derive(Deserialize)]
@@ -217,7 +243,7 @@ pub async fn create_visitor_pass(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
-    ensure_visitor_pass_schema(db.pool()).await;
+    ensure_visitor_pass_schema(db.pool(), &principal.student.tenant_id).await;
 
     let auto_approve = is_institutional || kind == "guest";
 
@@ -335,7 +361,7 @@ pub async fn list_visitor_passes(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
-    ensure_visitor_pass_schema(db.pool()).await;
+    ensure_visitor_pass_schema(db.pool(), &principal.student.tenant_id).await;
 
     let mut tx = db.pool().begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
@@ -391,7 +417,7 @@ pub async fn decide_visitor_pass(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
-    ensure_visitor_pass_schema(db.pool()).await;
+    ensure_visitor_pass_schema(db.pool(), &principal.student.tenant_id).await;
 
     let mut tx = db.pool().begin().await?;
 
@@ -517,7 +543,7 @@ pub async fn cancel_visitor_pass(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = crate::operations::tenant_id(db.pool(), &principal.student.tenant_id).await?;
 
-    ensure_visitor_pass_schema(db.pool()).await;
+    ensure_visitor_pass_schema(db.pool(), &principal.student.tenant_id).await;
 
     let mut tx = db.pool().begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id', $1, true)")

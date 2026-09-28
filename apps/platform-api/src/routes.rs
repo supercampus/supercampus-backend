@@ -81,6 +81,10 @@ pub fn router(state: AppState) -> Router {
             put(admin_users::set_tenant_user_status),
         )
         .route(
+            "/authorization/users/{user_id}/year",
+            put(admin_users::set_tenant_user_year),
+        )
+        .route(
             "/authorization/users/{user_id}/access",
             get(get_tenant_user_access).put(set_tenant_user_access),
         )
@@ -679,6 +683,13 @@ async fn create_tenant_user(
         &access,
         None,
         &request.role_ids,
+    )
+    .await?;
+    admin_users::require_student_year(
+        &state,
+        &principal.student.tenant_id,
+        &request.role_ids,
+        request.year_of_study,
     )
     .await?;
     let user = state

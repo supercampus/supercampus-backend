@@ -22,6 +22,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .merge(crate::library_lending::router())
         .merge(crate::support::router())
+        .merge(crate::gate_security::router())
         .route("/changes", get(changes))
         .route("/notifications", get(notifications))
         .route("/notifications/read-all", post(read_all_notifications))
@@ -38,7 +39,7 @@ pub fn router() -> Router<AppState> {
             post(register_push_device).delete(unregister_push_device),
         )
         .route("/canteen/store", get(canteen_store))
-        .route("/canteen/sales-dashboard", get(sales_dashboard))
+        .merge(crate::vendor_sales::router())
         .route("/canteen/shops", get(list_shops).post(create_shop))
         .route(
             "/canteen/shops/{shop_id}",
@@ -108,6 +109,10 @@ pub fn router() -> Router<AppState> {
         .route("/hostel/overview", get(hostel_overview))
         .route("/hostel/requests", post(create_hostel_service_request))
         .route(
+            "/hostel/requests/{request_id}/status",
+            post(update_hostel_service_request_status),
+        )
+        .route(
             "/hostel/dining-settings",
             put(update_hostel_dining_settings),
         )
@@ -126,7 +131,6 @@ pub fn router() -> Router<AppState> {
         .route("/gatepass/daily-access", post(activate_daily_access))
         .route("/campuses", get(list_campuses).post(create_campus))
         .route("/campuses/{campus_id}/geofence", put(set_campus_geofence))
-        .route("/gatepass/scan", post(scan_gatepass))
         .route(
             "/gatepass/visitors",
             get(crate::visitors::list_visitor_passes).post(crate::visitors::create_visitor_pass),
@@ -217,9 +221,226 @@ struct HostelMealRedeemInput {
     qr_payload: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostelRequestStatusInput {
+    status: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Statuses a hostel staff member may move a service request to, per kind.
+fn hostel_request_status_allowed(kind: &str, status: &str) -> bool {
+    match kind {
+        "complaint" => matches!(status, "assigned" | "in_progress" | "resolved" | "closed"),
+        "room_change" => matches!(
+            status,
+            "under_review" | "approved" | "rejected" | "completed"
+        ),
+        "clearance" => matches!(
+            status,
+            "under_review" | "approved" | "rejected" | "completed"
+        ),
+        "visitor" => matches!(status, "approved" | "rejected"),
+        _ => false,
+    }
+}
+
+/// Staff see the hostel operations board when their hostel read grant reaches
+/// beyond their own record. Returns `None` for self-scoped (student) access.
+fn hostel_operations_scope(access: &EffectiveAccess) -> Option<String> {
+    if !access.allows("hostel.records.read") {
+        return None;
+    }
+    match access.scope_for("hostel.records.read") {
+        Some("own") | None => None,
+        Some(scope) => Some(scope.to_owned()),
+    }
+}
+
+/// The hostel a scoped staff member runs (from their employee profile), unless
+/// their grant is tenant-wide. `None` means every hostel in the tenant.
+async fn hostel_staff_hostel(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    principal: &AuthPrincipal,
+    scope: &str,
+) -> ApiResult<Option<String>> {
+    if scope == "all" {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar::<_, Option<String>>(
+        r#"SELECT NULLIF(trim(profile->>'hostel'),'') FROM core.employees
+           WHERE tenant_id=$1 AND (user_id::text=$2 OR lower(email)=lower($3))
+           ORDER BY (user_id::text=$2) DESC LIMIT 1"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&principal.student.email)
+    .fetch_optional(pool)
+    .await?
+    .flatten())
+}
+
+/// Live hostel operations computed from real tables: residents from student
+/// profiles, presence from gate scans, leave/overdue from approved gatepasses,
+/// and the open service-request queues. Beds are not reported because the
+/// tenant stores no bed capacity.
+async fn hostel_operations(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    hostel: Option<&str>,
+) -> ApiResult<Value> {
+    Ok(sqlx::query_scalar::<_, Value>(
+        r#"WITH residents AS (
+             SELECT student.user_account_id::text user_id, student.full_name name,
+                    student.student_number roll_number,
+                    NULLIF(student.profile->>'hostel','') hostel,
+                    NULLIF(student.profile->>'room','') room
+               FROM core.students student
+              WHERE student.tenant_id=$1
+                AND student.status IN ('provisional','active')
+                AND CASE lower(COALESCE(student.profile->>'residency',''))
+                      WHEN 'hosteller' THEN true WHEN 'day_scholar' THEN false
+                      ELSE NULLIF(student.profile->>'hostel','') IS NOT NULL END
+                AND ($2::text IS NULL OR lower(student.profile->>'hostel')=lower($2::text))
+           ),
+           last_move AS (
+             SELECT DISTINCT ON (movement.user_id) movement.user_id, movement.direction
+               FROM campus_ops.gate_movements movement
+               JOIN residents ON residents.user_id=movement.user_id
+              WHERE movement.tenant_id=$1 AND movement.visitor_pass_id IS NULL
+              ORDER BY movement.user_id, movement.created_at DESC
+           ),
+           passes AS (
+             SELECT request.id, request.requester_user_id, request.pass_type,
+                    request.destination, request.departure_at, request.return_at,
+                    residents.name, residents.roll_number, residents.hostel, residents.room,
+                    (SELECT movement.direction FROM campus_ops.gate_movements movement
+                      WHERE movement.tenant_id=$1 AND movement.request_id=request.id
+                      ORDER BY movement.created_at DESC LIMIT 1) last_direction,
+                    (SELECT min(movement.created_at) FROM campus_ops.gate_movements movement
+                      WHERE movement.tenant_id=$1 AND movement.request_id=request.id
+                        AND movement.direction='exit') exited_at
+               FROM campus_ops.gatepass_requests request
+               JOIN residents ON residents.user_id=request.requester_user_id
+              WHERE request.tenant_id=$1 AND request.state='approved'
+           ),
+           open_requests AS (
+             SELECT request.id, request.request_kind, request.status, request.details,
+                    request.requester_name, request.created_at, request.updated_at,
+                    residents.roll_number, residents.hostel, residents.room
+               FROM campus_ops.hostel_service_requests request
+               LEFT JOIN residents ON residents.user_id=request.requester_user_id
+              WHERE request.tenant_id=$1
+                AND ($2::text IS NULL OR residents.user_id IS NOT NULL)
+                AND request.status NOT IN ('resolved','closed','completed','rejected','cancelled')
+                AND NOT (request.request_kind='visitor' AND request.status='approved')
+           )
+           SELECT jsonb_build_object(
+             'scopeHostel',$2::text,
+             'residents',(SELECT count(*) FROM residents),
+             'outside',(SELECT count(*) FROM last_move WHERE direction='exit'),
+             'onLeave',(SELECT count(DISTINCT requester_user_id) FROM passes
+                         WHERE now() BETWEEN departure_at AND return_at),
+             'hostels',COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                 'name',h.hostel,'residents',h.residents,'outside',h.outside) ORDER BY h.hostel)
+               FROM (SELECT COALESCE(residents.hostel,'Unassigned') hostel, count(*) residents,
+                            count(*) FILTER (WHERE last_move.direction='exit') outside
+                       FROM residents LEFT JOIN last_move ON last_move.user_id=residents.user_id
+                      GROUP BY 1) h),'[]'::jsonb),
+             'overdue',COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                 'requestId',id,'userId',requester_user_id,'name',name,
+                 'rollNumber',roll_number,'hostel',hostel,'room',room,'passType',pass_type,
+                 'destination',destination,'departureAt',departure_at,'returnAt',return_at,
+                 'exitedAt',exited_at) ORDER BY return_at)
+               FROM passes WHERE return_at < now() AND last_direction='exit'),'[]'::jsonb),
+             'away',COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                 'requestId',id,'userId',requester_user_id,'name',name,
+                 'rollNumber',roll_number,'hostel',hostel,'room',room,'passType',pass_type,
+                 'destination',destination,'departureAt',departure_at,'returnAt',return_at,
+                 'exitedAt',exited_at) ORDER BY return_at)
+               FROM passes WHERE now() BETWEEN departure_at AND return_at),'[]'::jsonb),
+             'requests',COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                 'id',id,'kind',request_kind,'status',status,'details',details,
+                 'requesterName',requester_name,'rollNumber',roll_number,'hostel',hostel,
+                 'room',room,'createdAt',created_at,'updatedAt',updated_at) ORDER BY created_at)
+               FROM open_requests),'[]'::jsonb))"#,
+    )
+    .bind(tenant)
+    .bind(hostel)
+    .fetch_one(pool)
+    .await?)
+}
+
+async fn update_hostel_service_request_status(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(request_id): Path<Uuid>,
+    Json(input): Json<HostelRequestStatusInput>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_any(&access, &["hostel.records.update"])?;
+    let scope = hostel_operations_scope(&access).ok_or(ApiError::Forbidden)?;
+    let status = input.status.trim().to_ascii_lowercase();
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let hostel = hostel_staff_hostel(db.pool(), tenant, &principal, &scope).await?;
+    let current = sqlx::query_as::<_, (String, Option<String>)>(
+        r#"SELECT request.request_kind, NULLIF(student.profile->>'hostel','')
+             FROM campus_ops.hostel_service_requests request
+             LEFT JOIN core.students student ON student.tenant_id=request.tenant_id
+              AND student.user_account_id::text=request.requester_user_id
+            WHERE request.tenant_id=$1 AND request.id=$2"#,
+    )
+    .bind(tenant)
+    .bind(request_id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Hostel request not found".into()))?;
+    if let Some(hostel) = hostel.as_deref()
+        && !current
+            .1
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(hostel))
+    {
+        return Err(ApiError::NotFound("Hostel request not found".into()));
+    }
+    if !hostel_request_status_allowed(&current.0, &status) {
+        return Err(ApiError::BadRequest(
+            "That status is not valid for this request".into(),
+        ));
+    }
+    let note = input
+        .note
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let value = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.hostel_service_requests
+              SET status=$3,
+                  details=details || jsonb_strip_nulls(jsonb_build_object(
+                    'resolutionNotes',$4::text,'handledBy',$5::text,
+                    'handledAt',now())),
+                  updated_at=now()
+            WHERE tenant_id=$1 AND id=$2
+        RETURNING jsonb_build_object('id',id,'kind',request_kind,'status',status,
+          'details',details,'requesterName',requester_name,
+          'createdAt',created_at,'updatedAt',updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(request_id)
+    .bind(&status)
+    .bind(note)
+    .bind(&principal.student.name)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(Json(ApiResponse::new(value)))
+}
+
 async fn hostel_overview(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
@@ -341,12 +562,28 @@ async fn hostel_overview(
     .fetch_one(db.pool())
     .await?;
 
+    let operations = match hostel_operations_scope(&access) {
+        Some(scope) => {
+            let hostel = hostel_staff_hostel(db.pool(), tenant, &principal, &scope).await?;
+            let mut board = hostel_operations(db.pool(), tenant, hostel.as_deref()).await?;
+            if let Some(object) = board.as_object_mut() {
+                object.insert(
+                    "canUpdate".into(),
+                    Value::Bool(access.allows("hostel.records.update")),
+                );
+            }
+            Some(board)
+        }
+        None => None,
+    };
+
     Ok(Json(ApiResponse::new(json!({
         "student": student,
         "diningSettings": settings,
         "feeEntitlement": entitlement,
         "serviceRequests": requests,
         "mealTokens": tokens,
+        "operations": operations,
     }))))
 }
 
@@ -1051,16 +1288,7 @@ async fn canteen_store(
     Extension(principal): Extension<AuthPrincipal>,
     Extension(access): Extension<EffectiveAccess>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    require_any(
-        &access,
-        &[
-            "canteen.menu.read",
-            "canteen.order.read",
-            "canteen.orders.manage",
-            "canteen.wallet.top_up",
-            "vendor_management.vendors.read",
-        ],
-    )?;
+    require_shop_customer(&access)?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let assigned_shop_keys = assigned_shop_keys(
@@ -1144,8 +1372,10 @@ async fn canteen_store(
               shop.created_at, shop.shop_key
             LIMIT 1
           ) resolved_shop ON true
-          WHERE item.tenant_id=$1
-            AND (NOT $9 OR resolved_shop.shop_key = ANY($10))), '[]'::jsonb),
+          -- The catalogue is the whole campus's: an operator in Shop mode buys
+          -- from every store like anyone else. Their work surfaces narrow it to
+          -- `assignedShopKeys`, and every menu write re-checks the assignment.
+          WHERE item.tenant_id=$1), '[]'::jsonb),
         'orders', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'orderNumber',order_number,
           'customerUserId',customer_user_id,'customerName',customer_name,'lines',lines,
           'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,
@@ -1173,13 +1403,8 @@ async fn canteen_store(
       .bind(can_manage).bind(can_read_analytics).bind(restrict_to_assignments).bind(&assigned_shop_keys)
       .bind(&order_shop_keys)
       .fetch_one(db.pool()).await?;
-    let shops = shops_json(
-        db.pool(),
-        tenant,
-        false,
-        restrict_to_assignments.then_some(&assigned_shop_keys),
-    )
-    .await?;
+    // Every active shop, for the same reason as the catalogue above.
+    let shops = shops_json(db.pool(), tenant, false, None).await?;
     let laundry_price_per_kg = sqlx::query_scalar::<_, f64>(
         "SELECT COALESCE((SELECT price_per_kg::float8 FROM campus_ops.laundry_settings WHERE tenant_id=$1 AND shop_key='mec-laundry'),0)",
     )
@@ -1247,286 +1472,7 @@ async fn canteen_store(
     Ok(Json(ApiResponse::new(data)))
 }
 
-/// Orders bucketed by where they ended up. `active` is everything still in
-/// the queue (pending, accepted, preparing, ready).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OrderStatusDistribution {
-    completed: i64,
-    active: i64,
-    cancelled: i64,
-}
-
-impl OrderStatusDistribution {
-    fn from_counts(completed: i64, active: i64, cancelled: i64) -> Self {
-        Self {
-            completed: completed.max(0),
-            active: active.max(0),
-            cancelled: cancelled.max(0),
-        }
-    }
-
-    fn total(&self) -> i64 {
-        self.completed + self.active + self.cancelled
-    }
-
-    /// Whole-number share of the bucketed orders; 0 when there are none.
-    fn percentage(&self, count: i64) -> f64 {
-        let total = self.total();
-        if total <= 0 {
-            return 0.0;
-        }
-        ((count as f64 / total as f64) * 100.0).round()
-    }
-}
-
-/// Food-counter vs other-store share of completed revenue. Both are 0 when
-/// nothing has sold yet, rather than claiming 100% of nothing.
-fn revenue_split_percentages(food: f64, other: f64) -> (f64, f64) {
-    let food = food.max(0.0);
-    let other = other.max(0.0);
-    let total = food + other;
-    if total <= 0.0 {
-        return (0.0, 0.0);
-    }
-    let food_pct = ((food / total) * 100.0).round();
-    (food_pct, (100.0 - food_pct).max(0.0))
-}
-
-async fn sales_dashboard(
-    State(state): State<AppState>,
-    Extension(principal): Extension<AuthPrincipal>,
-    Extension(access): Extension<EffectiveAccess>,
-) -> ApiResult<Json<ApiResponse<Value>>> {
-    require_any(
-        &access,
-        &[
-            "vendor_management.vendors.read",
-            "canteen.analytics.read",
-            "canteen.orders.manage",
-        ],
-    )?;
-    let db = state.tenant_database(&principal.student.tenant_id).await?;
-    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-
-    let db_total_orders = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0);
-
-    let db_today_orders = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND created_at::date = CURRENT_DATE",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0);
-
-    let db_total_revenue = sqlx::query_scalar::<_, f64>(
-        "SELECT COALESCE(sum(total)::float8, 0) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND status='completed'",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0.0);
-
-    let db_today_revenue = sqlx::query_scalar::<_, f64>(
-        "SELECT COALESCE(sum(total)::float8, 0) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND status='completed' AND created_at::date = CURRENT_DATE",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0.0);
-
-    let db_monthly_revenue = sqlx::query_scalar::<_, f64>(
-        "SELECT COALESCE(sum(total)::float8, 0) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND status='completed' AND date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0.0);
-
-    let db_weekly_revenue = sqlx::query_scalar::<_, f64>(
-        "SELECT COALESCE(sum(total)::float8, 0) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND status='completed' AND created_at >= date_trunc('week', CURRENT_DATE)",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0.0);
-
-    let db_today_online = sqlx::query_scalar::<_, f64>(
-        "SELECT COALESCE(sum(amount)::float8, 0) FROM campus_ops.canteen_wallet_transactions WHERE tenant_id=$1 AND transaction_type='online_top_up' AND created_at::date = CURRENT_DATE",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0.0);
-
-    let db_month_online = sqlx::query_scalar::<_, f64>(
-        "SELECT COALESCE(sum(amount)::float8, 0) FROM campus_ops.canteen_wallet_transactions WHERE tenant_id=$1 AND transaction_type='online_top_up' AND date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0.0);
-
-    let db_pending_orders = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND status IN ('pending','accepted','preparing','ready')",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0);
-
-    let platform_orders = db_total_orders;
-    let orders_today = db_today_orders;
-    let total_revenue = db_total_revenue;
-    let today_revenue = db_today_revenue;
-    let monthly_revenue = db_monthly_revenue;
-    let weekly_revenue = db_weekly_revenue;
-    let today_online_payments = db_today_online;
-    let month_online_payments = db_month_online;
-    let pending_actions = db_pending_orders;
-
-    let db_completed_orders = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND status='completed'",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0);
-
-    // A shop can reject an order and a student can cancel one; both end the
-    // order without a sale, so the distribution counts them together.
-    let db_cancelled_orders = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND status IN ('cancelled','rejected')",
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or(0);
-
-    let distribution = OrderStatusDistribution::from_counts(
-        db_completed_orders,
-        db_pending_orders,
-        db_cancelled_orders,
-    );
-
-    // Completed sales split by the kind of shop that made them: food counters
-    // against the QR-paid stores (stationery, laundry). Top-ups are money
-    // moving into wallets, not sales, and do not belong in this split.
-    let (food_revenue, other_revenue) = sqlx::query_as::<_, (f64, f64)>(
-        r#"SELECT
-             COALESCE(sum(o.total) FILTER (WHERE lower(COALESCE(s.category, 'canteen')) = 'canteen'), 0)::float8,
-             COALESCE(sum(o.total) FILTER (WHERE lower(COALESCE(s.category, 'canteen')) <> 'canteen'), 0)::float8
-           FROM campus_ops.canteen_orders o
-           LEFT JOIN campus_ops.shops s ON s.tenant_id = o.tenant_id AND s.shop_key = o.store
-           WHERE o.tenant_id=$1 AND o.status='completed'"#,
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or((0.0, 0.0));
-    let (orders_pct, adhoc_pct) = revenue_split_percentages(food_revenue, other_revenue);
-
-    let recent_orders = sqlx::query_scalar::<_, Value>(
-        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
-            'id', id,
-            'orderNumber', order_number,
-            'customerName', customer_name,
-            'store', store,
-            'total', total::float8,
-            'status', status,
-            'fulfilmentMode', fulfilment_mode,
-            'createdAt', created_at
-        ) ORDER BY created_at DESC), '[]'::jsonb)
-        FROM (
-            SELECT id, order_number, customer_name, store, total, status, fulfilment_mode, created_at
-            FROM campus_ops.canteen_orders
-            WHERE tenant_id=$1
-            ORDER BY created_at DESC
-            LIMIT 25
-        ) o"#,
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or_else(|_| json!([]));
-
-    let shops = sqlx::query_scalar::<_, Value>(
-        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
-            'shopKey', s.shop_key,
-            'name', s.name,
-            'category', s.category,
-            'isActive', s.is_active,
-            'isOpen', s.shop_open,
-            'ordersToday', COALESCE(today_stats.cnt, 0),
-            'revenueToday', COALESCE(today_stats.rev, 0)::float8,
-            'totalOrders', COALESCE(all_stats.cnt, 0),
-            'totalRevenue', COALESCE(all_stats.rev, 0)::float8,
-            'activeOrders', COALESCE(active_stats.cnt, 0)
-        ) ORDER BY s.created_at), '[]'::jsonb)
-        FROM campus_ops.shops s
-        LEFT JOIN LATERAL (
-            SELECT count(*) as cnt, sum(total) as rev
-            FROM campus_ops.canteen_orders
-            WHERE tenant_id=s.tenant_id AND store=s.shop_key AND created_at::date = CURRENT_DATE
-        ) today_stats ON true
-        LEFT JOIN LATERAL (
-            SELECT count(*) as cnt, sum(total) as rev
-            FROM campus_ops.canteen_orders
-            WHERE tenant_id=s.tenant_id AND store=s.shop_key AND status='completed'
-        ) all_stats ON true
-        LEFT JOIN LATERAL (
-            SELECT count(*) as cnt
-            FROM campus_ops.canteen_orders
-            WHERE tenant_id=s.tenant_id AND store=s.shop_key AND status IN ('pending','accepted','preparing','ready')
-        ) active_stats ON true
-        WHERE s.tenant_id=$1"#,
-    )
-    .bind(tenant)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or_else(|_| json!([]));
-
-    Ok(Json(ApiResponse::new(json!({
-        "platformOrders": platform_orders,
-        "ordersToday": orders_today,
-        "ordersTodayTrend": format!("↗ {} new today", orders_today),
-        "revenue": total_revenue,
-        "revenueToday": today_revenue,
-        "revenueTodayTrend": format!("↗ ₹{:.0} today", today_revenue),
-        "monthlyRevenue": monthly_revenue,
-        "weeklyRevenue": weekly_revenue,
-        "weeklyRevenueTrend": format!("↗ ₹{:.0} this week", weekly_revenue),
-        "todayOnlinePayments": today_online_payments,
-        "monthlyOnlinePayments": month_online_payments,
-        "onlinePaymentsTrend": format!("— ₹{:.0} this month", month_online_payments),
-        "pendingActions": pending_actions,
-        "pendingApprovals": 0,
-        "pendingRequests": pending_actions,
-        "pendingActionsTrend": format!("0 approvals · {} requests", pending_actions),
-        "orderStatusDistribution": {
-            "completed": distribution.percentage(distribution.completed),
-            "cancelled": distribution.percentage(distribution.cancelled),
-            "pending": distribution.percentage(distribution.active),
-            "completedCount": distribution.completed,
-            "cancelledCount": distribution.cancelled,
-            "pendingCount": distribution.active,
-            "totalCount": distribution.total()
-        },
-        "paymentSplit": {
-            "ordersPercentage": orders_pct,
-            "adhocPercentage": adhoc_pct,
-            "ordersRevenue": food_revenue,
-            "adhocRevenue": other_revenue
-        },
-        "shops": shops,
-        "recentOrders": recent_orders
-    }))))
-}
+// The shop sales dashboard lives in `crate::vendor_sales`.
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2099,7 +2045,7 @@ async fn place_order(
     Extension(access): Extension<EffectiveAccess>,
     Json(input): Json<PlaceOrderRequest>,
 ) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
-    require(&access, "canteen.order.create")?;
+    require_shop_customer(&access)?;
     if input.lines.is_empty()
         || input
             .lines
@@ -2458,7 +2404,7 @@ async fn claim_laundry_charge(
     Extension(access): Extension<EffectiveAccess>,
     Json(input): Json<LaundryClaimRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    require(&access, "canteen.order.create")?;
+    require_shop_customer(&access)?;
     let payload = input.qr_payload.trim();
     if !payload.starts_with("supercampus://laundry/") {
         return Err(ApiError::BadRequest(
@@ -2521,7 +2467,7 @@ async fn pay_laundry_charge(
     Extension(access): Extension<EffectiveAccess>,
     Path(charge_id): Path<Uuid>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    require(&access, "canteen.order.create")?;
+    require_shop_customer(&access)?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let mut tx = db.pool().begin().await?;
@@ -4118,25 +4064,28 @@ async fn update_canteen_staff_state(
     Extension(access): Extension<EffectiveAccess>,
     Json(input): Json<StaffStateRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
-    require(&access, "canteen.orders.manage")?;
+    // Work / Shop is the person's own preference, so anyone who can open the
+    // shops may keep it. Opening or closing a counter is not: that needs the
+    // order-management grant and an assigned shop.
+    require_shop_customer(&access)?;
     if !matches!(input.mode.as_str(), "eat" | "work") {
         return Err(ApiError::BadRequest("Mode must be eat or work".into()));
     }
-    if input.shop_open.is_some() {
-        require(&access, "canteen.orders.manage")?;
-    }
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    if assigned_shop_keys(
-        db.pool(),
-        tenant,
-        &principal.student.id,
-        &principal.student.email,
-    )
-    .await?
-    .is_empty()
-    {
-        return Err(ApiError::Forbidden);
+    if input.shop_open.is_some() {
+        require(&access, "canteen.orders.manage")?;
+        if assigned_shop_keys(
+            db.pool(),
+            tenant,
+            &principal.student.id,
+            &principal.student.email,
+        )
+        .await?
+        .is_empty()
+        {
+            return Err(ApiError::Forbidden);
+        }
     }
     if let Some(shop_open) = input.shop_open {
         let assigned = assigned_shop_keys(
@@ -5394,7 +5343,9 @@ async fn unique_gate_code(
         let available = sqlx::query_scalar::<_, bool>(
             r#"SELECT NOT EXISTS(
                  SELECT 1 FROM campus_ops.gatepass_requests
-                  WHERE tenant_id=$1 AND manual_code_hash=$2 AND state='approved'
+                  -- Any state: a completed pass keeps its code hash so a
+                  -- replayed code reads as "already scanned" at the gate.
+                  WHERE tenant_id=$1 AND manual_code_hash=$2
                  UNION ALL
                  SELECT 1 FROM campus_ops.daily_access_passes
                   WHERE tenant_id=$1 AND manual_code_hash=$2
@@ -5971,166 +5922,7 @@ fn attach_daily_access_location(
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct GateScanRequest {
-    qr_payload: String,
-    direction: String,
-    checkpoint: String,
-}
-
-fn validate_request_scan_sequence(direction: &str, previous: Option<&str>) -> ApiResult<()> {
-    match (direction, previous) {
-        ("exit", None) | ("entry", Some("exit")) => Ok(()),
-        ("entry", None) => Err(ApiError::Conflict(
-            "Scan gate exit before gate entry".into(),
-        )),
-        _ => Err(ApiError::Conflict(
-            "This gate movement was already recorded".into(),
-        )),
-    }
-}
-
-async fn scan_gatepass(
-    State(state): State<AppState>,
-    Extension(principal): Extension<AuthPrincipal>,
-    Extension(access): Extension<EffectiveAccess>,
-    Json(input): Json<GateScanRequest>,
-) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
-    require(&access, "gatepass.scan.create")?;
-    if !matches!(input.direction.as_str(), "entry" | "exit") {
-        return Err(ApiError::BadRequest(
-            "Direction must be entry or exit".into(),
-        ));
-    }
-    if input.qr_payload.trim().is_empty() || input.checkpoint.trim().is_empty() {
-        return Err(ApiError::BadRequest(
-            "QR payload and checkpoint are required".into(),
-        ));
-    }
-    let db = state.tenant_database(&principal.student.tenant_id).await?;
-    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let hash = token_hash(input.qr_payload.trim());
-    let mut tx = db.pool().begin().await?;
-    // Three kinds of token arrive at the same scanner and the guard cannot tell
-    // them apart by looking: an approved outpass or leave pass, a member's
-    // geofenced daily gate-in, or a visitor's card. A visitor has no account, so
-    // their pass id stands in for the user id — gate_movements.user_id is NOT
-    // NULL and every "movements for this person" query already keys on it.
-    let match_row = sqlx::query_as::<
-        _,
-        (
-            String,
-            Option<Uuid>,
-            Option<Uuid>,
-            String,
-            String,
-            DateTime<Utc>,
-        ),
-    >(
-        r#"SELECT user_id,request_id,visitor_pass_id,holder_name,pass_type,valid_until FROM (
-          SELECT requester_user_id user_id,id request_id,NULL::uuid visitor_pass_id,
-                 requester_name holder_name,pass_type,return_at valid_until
-            FROM campus_ops.gatepass_requests
-           WHERE tenant_id=$1 AND state='approved'
-             AND (qr_token_hash=$2 OR manual_code_hash=$2)
-             AND now() BETWEEN departure_at AND return_at
-          UNION ALL
-          SELECT pass.user_id,NULL::uuid,NULL::uuid,
-                 COALESCE(member.display_name,pass.user_id) holder_name,
-                 'daily_access' pass_type,
-                 pass.activated_at + interval '100 years' valid_until
-            FROM campus_ops.daily_access_passes pass
-            LEFT JOIN identity.users member ON member.id::text=pass.user_id
-           WHERE pass.tenant_id=$1
-             AND (pass.qr_token_hash=$2 OR pass.manual_code_hash=$2)
-          UNION ALL
-          -- A visitor pass is good inside the window it was approved for (including 30m early grace).
-          SELECT id::text,NULL::uuid,id,visitor_name,'visitor' pass_type,
-                 visit_until valid_until
-            FROM campus_ops.visitor_passes
-           WHERE tenant_id=$1 AND state IN ('approved', 'sent', 'active', 'checked_in') AND qr_token_hash=$2
-             AND now() BETWEEN (visit_from - interval '30 minutes') AND visit_until
-        ) valid LIMIT 1"#,
-    )
-    .bind(tenant)
-    .bind(hash)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("QR is invalid or expired".into()))?;
-
-    if let Some(request_id) = match_row.1 {
-        let previous_direction = sqlx::query_scalar::<_, String>(
-            r#"SELECT direction FROM campus_ops.gate_movements
-               WHERE tenant_id=$1 AND request_id=$2
-               ORDER BY created_at DESC LIMIT 1"#,
-        )
-        .bind(tenant)
-        .bind(request_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        validate_request_scan_sequence(&input.direction, previous_direction.as_deref())?;
-    }
-    let mut value=sqlx::query_scalar::<_,Value>("INSERT INTO campus_ops.gate_movements(tenant_id,user_id,request_id,visitor_pass_id,direction,checkpoint,scanned_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING jsonb_build_object('id',id,'userId',user_id,'requestId',request_id,'visitorPassId',visitor_pass_id,'direction',direction,'checkpoint',checkpoint,'createdAt',created_at)")
- .bind(tenant).bind(&match_row.0).bind(match_row.1).bind(match_row.2).bind(&input.direction).bind(input.checkpoint.trim()).bind(&principal.student.id).fetch_one(&mut *tx).await?;
-    if input.direction == "entry"
-        && let Some(request_id) = match_row.1
-    {
-        sqlx::query(
-            r#"UPDATE campus_ops.gatepass_requests
-               SET state='completed',qr_token_hash=NULL,qr_payload=NULL,
-                   manual_code_hash=NULL,manual_code=NULL,updated_at=now()
-               WHERE tenant_id=$1 AND id=$2 AND state='approved'"#,
-        )
-        .bind(tenant)
-        .bind(request_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    if let Some(visitor_pass_id) = match_row.2 {
-        if input.direction == "entry" {
-            sqlx::query(
-                r#"UPDATE campus_ops.visitor_passes
-                   SET state='checked_in',checked_in_at=COALESCE(checked_in_at,now()),updated_at=now()
-                   WHERE tenant_id=$1 AND id=$2"#,
-            )
-            .bind(tenant)
-            .bind(visitor_pass_id)
-            .execute(&mut *tx)
-            .await?;
-        } else if input.direction == "exit" {
-            sqlx::query(
-                r#"UPDATE campus_ops.visitor_passes
-                   SET state='checked_out',checked_out_at=now(),updated_at=now()
-                   WHERE tenant_id=$1 AND id=$2"#,
-            )
-            .bind(tenant)
-            .bind(visitor_pass_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-    }
-    if let Some(object) = value.as_object_mut() {
-        object.insert("holderName".into(), json!(match_row.3));
-        object.insert("passType".into(), json!(match_row.4));
-        object.insert("validUntil".into(), json!(match_row.5));
-    }
-    tx.commit().await?;
-    emit(
-        &state,
-        &principal.student.tenant_id,
-        db.pool(),
-        tenant,
-        "gatepass",
-        "movement",
-        value["id"].as_str().unwrap_or_default(),
-        "movement.scanned",
-        &principal.student.id,
-        &value,
-    )
-    .await?;
-    Ok((StatusCode::CREATED, Json(ApiResponse::new(value))))
-}
+// Gate scanning (POST /gatepass/scan) lives in `crate::gate_security`.
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -8069,6 +7861,23 @@ fn authorized_change_modules(access: &EffectiveAccess) -> Vec<String> {
         .collect()
 }
 
+/// Grants that let someone into the campus shops at all. Whoever can open the
+/// shops can also buy from them: staff, owners, captains, accountants and
+/// admins switch to Shop mode and order like a student, with their own wallet
+/// and PIN. Tenant scoping and the wallet PIN still apply to every purchase.
+const SHOP_CUSTOMER_PERMISSIONS: &[&str] = &[
+    "canteen.order.create",
+    "canteen.menu.read",
+    "canteen.order.read",
+    "canteen.orders.manage",
+    "canteen.wallet.top_up",
+    "vendor_management.vendors.read",
+];
+
+fn require_shop_customer(access: &EffectiveAccess) -> ApiResult<()> {
+    require_any(access, SHOP_CUSTOMER_PERMISSIONS)
+}
+
 pub(crate) fn require_any(access: &EffectiveAccess, permissions: &[&str]) -> ApiResult<()> {
     if permissions.iter().any(|p| access.allows(p)) {
         Ok(())
@@ -8533,6 +8342,46 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn hostel_access(permission: &str, scope: &str) -> EffectiveAccess {
+        EffectiveAccess {
+            roles: Vec::new(),
+            portal_families: Vec::new(),
+            permissions: vec![permission.into()],
+            scopes: HashMap::from([(permission.to_owned(), scope.to_owned())]),
+        }
+    }
+
+    #[test]
+    fn hostel_operations_board_needs_more_than_own_scope() {
+        assert_eq!(
+            hostel_operations_scope(&hostel_access("hostel.records.read", "own")),
+            None
+        );
+        assert_eq!(
+            hostel_operations_scope(&hostel_access("hostel.records.read", "institution"))
+                .as_deref(),
+            Some("institution")
+        );
+        assert_eq!(
+            hostel_operations_scope(&hostel_access("*", "all")).as_deref(),
+            Some("all")
+        );
+        assert_eq!(
+            hostel_operations_scope(&hostel_access("canteen.orders.read", "all")),
+            None
+        );
+    }
+
+    #[test]
+    fn hostel_request_statuses_follow_request_kind() {
+        assert!(hostel_request_status_allowed("complaint", "resolved"));
+        assert!(!hostel_request_status_allowed("complaint", "approved"));
+        assert!(hostel_request_status_allowed("room_change", "approved"));
+        assert!(!hostel_request_status_allowed("room_change", "resolved"));
+        assert!(hostel_request_status_allowed("visitor", "rejected"));
+        assert!(!hostel_request_status_allowed("unknown", "approved"));
+    }
+
     fn member(id: &str, name: &str, roles: &[&str], eligible: bool) -> WalletMemberRow {
         WalletMemberRow {
             user_id: id.into(),
@@ -8726,31 +8575,6 @@ mod tests {
     }
 
     #[test]
-    fn order_status_distribution_buckets_queue_separately_from_cancellations() {
-        // Two orders waiting at the counter are neither completed nor
-        // cancelled: they are the whole of the active bucket.
-        let queued = OrderStatusDistribution::from_counts(0, 2, 0);
-        assert_eq!(queued.total(), 2);
-        assert_eq!(queued.percentage(queued.completed), 0.0);
-        assert_eq!(queued.percentage(queued.cancelled), 0.0);
-        assert_eq!(queued.percentage(queued.active), 100.0);
-
-        let mixed = OrderStatusDistribution::from_counts(3, 0, 1);
-        assert_eq!(mixed.percentage(mixed.completed), 75.0);
-        assert_eq!(mixed.percentage(mixed.cancelled), 25.0);
-
-        let empty = OrderStatusDistribution::from_counts(0, 0, 0);
-        assert_eq!(empty.percentage(empty.completed), 0.0);
-    }
-
-    #[test]
-    fn revenue_split_claims_nothing_before_the_first_sale() {
-        assert_eq!(revenue_split_percentages(0.0, 0.0), (0.0, 0.0));
-        assert_eq!(revenue_split_percentages(300.0, 100.0), (75.0, 25.0));
-        assert_eq!(revenue_split_percentages(0.0, 50.0), (0.0, 100.0));
-    }
-
-    #[test]
     fn razorpay_payment_id_is_read_only_from_online_top_ups() {
         assert_eq!(
             razorpay_payment_id("online_top_up", Some("razorpay:pay_ABC123")),
@@ -8863,15 +8687,6 @@ mod tests {
             campus_code_from("Madras Engineering College"),
             "MADRAS-ENGINEERING"
         );
-    }
-
-    #[test]
-    fn gatepass_qr_requires_exit_then_entry_and_cannot_be_reused() {
-        assert!(validate_request_scan_sequence("exit", None).is_ok());
-        assert!(validate_request_scan_sequence("entry", Some("exit")).is_ok());
-        assert!(validate_request_scan_sequence("entry", None).is_err());
-        assert!(validate_request_scan_sequence("exit", Some("exit")).is_err());
-        assert!(validate_request_scan_sequence("entry", Some("entry")).is_err());
     }
 
     #[test]

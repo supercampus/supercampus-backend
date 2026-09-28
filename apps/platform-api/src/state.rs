@@ -2522,17 +2522,53 @@ impl AppState {
         .fetch_all(database.pool())
         .await
         .context("failed to list tenant users")?;
+        // A student's year is often recorded only on the student record in
+        // the tenant database; use it when the membership has none, so the
+        // Admin Console does not list such students under "Year not set".
+        let student_years: HashMap<Uuid, String> = match self.tenant_database(tenant_slug).await {
+            Ok(tenant) => sqlx::query_as::<_, (Uuid, String)>(
+                r#"SELECT student.user_account_id,
+                          COALESCE(
+                              NULLIF(student.profile ->> 'yearOfStudy', ''),
+                              NULLIF(student.profile ->> 'year', ''),
+                              NULLIF(student.academic_year, '')
+                          )
+                   FROM core.students student
+                   JOIN platform.tenants tenant ON tenant.id = student.tenant_id
+                   WHERE tenant.slug = $1
+                     AND student.user_account_id IS NOT NULL
+                     AND COALESCE(
+                             NULLIF(student.profile ->> 'yearOfStudy', ''),
+                             NULLIF(student.profile ->> 'year', ''),
+                             NULLIF(student.academic_year, '')
+                         ) IS NOT NULL"#,
+            )
+            .bind(tenant_slug)
+            .fetch_all(tenant.pool())
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, tenant_slug, "could not read student years for the user list");
+                Vec::new()
+            })
+            .into_iter()
+            .collect(),
+            Err(_) => HashMap::new(),
+        };
         let users = rows
             .iter()
             .map(|row| {
+                let id = row.try_get::<Uuid, _>("id")?;
+                let year_of_study = row
+                    .try_get::<Option<String>, _>("year_of_study")?
+                    .or_else(|| student_years.get(&id).cloned());
                 Ok(json!({
-                    "id": row.try_get::<Uuid, _>("id")?,
+                    "id": id,
                     "email": row.try_get::<String, _>("email")?,
                     "name": row.try_get::<String, _>("display_name")?,
                     "initials": row.try_get::<String, _>("initials")?,
                     "accountType": row.try_get::<String, _>("account_type")?,
                     "active": row.try_get::<bool, _>("active")?,
-                    "yearOfStudy": row.try_get::<Option<String>, _>("year_of_study")?,
+                    "yearOfStudy": year_of_study,
                     "department": row.try_get::<Option<String>, _>("department")?,
                     "roles": row.try_get::<Value, _>("roles")?,
                 }))
@@ -2584,18 +2620,24 @@ impl AppState {
             return Ok(None);
         };
 
+        let membership_profile = match request.year_of_study {
+            Some(year) => json!({ "year": format!("Year {year}"), "yearOfStudy": year }),
+            None => json!({}),
+        };
         sqlx::query(
             r#"INSERT INTO identity.tenant_memberships
                (tenant_id, user_id, roles, is_primary, profile)
-               VALUES ($1, $2, $3, true, '{}'::jsonb)
+               VALUES ($1, $2, $3, true, $4)
                ON CONFLICT (tenant_id, user_id) DO UPDATE SET
                    roles = EXCLUDED.roles,
+                   profile = identity.tenant_memberships.profile || EXCLUDED.profile,
                    active = true,
                    updated_at = now()"#,
         )
         .bind(tenant_id)
         .bind(user_id)
         .bind(&role_keys)
+        .bind(&membership_profile)
         .execute(&mut *transaction)
         .await?;
         replace_user_roles(
@@ -2876,7 +2918,56 @@ impl AppState {
 
         let new_initials = initials(new_name);
 
-        // 3. Update identity.users in control database
+        // 3. Stage the change in the tenant database first. Its records
+        //    (core.students, core.employees and the identity.users replica)
+        //    feed the Student Directory, module name lookups, and the Student
+        //    Master save, which writes the student's name back to
+        //    identity.users. Leaving them stale made a rename look saved until
+        //    the next Student Master save reverted it. The tenant id is
+        //    resolved inside the tenant database: it is not guaranteed to
+        //    equal the control plane's id for the same slug.
+        let mut tenant_transaction = match self.tenant_database(tenant_slug).await {
+            Ok(tenant_db) => Some(
+                tenant_db
+                    .pool()
+                    .begin()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    tenant_slug,
+                    "tenant database unavailable; renaming in the control plane only"
+                );
+                None
+            }
+        };
+        if let Some(tenant_tx) = tenant_transaction.as_mut() {
+            sync_tenant_user_identity(
+                tenant_tx,
+                tenant_slug,
+                user_id,
+                &current_email,
+                new_name,
+                &new_email,
+                &new_initials,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    %user_id,
+                    tenant_slug,
+                    "failed to update the user in the tenant database"
+                );
+                ApiError::BadRequest(
+                    "The change could not be saved to the campus records. Try again.".into(),
+                )
+            })?;
+        }
+
+        // 4. Update identity.users and the membership in the control plane.
         let mut transaction = database
             .pool()
             .begin()
@@ -2888,6 +2979,8 @@ impl AppState {
                SET display_name = $2,
                    email = $3,
                    initials = $4,
+                   profile = COALESCE(profile, '{}'::jsonb)
+                       || jsonb_build_object('name', $2::text, 'email', $3::text),
                    updated_at = now()
                WHERE id = $1"#,
         )
@@ -2899,10 +2992,10 @@ impl AppState {
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-        // Update identity.tenant_memberships profile
         sqlx::query(
             r#"UPDATE identity.tenant_memberships
-               SET profile = profile || jsonb_build_object('name', $3::text, 'email', $4::text),
+               SET profile = COALESCE(profile, '{}'::jsonb)
+                       || jsonb_build_object('name', $3::text, 'email', $4::text),
                    updated_at = now()
                WHERE tenant_id = $1 AND user_id = $2"#,
         )
@@ -2918,23 +3011,16 @@ impl AppState {
             .commit()
             .await
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-
-        // 4. Update tenant database if core.students exists
-        if let Ok(tenant_db) = self.tenant_database(tenant_slug).await {
-            let _ = sqlx::query(
-                r#"UPDATE core.students
-                   SET full_name = $3,
-                       email = $4,
-                       profile = profile || jsonb_build_object('name', $3::text, 'email', $4::text),
-                       updated_at = now()
-                   WHERE tenant_id = $1 AND user_account_id = $2"#,
-            )
-            .bind(tenant_id)
-            .bind(user_id)
-            .bind(new_name)
-            .bind(&new_email)
-            .execute(tenant_db.pool())
-            .await;
+        if let Some(tenant_tx) = tenant_transaction {
+            tenant_tx.commit().await.map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    %user_id,
+                    tenant_slug,
+                    "tenant commit failed after the control plane was updated"
+                );
+                ApiError::BadRequest(e.to_string())
+            })?;
         }
 
         self.validated_principals.write().await.clear();
@@ -2955,6 +3041,116 @@ impl AppState {
             "email": new_email,
             "initials": new_initials,
             "updated": true,
+        })))
+    }
+
+    /// Sets a member's year of study (1–6) everywhere it is read: the
+    /// membership profile (Admin Console users), identity.users, and the
+    /// linked student record in the tenant database (Student Directory).
+    /// Returns `None` when the user is not a member of the tenant.
+    pub async fn set_tenant_user_year(
+        &self,
+        tenant_slug: &str,
+        actor_id: &str,
+        user_id: Uuid,
+        year_of_study: u8,
+    ) -> ApiResult<Option<Value>> {
+        let database = self.database.as_ref().ok_or_else(|| {
+            ApiError::ServiceUnavailable("PostgreSQL is required for user management".into())
+        })?;
+        let tenant_id = ensure_tenant(database, tenant_slug)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let is_member: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM identity.tenant_memberships
+                   WHERE tenant_id = $1 AND user_id = $2
+               )"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_one(database.pool())
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if !is_member {
+            return Ok(None);
+        }
+
+        let mut student_records = 0;
+        let mut tenant_transaction = match self.tenant_database(tenant_slug).await {
+            Ok(tenant_db) => Some(
+                tenant_db
+                    .pool()
+                    .begin()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+            ),
+            Err(error) => {
+                tracing::warn!(%error, tenant_slug, "tenant database unavailable; year saved in the control plane only");
+                None
+            }
+        };
+        if let Some(tenant_tx) = tenant_transaction.as_mut() {
+            student_records = sync_tenant_user_year(tenant_tx, tenant_slug, user_id, year_of_study)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, %user_id, tenant_slug, "failed to set the year in the tenant database");
+                    ApiError::BadRequest(
+                        "The year could not be saved to the campus records. Try again.".into(),
+                    )
+                })?;
+        }
+
+        let academic_year = format!("Year {year_of_study}");
+        let year = i32::from(year_of_study);
+        let mut transaction = database
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        sqlx::query(
+            r#"UPDATE identity.tenant_memberships
+               SET profile = COALESCE(profile, '{}'::jsonb)
+                       || jsonb_build_object('year', $3::text, 'yearOfStudy', $4::int),
+                   updated_at = now()
+               WHERE tenant_id = $1 AND user_id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(&academic_year)
+        .bind(year)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        sqlx::query(
+            r#"UPDATE identity.users
+               SET profile = COALESCE(profile, '{}'::jsonb)
+                       || jsonb_build_object('year', $2::text, 'yearOfStudy', $3::int),
+                   updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(user_id)
+        .bind(&academic_year)
+        .bind(year)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if let Some(tenant_tx) = tenant_transaction {
+            tenant_tx
+                .commit()
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        }
+        self.validated_principals.write().await.clear();
+        tracing::info!(%user_id, actor_id, tenant_slug, year_of_study, "administrator set a student's year of study");
+        Ok(Some(json!({
+            "userId": user_id,
+            "yearOfStudy": year_of_study,
+            "studentRecordsUpdated": student_records,
         })))
     }
 
@@ -4585,6 +4781,125 @@ fn identity_student(input: IdentityStudentInput) -> AuthStudent {
         full_college: profile_string("fullCollege", &tenant_name),
         tenant,
     }
+}
+
+/// Mirrors an administrator's rename or email change into the tenant
+/// database: the identity.users replica, the student record and the employee
+/// record linked to the account. A student record not yet linked to the
+/// account is matched by its previous email.
+async fn sync_tenant_user_identity(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_slug: &str,
+    user_id: Uuid,
+    previous_email: &str,
+    name: &str,
+    email: &str,
+    initials: &str,
+) -> anyhow::Result<()> {
+    let tenant_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM platform.tenants WHERE slug = $1")
+            .bind(tenant_slug)
+            .fetch_optional(&mut **transaction)
+            .await
+            .context("failed to resolve the tenant in its database")?;
+    sqlx::query(
+        r#"UPDATE identity.users
+           SET display_name = $2,
+               email = $3,
+               initials = $4,
+               profile = COALESCE(profile, '{}'::jsonb)
+                   || jsonb_build_object('name', $2::text, 'email', $3::text),
+               updated_at = now()
+           WHERE id = $1"#,
+    )
+    .bind(user_id)
+    .bind(name)
+    .bind(email)
+    .bind(initials)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to update the tenant identity replica")?;
+    let Some(tenant_id) = tenant_id else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"UPDATE core.students
+           SET full_name = $3,
+               email = $4,
+               profile = COALESCE(profile, '{}'::jsonb)
+                   || jsonb_build_object('name', $3::text, 'email', $4::text),
+               updated_at = now()
+           WHERE tenant_id = $1
+             AND (user_account_id = $2
+                  OR (user_account_id IS NULL AND lower(COALESCE(email, '')) = lower($5)))"#,
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(name)
+    .bind(email)
+    .bind(previous_email)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to update the student record")?;
+    sqlx::query(
+        r#"UPDATE core.employees
+           SET full_name = $3,
+               email = $4,
+               updated_at = now()
+           WHERE tenant_id = $1 AND user_id = $2"#,
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(name)
+    .bind(email)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to update the employee record")?;
+    Ok(())
+}
+
+/// Records a student's year of study (1–6) in the tenant database: the
+/// student record linked to the account and the identity.users replica.
+async fn sync_tenant_user_year(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_slug: &str,
+    user_id: Uuid,
+    year_of_study: u8,
+) -> anyhow::Result<u64> {
+    let academic_year = format!("Year {year_of_study}");
+    let year = i32::from(year_of_study);
+    sqlx::query(
+        r#"UPDATE identity.users
+           SET profile = COALESCE(profile, '{}'::jsonb)
+                   || jsonb_build_object('year', $2::text, 'yearOfStudy', $3::int),
+               updated_at = now()
+           WHERE id = $1"#,
+    )
+    .bind(user_id)
+    .bind(&academic_year)
+    .bind(year)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to update the tenant identity replica")?;
+    let updated = sqlx::query(
+        r#"UPDATE core.students student
+           SET academic_year = $3,
+               profile = COALESCE(student.profile, '{}'::jsonb)
+                   || jsonb_build_object('year', $3::text, 'yearOfStudy', $4::int),
+               updated_at = now()
+           FROM platform.tenants tenant
+           WHERE tenant.id = student.tenant_id
+             AND tenant.slug = $1
+             AND student.user_account_id = $2"#,
+    )
+    .bind(tenant_slug)
+    .bind(user_id)
+    .bind(&academic_year)
+    .bind(year)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to update the student record")?;
+    Ok(updated.rows_affected())
 }
 
 fn initials(name: &str) -> String {

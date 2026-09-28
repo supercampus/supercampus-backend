@@ -1,6 +1,7 @@
 pub mod academic_assignments;
 pub mod dashboard;
 pub mod error;
+pub mod gate_security;
 pub mod governance;
 pub mod guardian_link;
 pub mod guardian_whatsapp;
@@ -13,6 +14,7 @@ pub mod passes;
 pub mod platform_admin;
 pub mod razorpay;
 pub mod support;
+pub mod vendor_sales;
 pub mod visitors;
 
 pub mod realtime;

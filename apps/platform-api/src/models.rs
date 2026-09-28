@@ -271,6 +271,9 @@ pub struct CreateTenantUserRequest {
     pub password: Option<String>,
     #[serde(default)]
     pub temporary_password: Option<String>,
+    /// Year of study (1–6); required when the student role is assigned.
+    #[serde(default)]
+    pub year_of_study: Option<u8>,
 }
 
 impl CreateTenantUserRequest {

@@ -107,11 +107,25 @@ pub(crate) async fn shop_analytics(
     .ok_or_else(|| ApiError::NotFound("Shop not found".into()))?;
 
     let orders = shop_orders(pool, tenant, &shop_key, range).await?;
-    let staff = shop_staff(pool, tenant, &shop_key).await?;
+    // Only real people are ranked; orders a demo account moved still count
+    // in the shop's totals.
+    let (demo_staff, staff): (Vec<StaffMember>, Vec<StaffMember>) =
+        shop_staff(pool, tenant, &shop_key)
+            .await?
+            .into_iter()
+            .partition(|member| {
+                is_demo_account(member.email.as_deref(), member.assigned_by.as_deref())
+            });
+    let mut hidden: std::collections::HashSet<String> = demo_staff
+        .iter()
+        .flat_map(|member| {
+            std::iter::once(member.assignment_user_id.clone()).chain(member.identity_id.clone())
+        })
+        .collect();
     let unknown: Vec<String> = orders
         .iter()
         .filter_map(|order| order.handled_by.clone())
-        .filter(|id| !staff.iter().any(|member| member.matches(id)))
+        .filter(|id| !staff.iter().any(|member| member.matches(id)) && !hidden.contains(id))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -125,11 +139,18 @@ pub(crate) async fn shop_analytics(
         .fetch_all(pool)
         .await?
         .into_iter()
+        .filter(|(id, _, email)| {
+            let demo = is_demo_account(email.as_deref(), None);
+            if demo {
+                hidden.insert(id.clone());
+            }
+            !demo
+        })
         .map(|(id, name, email)| (id, (name, email)))
         .collect()
     };
 
-    let mut body = build_report(&orders, &staff, &others);
+    let mut body = build_report(&orders, &staff, &others, &hidden);
     body["shop"] = json!({ "shopKey": shop.0, "name": shop.1, "category": shop.2 });
     body["range"] = json!({
         "from": range.from.to_string(),
@@ -232,6 +253,21 @@ struct StaffMember {
     role: String,
     name: String,
     email: Option<String>,
+    /// Who made the assignment: a user id, or a seed/migration marker.
+    assigned_by: Option<String>,
+}
+
+/// Demo accounts are not people: the seed's sample captains live on the
+/// reserved `.local` domain, which cannot receive mail, and their
+/// assignments are stamped by the seed or a migration rather than by a user.
+fn is_demo_account(email: Option<&str>, assigned_by: Option<&str>) -> bool {
+    let demo_email = email
+        .map(|e| e.trim().to_ascii_lowercase().ends_with(".local"))
+        .unwrap_or(false);
+    let seeded = assigned_by
+        .map(|by| by.contains("seed") || by.starts_with("runtime-migration"))
+        .unwrap_or(false);
+    demo_email || seeded
 }
 
 impl StaffMember {
@@ -343,6 +379,7 @@ fn build_report(
     orders: &[OrderFact],
     staff: &[StaffMember],
     others: &HashMap<String, (String, Option<String>)>,
+    hidden: &std::collections::HashSet<String>,
 ) -> Value {
     let mut summary = Totals::default();
     for order in orders {
@@ -381,6 +418,10 @@ fn build_report(
         let Some(handler) = order.handled_by.as_deref() else {
             continue;
         };
+        // Demo accounts are not ranked; their orders stay in the totals.
+        if hidden.contains(handler) {
+            continue;
+        }
         let index = match staff.iter().position(|member| member.matches(handler)) {
             Some(index) => index,
             None => match rows.iter().position(|row| !row.assigned && row.user_id == handler) {
@@ -534,9 +575,9 @@ async fn shop_staff(
     tenant: Uuid,
     shop_key: &str,
 ) -> ApiResult<Vec<StaffMember>> {
-    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, Option<String>)>(
+    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, Option<String>, Option<String>)>(
         r#"SELECT a.user_id, a.assignment_role, u.id::text,
-             COALESCE(NULLIF(trim(u.display_name), ''), u.email, a.user_id), u.email
+             COALESCE(NULLIF(trim(u.display_name), ''), u.email, a.user_id), u.email, a.assigned_by
            FROM campus_ops.shop_user_assignments a
            JOIN campus_ops.shops s ON s.tenant_id=a.tenant_id AND s.id=a.shop_id
            LEFT JOIN identity.users u ON u.id::text=a.user_id
@@ -555,6 +596,7 @@ async fn shop_staff(
             identity_id: r.2,
             name: r.3,
             email: r.4,
+            assigned_by: r.5,
         })
         .collect())
 }
@@ -591,7 +633,19 @@ mod tests {
             role: role.into(),
             name: name.into(),
             email: None,
+            assigned_by: None,
         }
+    }
+
+    #[test]
+    fn demo_accounts_are_not_ranked_as_captains() {
+        assert!(is_demo_account(Some("canteen.captain1@mec.local"), None));
+        assert!(is_demo_account(Some("shashi@gmail.com"), Some("mec-seed")));
+        assert!(is_demo_account(None, Some("runtime-migration-0076")));
+        assert!(!is_demo_account(
+            Some("shashi@gmail.com"),
+            Some("3f1c2a9e-8d5b-4c6f-9a1e-2b7d4c8e9f01"),
+        ));
     }
 
     #[test]
@@ -628,7 +682,7 @@ mod tests {
         ];
         let mut others = HashMap::new();
         others.insert("gone".to_string(), ("Chitra".to_string(), None));
-        let report = build_report(&orders, &staff, &others);
+        let report = build_report(&orders, &staff, &others, &Default::default());
 
         let summary = &report["summary"];
         assert_eq!(summary["orders"], 5);
@@ -670,12 +724,13 @@ mod tests {
             role: "captain".into(),
             name: "Dev".into(),
             email: None,
+            assigned_by: None,
         }];
         let orders = vec![
             order(Some("uuid-1"), "completed", 10.0, 5.0, 3),
             order(Some("legacy-id"), "completed", 20.0, 5.0, 3),
         ];
-        let report = build_report(&orders, &staff, &HashMap::new());
+        let report = build_report(&orders, &staff, &HashMap::new(), &Default::default());
         let captains = report["captains"].as_array().unwrap();
         assert_eq!(captains.len(), 1);
         assert_eq!(captains[0]["orders"], 2);

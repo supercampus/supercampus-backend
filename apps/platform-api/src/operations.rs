@@ -2613,6 +2613,51 @@ fn derive_order_status(line_statuses: &[String], current: &str) -> String {
     current.into()
 }
 
+fn line_item_id(line: &Value) -> Option<Uuid> {
+    line.get("itemId")
+        .or_else(|| line.get("item_id"))
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+}
+
+/// Menu items among `lines` that are handed over without kitchen preparation.
+async fn instant_item_ids(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    lines: &[Value],
+) -> ApiResult<Vec<Uuid>> {
+    let item_ids: Vec<Uuid> = lines.iter().filter_map(line_item_id).collect();
+    if item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT id FROM campus_ops.canteen_menu_items WHERE tenant_id=$1 AND id = ANY($2) AND is_instant",
+    )
+    .bind(tenant)
+    .bind(&item_ids)
+    .fetch_all(&mut **tx)
+    .await?)
+}
+
+fn line_is_instant(line: &Value, instant_ids: &[Uuid]) -> bool {
+    line.get("isInstant").and_then(Value::as_bool).unwrap_or(false)
+        || line_item_id(line).is_some_and(|id| instant_ids.contains(&id))
+}
+
+/// Where one pickup-QR scan moves an item: instant food is handed over at
+/// once; prepared food advances one step (pending → preparing → ready →
+/// delivered).
+fn scan_step(current: &str, is_instant: bool) -> String {
+    if current == "completed" || is_instant {
+        return "completed".into();
+    }
+    match line_status_rank(current) {
+        0 => "preparing".into(),
+        1 => "ready".into(),
+        _ => "completed".into(),
+    }
+}
+
 async fn update_order_line_status(
     state: AppState,
     principal: AuthPrincipal,
@@ -2652,35 +2697,8 @@ async fn update_order_line_status(
     if line_index >= lines.len() {
         return Err(ApiError::BadRequest("That item is not part of this order".into()));
     }
-    let item_ids: Vec<Uuid> = lines
-        .iter()
-        .filter_map(|line| {
-            line.get("itemId")
-                .or_else(|| line.get("item_id"))
-                .and_then(Value::as_str)
-                .and_then(|id| Uuid::parse_str(id).ok())
-        })
-        .collect();
-    let instant_ids: Vec<Uuid> = if item_ids.is_empty() {
-        Vec::new()
-    } else {
-        sqlx::query_scalar(
-            "SELECT id FROM campus_ops.canteen_menu_items WHERE tenant_id=$1 AND id = ANY($2) AND is_instant",
-        )
-        .bind(tenant)
-        .bind(&item_ids)
-        .fetch_all(&mut *tx)
-        .await?
-    };
-    let is_instant = |line: &Value| {
-        line.get("isInstant").and_then(Value::as_bool).unwrap_or(false)
-            || line
-                .get("itemId")
-                .or_else(|| line.get("item_id"))
-                .and_then(Value::as_str)
-                .and_then(|id| Uuid::parse_str(id).ok())
-                .is_some_and(|id| instant_ids.contains(&id))
-    };
+    let instant_ids = instant_item_ids(&mut tx, tenant, &lines).await?;
+    let is_instant = |line: &Value| line_is_instant(line, &instant_ids);
     // Pin every item to its own status so the others stop following the order.
     let mut statuses: Vec<String> = lines
         .iter()
@@ -2897,42 +2915,41 @@ async fn scan_order(
         &access,
     )
     .await?;
-    if desired == "completed" {
-        let mut item_ids = Vec::new();
-        if let Some(arr) = current.5.as_array() {
-            for line in arr {
-                if let Some(id_str) = line
-                    .get("itemId")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| line.get("item_id").and_then(|v| v.as_str()))
-                {
-                    if let Ok(id) = Uuid::parse_str(id_str) {
-                        item_ids.push(id);
-                    }
-                }
-            }
-        }
-
-        let non_instant_count: i64 = if item_ids.is_empty() {
-            0
-        } else {
-            sqlx::query_scalar(
-                "SELECT count(*) FROM campus_ops.canteen_menu_items WHERE tenant_id=$1 AND id = ANY($2) AND NOT is_instant",
-            )
-            .bind(tenant)
-            .bind(&item_ids)
-            .fetch_one(&mut *tx)
-            .await?
-        };
-
-        if non_instant_count > 0 {
-            return Err(ApiError::BadRequest(
-                "This order contains food that requires kitchen preparation. Please use the kitchen preparation flow.".into(),
-            ));
-        }
+    if matches!(current.1.as_str(), "completed" | "rejected" | "cancelled") {
+        return Err(ApiError::Conflict(format!(
+            "This order is already {}",
+            if current.1 == "completed" { "delivered" } else { current.1.as_str() }
+        )));
     }
-    let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.canteen_orders SET status=$3,handled_by=$4,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'orderNumber',order_number,'tokenNumber',token_number,'status',status,'customerUserId',customer_user_id,'lines',lines,'total',total::float8,'isInstant',true,'updatedAt',updated_at)")
- .bind(tenant).bind(current.0).bind(&desired).bind(&principal.student.id).fetch_one(&mut *tx).await?;
+    // A delivery scan advances the order: instant food is handed over at once,
+    // prepared food moves one step per scan until it is delivered.
+    let (next_status, next_lines, moved) = if desired == "completed" {
+        let mut lines = current.5.as_array().cloned().unwrap_or_default();
+        let instant_ids = instant_item_ids(&mut tx, tenant, &lines).await?;
+        let mut statuses = Vec::with_capacity(lines.len());
+        let mut moved = Vec::new();
+        for line in lines.iter_mut() {
+            let instant = line_is_instant(line, &instant_ids);
+            let before = effective_line_status(line, &current.1, instant);
+            let after = scan_step(&before, instant);
+            if after != before {
+                moved.push(after.clone());
+            }
+            if let Some(object) = line.as_object_mut() {
+                object.insert("status".into(), Value::String(after.clone()));
+            }
+            statuses.push(after);
+        }
+        (
+            derive_order_status(&statuses, &current.1),
+            Some(Value::Array(lines)),
+            moved,
+        )
+    } else {
+        (desired.clone(), None, Vec::new())
+    };
+    let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.canteen_orders SET status=$3,handled_by=$4,lines=COALESCE($5,lines),token_number=CASE WHEN $3<>'pending' AND token_number IS NULL THEN (order_number % 1000)::int ELSE token_number END,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'orderNumber',order_number,'tokenNumber',token_number,'status',status,'customerUserId',customer_user_id,'lines',lines,'total',total::float8,'isInstant',true,'updatedAt',updated_at)")
+ .bind(tenant).bind(current.0).bind(&next_status).bind(&principal.student.id).bind(next_lines).fetch_one(&mut *tx).await?;
     if desired == "rejected" && current.1 != "rejected" {
         sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version) VALUES($1,$2,$3,$4,1) ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now()")
             .bind(tenant).bind(&current.2).bind(&current.4).bind(current.3).execute(&mut *tx).await?;
@@ -2951,25 +2968,30 @@ async fn scan_order(
         )
         .await?;
     } else if desired == "completed" {
-        notify_tx(
-            &mut tx,
-            tenant,
-            Some(&current.2),
-            None,
-            "canteen",
-            "Your order is delivered",
-            "Your order has been handed over at the counter.",
-            &value,
-        )
-        .await?;
+        let (title, body) = if next_status == "completed" {
+            ("Your order is delivered", "Your order has been handed over at the counter.")
+        } else if moved.iter().any(|status| status == "ready") {
+            ("Your order is ready", "Collect it at the counter.")
+        } else if moved.iter().any(|status| status == "completed") {
+            ("Part of your order is delivered", "The rest is still being prepared.")
+        } else {
+            ("Your order is being prepared", "We'll let you know when it is ready.")
+        };
+        notify_tx(&mut tx, tenant, Some(&current.2), None, "canteen", title, body, &value)
+            .await?;
     }
+    let event = if next_status == "completed" {
+        "order.delivered".to_string()
+    } else {
+        format!("order.{next_status}")
+    };
     emit_tx(
         &mut tx,
         tenant,
         "canteen",
         "order",
         value["id"].as_str().unwrap_or_default(),
-        "order.delivered",
+        &event,
         &principal.student.id,
         &value,
     )
@@ -2981,7 +3003,7 @@ async fn scan_order(
         "canteen",
         "order",
         value["id"].as_str().unwrap_or_default(),
-        "order.delivered",
+        &event,
     );
     Ok(Json(ApiResponse::new(value)))
 }
@@ -8571,6 +8593,18 @@ mod tests {
         assert!(line_transition_allowed("ready", "completed", false));
         assert!(!line_transition_allowed("pending", "completed", false));
         assert!(!line_transition_allowed("pending", "ready", false));
+    }
+
+    #[test]
+    fn each_scan_moves_prepared_food_one_step_and_delivers_instant_food() {
+        assert_eq!(scan_step("pending", true), "completed");
+        assert_eq!(scan_step("pending", false), "preparing");
+        assert_eq!(scan_step("preparing", false), "ready");
+        assert_eq!(scan_step("ready", false), "completed");
+        assert_eq!(scan_step("completed", false), "completed");
+        // Scan 1 of a mixed order: instant out, prepared starts cooking.
+        let after_first = vec!["completed".to_string(), "preparing".to_string()];
+        assert_eq!(derive_order_status(&after_first, "pending"), "preparing");
     }
 
     #[test]

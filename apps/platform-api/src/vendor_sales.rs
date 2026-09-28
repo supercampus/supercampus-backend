@@ -31,6 +31,11 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/canteen/sales-dashboard", get(sales_dashboard))
         .route("/canteen/sales-dashboard/orders", get(sales_orders))
+        // One shop over an explicit date range, with per-captain performance.
+        .route(
+            "/canteen/shop-analytics",
+            get(crate::shop_analytics::shop_analytics),
+        )
 }
 
 /// Grants that may read shop sales.

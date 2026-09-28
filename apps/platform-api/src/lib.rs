@@ -13,6 +13,7 @@ pub mod operations;
 pub mod passes;
 pub mod platform_admin;
 pub mod razorpay;
+pub mod shop_analytics;
 pub mod support;
 pub mod vendor_sales;
 pub mod visitors;

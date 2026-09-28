@@ -1766,7 +1766,7 @@ async fn sync_shop_operators(
     Ok(())
 }
 
-async fn require_assigned_shop(
+pub(crate) async fn require_assigned_shop(
     pool: &sqlx::PgPool,
     tenant: Uuid,
     user_id: &str,
@@ -2550,7 +2550,218 @@ async fn pay_laundry_charge(
 struct OrderStatusRequest {
     status: String,
     reason: Option<String>,
+    /// Moves one food item of the order instead of the whole order. The
+    /// order's own status is then derived from its items.
+    line_index: Option<usize>,
 }
+
+/// Service rank of a status on the counter's one-way flow.
+fn line_status_rank(status: &str) -> u8 {
+    match status {
+        "pending" | "accepted" => 0,
+        "preparing" => 1,
+        "ready" => 2,
+        "completed" => 3,
+        _ => 0,
+    }
+}
+
+/// The status a food item is at, falling back to its order's status for
+/// items that have never been moved on their own.
+fn effective_line_status(line: &Value, order_status: &str, is_instant: bool) -> String {
+    if let Some(status) = line.get("status").and_then(Value::as_str) {
+        return status.to_string();
+    }
+    match order_status {
+        "preparing" | "ready" if is_instant => "pending".into(),
+        "preparing" | "ready" | "completed" => order_status.into(),
+        _ => "pending".into(),
+    }
+}
+
+/// Whether an item may move from `from` to `to`. Instant food is handed over
+/// straight from pending; prepared food goes pending → preparing → ready →
+/// delivered, one step at a time.
+fn line_transition_allowed(from: &str, to: &str, is_instant: bool) -> bool {
+    if is_instant {
+        return line_status_rank(from) < 3 && to == "completed";
+    }
+    matches!(
+        (line_status_rank(from), to),
+        (0, "preparing") | (1, "ready") | (2, "completed")
+    )
+}
+
+/// The order-level status that summarises its items' statuses.
+fn derive_order_status(line_statuses: &[String], current: &str) -> String {
+    let remaining: Vec<&String> = line_statuses
+        .iter()
+        .filter(|status| status.as_str() != "completed")
+        .collect();
+    if remaining.is_empty() {
+        return "completed".into();
+    }
+    if remaining.iter().any(|status| status.as_str() == "preparing") {
+        return "preparing".into();
+    }
+    if remaining.iter().all(|status| status.as_str() == "ready") {
+        return "ready".into();
+    }
+    if line_statuses.iter().any(|status| line_status_rank(status) > 0) {
+        return "accepted".into();
+    }
+    current.into()
+}
+
+async fn update_order_line_status(
+    state: AppState,
+    principal: AuthPrincipal,
+    access: EffectiveAccess,
+    order_id: Uuid,
+    line_index: usize,
+    desired: String,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    if !matches!(desired.as_str(), "preparing" | "ready" | "completed") {
+        return Err(ApiError::BadRequest("Invalid item status".into()));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let (current_status, customer, store, lines) =
+        sqlx::query_as::<_, (String, String, String, Value)>(
+            "SELECT status,customer_user_id,store,lines FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+        )
+        .bind(tenant)
+        .bind(order_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Order not found".into()))?;
+    require_assigned_shop(
+        db.pool(),
+        tenant,
+        &principal.student.id,
+        &principal.student.email,
+        &store,
+        &access,
+    )
+    .await?;
+    if matches!(current_status.as_str(), "completed" | "rejected" | "cancelled") {
+        return Err(ApiError::BadRequest("This order is already settled".into()));
+    }
+    let mut lines = lines.as_array().cloned().unwrap_or_default();
+    if line_index >= lines.len() {
+        return Err(ApiError::BadRequest("That item is not part of this order".into()));
+    }
+    let item_ids: Vec<Uuid> = lines
+        .iter()
+        .filter_map(|line| {
+            line.get("itemId")
+                .or_else(|| line.get("item_id"))
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+        })
+        .collect();
+    let instant_ids: Vec<Uuid> = if item_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(
+            "SELECT id FROM campus_ops.canteen_menu_items WHERE tenant_id=$1 AND id = ANY($2) AND is_instant",
+        )
+        .bind(tenant)
+        .bind(&item_ids)
+        .fetch_all(&mut *tx)
+        .await?
+    };
+    let is_instant = |line: &Value| {
+        line.get("isInstant").and_then(Value::as_bool).unwrap_or(false)
+            || line
+                .get("itemId")
+                .or_else(|| line.get("item_id"))
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some_and(|id| instant_ids.contains(&id))
+    };
+    // Pin every item to its own status so the others stop following the order.
+    let mut statuses: Vec<String> = lines
+        .iter()
+        .map(|line| effective_line_status(line, &current_status, is_instant(line)))
+        .collect();
+    let target_instant = is_instant(&lines[line_index]);
+    if !line_transition_allowed(&statuses[line_index], &desired, target_instant) {
+        return Err(ApiError::BadRequest(if target_instant {
+            "Instant items go straight from pending to delivered".into()
+        } else {
+            "Prepared items move pending → preparing → ready → delivered".into()
+        }));
+    }
+    statuses[line_index] = desired.clone();
+    for (line, status) in lines.iter_mut().zip(&statuses) {
+        if let Some(object) = line.as_object_mut() {
+            object.insert("status".into(), Value::String(status.clone()));
+        }
+    }
+    let item_name = lines[line_index]
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("Your item")
+        .to_string();
+    let order_status = derive_order_status(&statuses, &current_status);
+    let order = sqlx::query_scalar::<_, Value>(
+        r#"UPDATE campus_ops.canteen_orders SET status=$3,lines=$4,handled_by=$5,
+   token_number=CASE WHEN $3<>'pending' AND token_number IS NULL THEN (order_number % 1000)::int ELSE token_number END,updated_at=now()
+   WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'customerUserId',customer_user_id,'status',status,
+   'lines',lines,'tokenNumber',token_number,'updatedAt',updated_at)"#,
+    )
+    .bind(tenant)
+    .bind(order_id)
+    .bind(&order_status)
+    .bind(Value::Array(lines))
+    .bind(&principal.student.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let (title, body) = match (order_status.as_str(), desired.as_str()) {
+        ("completed", _) => (
+            "Your order is delivered".to_string(),
+            "Every item has been handed over at the counter.".to_string(),
+        ),
+        (_, "preparing") => (
+            "Item being prepared".to_string(),
+            format!("{item_name} is being prepared"),
+        ),
+        (_, "ready") => (
+            "Item ready".to_string(),
+            format!("{item_name} is ready to collect"),
+        ),
+        _ => (
+            "Item delivered".to_string(),
+            format!("{item_name} has been handed over"),
+        ),
+    };
+    notify_tx(&mut tx, tenant, Some(&customer), None, "canteen", &title, &body, &order).await?;
+    let event = format!("order.item.{desired}");
+    emit_tx(
+        &mut tx,
+        tenant,
+        "canteen",
+        "order",
+        &order_id.to_string(),
+        &event,
+        &principal.student.id,
+        &order,
+    )
+    .await?;
+    tx.commit().await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "canteen",
+        "order",
+        &order_id.to_string(),
+        &event,
+    );
+    Ok(Json(ApiResponse::new(order)))
+}
+
 async fn update_order_status(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -2559,6 +2770,10 @@ async fn update_order_status(
     Json(input): Json<OrderStatusRequest>,
 ) -> ApiResult<Json<ApiResponse<Value>>> {
     require(&access, "canteen.orders.manage")?;
+    if let Some(line_index) = input.line_index {
+        return update_order_line_status(state, principal, access, order_id, line_index, input.status)
+            .await;
+    }
     if !matches!(
         input.status.as_str(),
         "accepted" | "preparing" | "ready" | "completed" | "rejected"
@@ -8341,6 +8556,42 @@ fn require_any_role(principal: &AuthPrincipal) -> ApiResult<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn instant_items_go_straight_to_delivered() {
+        assert!(line_transition_allowed("pending", "completed", true));
+        assert!(!line_transition_allowed("pending", "preparing", true));
+        assert!(!line_transition_allowed("completed", "completed", true));
+    }
+
+    #[test]
+    fn prepared_items_move_one_step_at_a_time() {
+        assert!(line_transition_allowed("pending", "preparing", false));
+        assert!(line_transition_allowed("preparing", "ready", false));
+        assert!(line_transition_allowed("ready", "completed", false));
+        assert!(!line_transition_allowed("pending", "completed", false));
+        assert!(!line_transition_allowed("pending", "ready", false));
+    }
+
+    #[test]
+    fn unmoved_items_follow_their_order() {
+        let line = json!({"itemId": "x"});
+        assert_eq!(effective_line_status(&line, "preparing", false), "preparing");
+        assert_eq!(effective_line_status(&line, "preparing", true), "pending");
+        assert_eq!(effective_line_status(&line, "accepted", false), "pending");
+        let moved = json!({"itemId": "x", "status": "ready"});
+        assert_eq!(effective_line_status(&moved, "pending", false), "ready");
+    }
+
+    #[test]
+    fn order_status_summarises_its_items() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(derive_order_status(&s(&["completed", "completed"]), "ready"), "completed");
+        assert_eq!(derive_order_status(&s(&["completed", "preparing"]), "pending"), "preparing");
+        assert_eq!(derive_order_status(&s(&["ready", "completed"]), "preparing"), "ready");
+        assert_eq!(derive_order_status(&s(&["completed", "pending"]), "pending"), "accepted");
+        assert_eq!(derive_order_status(&s(&["pending", "pending"]), "pending"), "pending");
+    }
 
     fn hostel_access(permission: &str, scope: &str) -> EffectiveAccess {
         EffectiveAccess {

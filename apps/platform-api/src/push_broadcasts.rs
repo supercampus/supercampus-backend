@@ -4,10 +4,11 @@
 //! Every recipient gets a personal row in `campus_ops.notifications`, so a
 //! broadcast always lands in the app's notification list. Phones are reached
 //! by the notification worker, which turns queued rows into FCM HTTP v1 pushes
-//! when `FCM_ENABLED=true` and `GOOGLE_APPLICATION_CREDENTIALS` points at a
-//! Firebase service account. Without those the broadcast is recorded as
-//! `not_configured` and the administrator is told so; nothing pretends a push
-//! left the building.
+//! with its own Firebase service account. The API never sends a push and so
+//! never needs that key: it queues a push for every recipient with a device
+//! and the worker's delivery rows record what was actually sent. Only an
+//! explicit `FCM_ENABLED=false` on the API records a broadcast as
+//! `not_configured`.
 //!
 //! Recipients are resolved from the control plane's memberships (the same
 //! `membership.roles` effective access is computed from) and mapped to the id
@@ -114,56 +115,35 @@ struct PushReadiness {
     message: String,
 }
 
-/// Whether the notification worker can deliver to phones. The worker reads the
-/// same deployment environment as the API.
-fn push_readiness(
-    fcm_enabled: Option<&str>,
-    credentials_path: Option<&str>,
-    credentials_exist: bool,
-) -> PushReadiness {
-    let enabled = fcm_enabled
-        .map(str::trim)
-        .is_some_and(|value| matches!(value, "1" | "true" | "TRUE" | "True"));
-    if !enabled {
+/// Whether pushes should be queued for the notification worker.
+///
+/// The worker, not the API, holds the Firebase key and does the sending, so
+/// the API's own copy of the key (or its absence) says nothing about delivery;
+/// requiring it here is what left pushes unqueued in production while the
+/// worker was ready. Only an explicit off switch stops queueing.
+fn push_readiness(fcm_enabled: Option<&str>) -> PushReadiness {
+    let disabled = fcm_enabled.map(str::trim).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    });
+    if disabled {
         return PushReadiness {
             configured: false,
-            message: "Push delivery is not configured on this server (FCM_ENABLED is off). \
-                      Messages reach every recipient's in-app notification list only."
-                .into(),
-        };
-    }
-    let path = credentials_path.map(str::trim).unwrap_or_default();
-    if path.is_empty() {
-        return PushReadiness {
-            configured: false,
-            message: "FCM is enabled but GOOGLE_APPLICATION_CREDENTIALS is not set. \
-                      Messages reach the in-app notification list only."
-                .into(),
-        };
-    }
-    if !credentials_exist {
-        return PushReadiness {
-            configured: false,
-            message: "FCM is enabled but the Firebase service-account file is missing. \
-                      Messages reach the in-app notification list only."
+            message: "Push delivery is switched off on this server (FCM_ENABLED=false).                       Messages reach every recipient's in-app notification list only."
                 .into(),
         };
     }
     PushReadiness {
         configured: true,
-        message: "Push delivery through Firebase Cloud Messaging is on.".into(),
+        message: "Pushes are queued for the notification worker, which delivers them                   through Firebase Cloud Messaging."
+            .into(),
     }
 }
 
 fn environment_push_readiness() -> PushReadiness {
-    let enabled = std::env::var("FCM_ENABLED").ok();
-    let path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
-    let exists = path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .is_some_and(|path| std::path::Path::new(path).is_file());
-    push_readiness(enabled.as_deref(), path.as_deref(), exists)
+    push_readiness(std::env::var("FCM_ENABLED").ok().as_deref())
 }
 
 /// Year of study as a plain number ("1".."6"), from the shapes campus data
@@ -1074,13 +1054,15 @@ mod tests {
     const C: &str = "00000000-0000-0000-0000-00000000000c";
 
     #[test]
-    fn push_is_ready_only_with_fcm_on_and_a_credential_file() {
-        assert!(!push_readiness(None, None, false).configured);
-        assert!(!push_readiness(Some("false"), Some("/key.json"), true).configured);
-        assert!(!push_readiness(Some("true"), None, false).configured);
-        assert!(!push_readiness(Some("true"), Some("/missing.json"), false).configured);
-        assert!(push_readiness(Some("true"), Some("/key.json"), true).configured);
-        assert!(push_readiness(Some("1"), Some("/key.json"), true).configured);
+    fn pushes_are_queued_unless_explicitly_switched_off() {
+        // The worker holds the Firebase key; the API queues without it.
+        assert!(push_readiness(None).configured);
+        assert!(push_readiness(Some("true")).configured);
+        assert!(push_readiness(Some("1")).configured);
+        assert!(!push_readiness(Some("false")).configured);
+        assert!(!push_readiness(Some(" FALSE ")).configured);
+        assert!(!push_readiness(Some("0")).configured);
+        assert!(!push_readiness(Some("off")).configured);
     }
 
     #[test]

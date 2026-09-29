@@ -166,6 +166,34 @@ async fn process_all_tenants(
     Ok(())
 }
 
+/// Applies the WhatsApp delivery schema (runtime migration 0096) once per
+/// tenant per process. Production skips startup migrations, and the sqlx
+/// migrator never reaches files past its duplicate 0076, so without this the
+/// WhatsApp step failed every sweep with a missing table. The SQL is
+/// idempotent (`IF NOT EXISTS` throughout).
+async fn ensure_whatsapp_schema(database: &Database, tenant_slug: &str) -> anyhow::Result<()> {
+    static APPLIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let applied = APPLIED.get_or_init(Default::default);
+    if applied
+        .lock()
+        .map(|set| set.contains(tenant_slug))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/runtime/0096_gallabox_whatsapp_notifications.sql"
+    ))
+    .execute(database.pool())
+    .await
+    .context("failed to apply the WhatsApp delivery schema")?;
+    if let Ok(mut set) = applied.lock() {
+        set.insert(tenant_slug.to_owned());
+    }
+    Ok(())
+}
+
 async fn process_tenant(
     database: &Database,
     tenant_slug: &str,
@@ -203,6 +231,7 @@ async fn process_tenant(
         }
     }
     if transports.whatsapp.transport() != "log" {
+        ensure_whatsapp_schema(database, tenant_slug).await?;
         enqueue_whatsapp_deliveries(database, tenant_id).await?;
         let jobs = claim_whatsapp_batch(database, tenant_id).await?;
         for job in jobs {

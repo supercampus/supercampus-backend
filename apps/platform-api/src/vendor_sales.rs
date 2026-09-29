@@ -341,14 +341,26 @@ fn store_sales(shops: &[ShopInfo], rows: &[SalesRow]) -> Vec<StoreSales> {
             all: SalesSummary::from_rows(own.iter().copied(), |r| r.all),
         });
     }
+    // Busiest first; equal figures keep the administrator's shop order.
     stores.sort_by(|a, b| {
         b.period
             .revenue
             .total_cmp(&a.period.revenue)
             .then(b.period.orders().cmp(&a.period.orders()))
+            .then(
+                register_position(shops, &a.shop.shop_key)
+                    .unwrap_or(usize::MAX)
+                    .cmp(&register_position(shops, &b.shop.shop_key).unwrap_or(usize::MAX)),
+            )
             .then(a.shop.name.cmp(&b.shop.name))
     });
     stores
+}
+
+/// Where a shop sits in the register, which `shop_register` returns in the
+/// administrator's display order.
+fn register_position(shops: &[ShopInfo], shop_key: &str) -> Option<usize> {
+    shops.iter().position(|shop| shop.shop_key == shop_key)
 }
 
 #[derive(Deserialize)]
@@ -429,6 +441,10 @@ fn dashboard_json(
                 "isActive": store.shop.is_active,
                 "isOpen": store.shop.is_open,
                 "operators": store.shop.operators,
+                // The administrator's shop sequence; `null` for a key the
+                // register no longer holds. Lists that are not rankings sort
+                // by it.
+                "position": register_position(shops, &store.shop.shop_key),
                 "orders": store.period.orders(),
                 "completedOrders": store.period.completed,
                 "cancelledOrders": store.period.cancelled,
@@ -567,7 +583,8 @@ async fn shop_register(pool: &sqlx::PgPool, tenant: Uuid) -> ApiResult<Vec<ShopI
                FROM campus_ops.shop_user_assignments a
                LEFT JOIN identity.users u ON u.id::text=a.user_id
                WHERE a.tenant_id=s.tenant_id AND a.shop_id=s.id AND a.is_active), '[]'::jsonb)
-           FROM campus_ops.shops s WHERE s.tenant_id=$1 ORDER BY s.name"#,
+           FROM campus_ops.shops s WHERE s.tenant_id=$1
+           ORDER BY s.sort_order NULLS LAST, s.name, s.shop_key"#,
     )
     .bind(tenant)
     .fetch_all(pool)

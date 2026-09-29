@@ -43,6 +43,11 @@ pub fn router() -> Router<AppState> {
         .route("/canteen/store", get(canteen_store))
         .merge(crate::vendor_sales::router())
         .route("/canteen/shops", get(list_shops).post(create_shop))
+        .route("/canteen/shops/order", put(reorder_shops))
+        .route(
+            "/canteen/shops/assignments/{user_id}",
+            get(user_shop_assignments).put(set_user_shop_assignments),
+        )
         .route(
             "/canteen/shops/{shop_id}",
             put(update_shop).delete(delete_shop),
@@ -1293,6 +1298,28 @@ async fn unregister_push_device(
     )))
 }
 
+/// Whether a `campus_ops.shop_user_assignments assignment` row names the
+/// signed-in person. The row may carry the control-plane account id (what
+/// the admin tools store), the tenant replica's id for the same email (older
+/// seeds), or the email itself; all three mean the same person. `$id` and
+/// `$email` are the SQL placeholders for the principal's id and email.
+macro_rules! assignment_names_user_sql {
+    ($id:literal, $email:literal) => {
+        concat!(
+            "(assignment.user_id=", $id,
+            " OR lower(assignment.user_id)=lower(", $email, ")",
+            " OR EXISTS (SELECT 1 FROM identity.users assigned_user",
+            " WHERE assigned_user.id::text=assignment.user_id",
+            " AND lower(assigned_user.email)=lower(", $email, ")))"
+        )
+    };
+}
+
+/// Shown to shop staff whose role is set but who have no counter yet: an
+/// empty queue would look like a quiet day rather than missing setup.
+pub(crate) const NOT_ASSIGNED_TO_SHOP_MESSAGE: &str =
+    "You're not assigned to a counter yet. Ask the admin to add you to a shop.";
+
 /// The shop a `campus_ops.canteen_orders` row belongs to, by the same rule the
 /// menu payload uses to resolve an item's store: an exact `shop_key` match,
 /// otherwise the oldest active shop of the store's category. Orders placed
@@ -1486,6 +1513,20 @@ async fn canteen_store(
         object.insert("laundryPricePerKg".into(), json!(laundry_price_per_kg));
         object.insert("laundryCharges".into(), laundry_charges);
         object.insert("assignedShopKeys".into(), json!(assigned_shop_keys));
+        // Shop staff whose role is set but who work no counter yet: the app
+        // says so instead of showing an empty queue that looks like a quiet day.
+        let assignment_pending = shop_assignment_pending(
+            is_vendor_operator,
+            configures_shops,
+            assigned_shop_keys.len(),
+        );
+        object.insert("shopAssignmentPending".into(), json!(assignment_pending));
+        if assignment_pending {
+            object.insert(
+                "shopAssignmentMessage".into(),
+                json!(NOT_ASSIGNED_TO_SHOP_MESSAGE),
+            );
+        }
         let (pin_hash, pin_hint) =
             wallet_pin_state(db.pool(), tenant, &principal.student.id).await?;
         object.insert("hasPin".into(), json!(pin_hash.is_some()));
@@ -1508,6 +1549,17 @@ async fn canteen_store(
         );
     }
     Ok(Json(ApiResponse::new(data)))
+}
+
+/// Whether a person holds shop-staff grants but works no counter: grants to
+/// run orders or a menu, without the shop-configuration grant that already
+/// covers every shop, and no active assignment.
+fn shop_assignment_pending(
+    is_vendor_operator: bool,
+    configures_shops: bool,
+    assigned_shops: usize,
+) -> bool {
+    is_vendor_operator && !configures_shops && assigned_shops == 0
 }
 
 // The shop sales dashboard lives in `crate::vendor_sales`.
@@ -1570,15 +1622,24 @@ async fn create_shop(
     validate_shop(&input)?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let operators = resolve_shop_operators(
+        &state,
+        db.pool(),
+        &principal.student.tenant_id,
+        input.operators.as_deref(),
+    )
+    .await?;
     let mut tx = db.pool().begin().await?;
     let shop_id = Uuid::new_v4();
     let shop = sqlx::query_scalar::<_, Value>(r#"
       INSERT INTO campus_ops.shops
-        (id,tenant_id,shop_key,name,category,description,is_active,meal_compliance,qr_payments,created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        (id,tenant_id,shop_key,name,category,description,is_active,meal_compliance,qr_payments,created_by,sort_order)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        -- A new shop joins the end of the administrator's sequence.
+        (SELECT max(sort_order)+1 FROM campus_ops.shops WHERE tenant_id=$2))
       RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'name',name,'category',category,
         'description',description,'isActive',is_active,'mealCompliance',meal_compliance,
-        'qrPayments',qr_payments,'createdAt',created_at,'updatedAt',updated_at)"#)
+        'qrPayments',qr_payments,'sortOrder',sort_order,'createdAt',created_at,'updatedAt',updated_at)"#)
       .bind(shop_id).bind(tenant).bind(input.shop_key.trim()).bind(input.name.trim())
       .bind(input.category.trim()).bind(input.description.trim()).bind(input.is_active)
       .bind(input.meal_compliance).bind(input.qr_payments).bind(&principal.student.id)
@@ -1587,7 +1648,7 @@ async fn create_shop(
         &mut tx,
         tenant,
         shop_id,
-        input.operators.as_deref(),
+        operators.as_deref(),
         &principal.student.id,
     )
     .await?;
@@ -1619,6 +1680,13 @@ async fn update_shop(
     validate_shop(&input)?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let operators = resolve_shop_operators(
+        &state,
+        db.pool(),
+        &principal.student.tenant_id,
+        input.operators.as_deref(),
+    )
+    .await?;
     let mut tx = db.pool().begin().await?;
     let shop = sqlx::query_scalar::<_, Value>(
         r#"
@@ -1627,7 +1695,7 @@ async fn update_shop(
       WHERE tenant_id=$1 AND id=$2
       RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'name',name,'category',category,
         'description',description,'isActive',is_active,'mealCompliance',meal_compliance,
-        'qrPayments',qr_payments,'createdAt',created_at,'updatedAt',updated_at)"#,
+        'qrPayments',qr_payments,'sortOrder',sort_order,'createdAt',created_at,'updatedAt',updated_at)"#,
     )
     .bind(tenant)
     .bind(shop_id)
@@ -1645,7 +1713,7 @@ async fn update_shop(
         &mut tx,
         tenant,
         shop_id,
-        input.operators.as_deref(),
+        operators.as_deref(),
         &principal.student.id,
     )
     .await?;
@@ -1741,10 +1809,16 @@ async fn shops_json(
       SELECT COALESCE(jsonb_agg(jsonb_build_object('id',shop.id,'shopKey',shop.shop_key,'name',shop.name,
         'category',shop.category,'description',shop.description,'isActive',shop.is_active,'shopOpen',shop.shop_open,
         'mealCompliance',shop.meal_compliance,'qrPayments',shop.qr_payments,'createdAt',shop.created_at,
-        'updatedAt',shop.updated_at,'operators',COALESCE((SELECT jsonb_agg(jsonb_build_object(
-          'userId',assignment.user_id,'assignmentRole',assignment.assignment_role) ORDER BY assignment.assignment_role,assignment.user_id)
-          FROM campus_ops.shop_user_assignments assignment WHERE assignment.tenant_id=shop.tenant_id
-            AND assignment.shop_id=shop.id AND assignment.is_active),'[]'::jsonb)) ORDER BY shop.name), '[]'::jsonb)
+        'updatedAt',shop.updated_at,'sortOrder',shop.sort_order,'operators',COALESCE((SELECT jsonb_agg(jsonb_build_object(
+          'userId',assignment.user_id,'assignmentRole',assignment.assignment_role,
+          -- Staff names only in the administrator's register ($2), never in
+          -- the storefront payload every customer receives.
+          'name',CASE WHEN $2 THEN operator_user.display_name END) ORDER BY assignment.assignment_role,assignment.user_id)
+          FROM campus_ops.shop_user_assignments assignment
+          LEFT JOIN identity.users operator_user ON operator_user.id::text=assignment.user_id
+          WHERE assignment.tenant_id=shop.tenant_id
+            AND assignment.shop_id=shop.id AND assignment.is_active),'[]'::jsonb))
+          ORDER BY shop.sort_order NULLS LAST, shop.name, shop.shop_key), '[]'::jsonb)
       FROM campus_ops.shops shop WHERE shop.tenant_id=$1 AND ($2 OR shop.is_active)
         AND (NOT $3 OR shop.shop_key = ANY($4))"#,
     )
@@ -1762,16 +1836,15 @@ async fn assigned_shop_keys(
     user_id: &str,
     user_email: &str,
 ) -> ApiResult<Vec<String>> {
-    Ok(sqlx::query_scalar::<_, String>(
+    Ok(sqlx::query_scalar::<_, String>(concat!(
         r#"SELECT shop.shop_key FROM campus_ops.shop_user_assignments assignment
            JOIN campus_ops.shops shop ON shop.tenant_id=assignment.tenant_id AND shop.id=assignment.shop_id
-           WHERE assignment.tenant_id=$1
-             AND (assignment.user_id=$2 OR EXISTS (
-               SELECT 1 FROM identity.users assigned_user
-               WHERE assigned_user.id::text=assignment.user_id
-                 AND lower(assigned_user.email)=lower($3)))
-             AND assignment.is_active AND shop.is_active ORDER BY shop.name"#,
-    )
+           WHERE assignment.tenant_id=$1 AND "#,
+        assignment_names_user_sql!("$2", "$3"),
+        r#" AND assignment.is_active AND shop.is_active
+           GROUP BY shop.shop_key, shop.sort_order, shop.name
+           ORDER BY shop.sort_order NULLS LAST, shop.name, shop.shop_key"#
+    ))
     .bind(tenant)
     .bind(user_id)
     .bind(user_email)
@@ -1779,11 +1852,130 @@ async fn assigned_shop_keys(
     .await?)
 }
 
+/// A shop operator as stored: the control-plane account id (the id the
+/// signed-in principal carries), with the details mirrored into the tenant.
+#[derive(Debug, Clone, PartialEq)]
+struct ShopUser {
+    user_id: Uuid,
+    email: String,
+    name: String,
+    initials: String,
+}
+
+/// Finds the tenant member an administrator picked. The request may name the
+/// control-plane account id, the tenant replica's id or the email; all
+/// resolve to the control-plane account so the assignment matches the id the
+/// person signs in with. `None` when no active member of this tenant matches.
+async fn resolve_shop_user(
+    state: &AppState,
+    tenant_pool: &sqlx::PgPool,
+    tenant_slug: &str,
+    requested: &str,
+) -> ApiResult<Option<ShopUser>> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Ok(None);
+    }
+    let replica_email = sqlx::query_scalar::<_, String>(
+        "SELECT email FROM identity.users WHERE id::text=$1 LIMIT 1",
+    )
+    .bind(requested)
+    .fetch_optional(tenant_pool)
+    .await?;
+    let control = state.database();
+    let pool = control.as_ref().map(|db| db.pool()).unwrap_or(tenant_pool);
+    let row = sqlx::query_as::<_, (Uuid, String, String, String)>(
+        r#"SELECT u.id, u.email, u.display_name, u.initials
+           FROM identity.users u
+           WHERE u.active
+             AND (u.id::text=$1 OR lower(u.email)=lower($1) OR lower(u.email)=lower($2))
+             AND EXISTS (
+               SELECT 1 FROM identity.tenant_memberships membership
+               JOIN platform.tenants tenant ON tenant.id=membership.tenant_id
+               WHERE membership.user_id=u.id AND membership.active AND tenant.slug=$3)
+           ORDER BY (u.id::text=$1) DESC
+           LIMIT 1"#,
+    )
+    .bind(requested)
+    .bind(replica_email)
+    .bind(tenant_slug)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(user_id, email, name, initials)| ShopUser {
+        user_id,
+        email,
+        name,
+        initials,
+    }))
+}
+
+/// Keeps the tenant's identity replica aware of an operator created after
+/// the tenant was seeded, so names and ids resolve on tenant-side joins (the
+/// staff line, sales attribution). The replica is never used to sign in; its
+/// password is random and unknowable. An existing row for the id or email is
+/// left alone.
+async fn mirror_shop_user(tx: &mut Transaction<'_, Postgres>, user: &ShopUser) -> ApiResult<()> {
+    sqlx::query(
+        r#"INSERT INTO identity.users (id,email,password_hash,display_name,initials,account_type)
+           SELECT $1,$2,crypt(gen_random_uuid()::text, gen_salt('bf', 4)),$3,$4,'staff'
+           WHERE NOT EXISTS (
+             SELECT 1 FROM identity.users WHERE id=$1 OR lower(email)=lower($2))"#,
+    )
+    .bind(user.user_id)
+    .bind(&user.email)
+    .bind(&user.name)
+    .bind(&user.initials)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Resolves every requested operator before a shop write. Unknown people are
+/// refused rather than stored as an id nobody signs in with.
+async fn resolve_shop_operators(
+    state: &AppState,
+    tenant_pool: &sqlx::PgPool,
+    tenant_slug: &str,
+    operators: Option<&[ShopOperatorRequest]>,
+) -> ApiResult<Option<Vec<(ShopUser, String)>>> {
+    let Some(operators) = operators else {
+        return Ok(None);
+    };
+    let mut resolved: Vec<(ShopUser, String)> = Vec::with_capacity(operators.len());
+    for operator in operators {
+        let user = resolve_shop_user(state, tenant_pool, tenant_slug, &operator.user_id)
+            .await?
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "One of the chosen staff is not an active member of this campus".into(),
+                )
+            })?;
+        merge_shop_operator(&mut resolved, user, &operator.assignment_role);
+    }
+    Ok(Some(resolved))
+}
+
+/// Adds one operator to a shop's list. Someone listed twice keeps a single
+/// row, and owner wins because it carries the captain's rights too.
+fn merge_shop_operator(resolved: &mut Vec<(ShopUser, String)>, user: ShopUser, role: &str) {
+    match resolved
+        .iter_mut()
+        .find(|(known, _)| known.user_id == user.user_id)
+    {
+        Some((_, existing)) => {
+            if role == "owner" {
+                *existing = "owner".into();
+            }
+        }
+        None => resolved.push((user, role.to_owned())),
+    }
+}
+
 async fn sync_shop_operators(
     tx: &mut Transaction<'_, Postgres>,
     tenant: Uuid,
     shop_id: Uuid,
-    operators: Option<&[ShopOperatorRequest]>,
+    operators: Option<&[(ShopUser, String)]>,
     actor_user_id: &str,
 ) -> ApiResult<()> {
     let Some(operators) = operators else {
@@ -1791,14 +1983,15 @@ async fn sync_shop_operators(
     };
     sqlx::query("UPDATE campus_ops.shop_user_assignments SET is_active=false,updated_at=now() WHERE tenant_id=$1 AND shop_id=$2")
         .bind(tenant).bind(shop_id).execute(&mut **tx).await?;
-    for operator in operators {
+    for (user, role) in operators {
+        mirror_shop_user(tx, user).await?;
         sqlx::query(r#"INSERT INTO campus_ops.shop_user_assignments
           (tenant_id,shop_id,user_id,assignment_role,is_active,assigned_by)
           VALUES($1,$2,$3,$4,true,$5)
           ON CONFLICT(tenant_id,shop_id,user_id) DO UPDATE SET assignment_role=EXCLUDED.assignment_role,
             is_active=true,assigned_by=EXCLUDED.assigned_by,updated_at=now()"#)
-            .bind(tenant).bind(shop_id).bind(operator.user_id.trim())
-            .bind(&operator.assignment_role).bind(actor_user_id)
+            .bind(tenant).bind(shop_id).bind(user.user_id.to_string())
+            .bind(role).bind(actor_user_id)
             .execute(&mut **tx).await?;
     }
     Ok(())
@@ -1815,21 +2008,296 @@ pub(crate) async fn require_assigned_shop(
     if access.allows("vendor_management.vendors.update") {
         return Ok(());
     }
-    let assigned = sqlx::query_scalar::<_, bool>(r#"SELECT EXISTS(
-      SELECT 1 FROM campus_ops.shop_user_assignments assignment
-      JOIN campus_ops.shops shop ON shop.tenant_id=assignment.tenant_id AND shop.id=assignment.shop_id
-      WHERE assignment.tenant_id=$1 AND shop.shop_key=$3
-        AND (assignment.user_id=$2 OR EXISTS (
-          SELECT 1 FROM identity.users assigned_user
-          WHERE assigned_user.id::text=assignment.user_id
-            AND lower(assigned_user.email)=lower($4)))
-        AND assignment.is_active AND shop.is_active)"#)
-        .bind(tenant).bind(user_id).bind(shop_key).bind(user_email).fetch_one(pool).await?;
-    if assigned {
+    // A legacy store key (`classic`) belongs to the shop the menu and order
+    // payloads resolve it to, so the counter that sees an order can act on it.
+    let (here, anywhere) = sqlx::query_as::<_, (bool, bool)>(concat!(
+        r#"WITH mine AS (
+             SELECT shop.shop_key FROM campus_ops.shop_user_assignments assignment
+             JOIN campus_ops.shops shop ON shop.tenant_id=assignment.tenant_id AND shop.id=assignment.shop_id
+             WHERE assignment.tenant_id=$1 AND "#,
+        assignment_names_user_sql!("$2", "$4"),
+        r#" AND assignment.is_active AND shop.is_active),
+           target AS (
+             SELECT COALESCE((SELECT shop.shop_key FROM campus_ops.shops shop
+               WHERE shop.tenant_id=$1 AND shop.is_active
+                 AND (shop.shop_key=$3 OR lower(shop.category)=CASE
+                   WHEN lower($3) LIKE '%laundry%' THEN 'laundry'
+                   WHEN lower($3) LIKE '%station%' THEN 'stationery'
+                   ELSE 'canteen' END)
+               ORDER BY CASE WHEN shop.shop_key=$3 THEN 0 ELSE 1 END, shop.created_at, shop.shop_key
+               LIMIT 1), $3) AS shop_key)
+           SELECT EXISTS(SELECT 1 FROM mine WHERE mine.shop_key=$3
+                           OR mine.shop_key=(SELECT shop_key FROM target)),
+                  EXISTS(SELECT 1 FROM mine)"#
+    ))
+    .bind(tenant)
+    .bind(user_id)
+    .bind(shop_key)
+    .bind(user_email)
+    .fetch_one(pool)
+    .await?;
+    assignment_decision(here, anywhere)
+}
+
+/// Why a shop-staff action was refused, in words the counter can act on.
+fn assignment_decision(assigned_here: bool, assigned_anywhere: bool) -> ApiResult<()> {
+    if assigned_here {
         Ok(())
+    } else if !assigned_anywhere {
+        Err(ApiError::ForbiddenWithMessage(
+            NOT_ASSIGNED_TO_SHOP_MESSAGE.into(),
+        ))
     } else {
-        Err(ApiError::Forbidden)
+        Err(ApiError::ForbiddenWithMessage(
+            "This belongs to a shop you're not assigned to. Ask the admin to add you to it."
+                .into(),
+        ))
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ShopOrderRequest {
+    shop_keys: Vec<String>,
+}
+
+/// The full display sequence after an administrator's reorder: the keys they
+/// sent, in that order, then every other shop in its current order. Fails on
+/// an unknown or repeated key so a stale screen cannot silently drop shops.
+fn arrange_shop_keys(requested: &[String], current: &[String]) -> ApiResult<Vec<String>> {
+    let mut sequence: Vec<String> = Vec::with_capacity(current.len());
+    for key in requested {
+        let key = key.trim();
+        if !current.iter().any(|known| known == key) {
+            return Err(ApiError::BadRequest(format!("Unknown shop {key}")));
+        }
+        if sequence.iter().any(|placed| placed == key) {
+            return Err(ApiError::BadRequest(format!("Shop {key} is listed twice")));
+        }
+        sequence.push(key.to_owned());
+    }
+    if sequence.is_empty() {
+        return Err(ApiError::BadRequest(
+            "Send the shops in their new order".into(),
+        ));
+    }
+    for key in current {
+        if !sequence.contains(key) {
+            sequence.push(key.clone());
+        }
+    }
+    Ok(sequence)
+}
+
+/// `PUT /canteen/shops/order` — the administrator's own shop sequence,
+/// reflected by every shop listing.
+async fn reorder_shops(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Json(input): Json<ShopOrderRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "vendor_management.vendors.update")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let current = sqlx::query_scalar::<_, String>(
+        r#"SELECT shop_key FROM campus_ops.shops WHERE tenant_id=$1
+           ORDER BY sort_order NULLS LAST, name, shop_key FOR UPDATE"#,
+    )
+    .bind(tenant)
+    .fetch_all(&mut *tx)
+    .await?;
+    let sequence = arrange_shop_keys(&input.shop_keys, &current)?;
+    sqlx::query(
+        r#"UPDATE campus_ops.shops shop SET sort_order=placed.position::int, updated_at=now()
+           FROM unnest($2::text[]) WITH ORDINALITY AS placed(shop_key, position)
+           WHERE shop.tenant_id=$1 AND shop.shop_key=placed.shop_key
+             AND shop.sort_order IS DISTINCT FROM placed.position::int"#,
+    )
+    .bind(tenant)
+    .bind(&sequence)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let payload = json!({ "shopKeys": sequence });
+    emit(
+        &state,
+        &principal.student.tenant_id,
+        db.pool(),
+        tenant,
+        "vendor_management",
+        "shop",
+        "order",
+        "shop.reordered",
+        &principal.student.id,
+        &payload,
+    )
+    .await?;
+    Ok(Json(ApiResponse::new(json!({
+        "shops": shops_json(db.pool(), tenant, true, None).await?
+    }))))
+}
+
+/// `GET /canteen/shops/assignments/{user_id}` — every active shop in display
+/// order, with the person's role at each (`null` where they have none). Lets
+/// the user editor choose counters in the same flow as the role.
+async fn user_shop_assignments(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(user_id): Path<String>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "vendor_management.vendors.read")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let user = resolve_shop_user(&state, db.pool(), &principal.student.tenant_id, &user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("User not found".into()))?;
+    Ok(Json(ApiResponse::new(
+        user_shop_assignments_json(db.pool(), tenant, &user).await?,
+    )))
+}
+
+async fn user_shop_assignments_json(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    user: &ShopUser,
+) -> ApiResult<Value> {
+    let shops = sqlx::query_scalar::<_, Value>(concat!(
+        r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'shopId', shop.id, 'shopKey', shop.shop_key, 'name', shop.name,
+             'category', shop.category, 'sortOrder', shop.sort_order,
+             'assignmentRole', (SELECT assignment.assignment_role
+               FROM campus_ops.shop_user_assignments assignment
+               WHERE assignment.tenant_id=shop.tenant_id AND assignment.shop_id=shop.id
+                 AND assignment.is_active AND "#,
+        assignment_names_user_sql!("$2", "$3"),
+        r#" ORDER BY (assignment.assignment_role='owner') DESC LIMIT 1))
+             ORDER BY shop.sort_order NULLS LAST, shop.name, shop.shop_key), '[]'::jsonb)
+           FROM campus_ops.shops shop
+           WHERE shop.tenant_id=$1 AND shop.is_active"#
+    ))
+    .bind(tenant)
+    .bind(user.user_id.to_string())
+    .bind(&user.email)
+    .fetch_one(pool)
+    .await?;
+    Ok(json!({
+        "userId": user.user_id,
+        "email": user.email,
+        "name": user.name,
+        "shops": shops,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserShopAssignmentsRequest {
+    assignments: Vec<UserShopAssignment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserShopAssignment {
+    shop_key: String,
+    #[serde(default = "default_shop_operator_role")]
+    assignment_role: String,
+}
+
+/// `PUT /canteen/shops/assignments/{user_id}` — replaces the shops one person
+/// works at. An empty list removes them from every counter.
+async fn set_user_shop_assignments(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(user_id): Path<String>,
+    Json(input): Json<UserShopAssignmentsRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "vendor_management.vendors.update")?;
+    if input
+        .assignments
+        .iter()
+        .any(|a| !matches!(a.assignment_role.as_str(), "owner" | "captain"))
+    {
+        return Err(ApiError::BadRequest(
+            "Choose owner or captain for each shop".into(),
+        ));
+    }
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let user = resolve_shop_user(&state, db.pool(), &principal.student.tenant_id, &user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("User not found".into()))?;
+    let canonical_id = user.user_id.to_string();
+    let mut tx = db.pool().begin().await?;
+    let mut shop_roles: Vec<(Uuid, String)> = Vec::with_capacity(input.assignments.len());
+    for assignment in &input.assignments {
+        let shop_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM campus_ops.shops WHERE tenant_id=$1 AND shop_key=$2 AND is_active",
+        )
+        .bind(tenant)
+        .bind(assignment.shop_key.trim())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!("Unknown shop {}", assignment.shop_key.trim()))
+        })?;
+        match shop_roles.iter_mut().find(|(id, _)| *id == shop_id) {
+            Some((_, role)) if assignment.assignment_role == "owner" => *role = "owner".into(),
+            Some(_) => {}
+            None => shop_roles.push((shop_id, assignment.assignment_role.clone())),
+        }
+    }
+    // Every row naming this person (by account id, replica id or email) is
+    // retired, so the result is exactly the chosen shops.
+    sqlx::query(concat!(
+        r#"UPDATE campus_ops.shop_user_assignments assignment
+           SET is_active=false, updated_at=now()
+           WHERE assignment.tenant_id=$1 AND assignment.is_active AND "#,
+        assignment_names_user_sql!("$2", "$3")
+    ))
+    .bind(tenant)
+    .bind(&canonical_id)
+    .bind(&user.email)
+    .execute(&mut *tx)
+    .await?;
+    if !shop_roles.is_empty() {
+        mirror_shop_user(&mut tx, &user).await?;
+    }
+    for (shop_id, role) in &shop_roles {
+        sqlx::query(
+            r#"INSERT INTO campus_ops.shop_user_assignments
+               (tenant_id,shop_id,user_id,assignment_role,is_active,assigned_by)
+               VALUES($1,$2,$3,$4,true,$5)
+               ON CONFLICT(tenant_id,shop_id,user_id) DO UPDATE SET
+                 assignment_role=EXCLUDED.assignment_role, is_active=true,
+                 assigned_by=EXCLUDED.assigned_by, updated_at=now()"#,
+        )
+        .bind(tenant)
+        .bind(shop_id)
+        .bind(&canonical_id)
+        .bind(role)
+        .bind(&principal.student.id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    let value = user_shop_assignments_json(db.pool(), tenant, &user).await?;
+    emit(
+        &state,
+        &principal.student.tenant_id,
+        db.pool(),
+        tenant,
+        "vendor_management",
+        "shop",
+        &canonical_id,
+        "shop.operators_assigned",
+        &principal.student.id,
+        &value,
+    )
+    .await?;
+    Ok(Json(ApiResponse::new(value)))
 }
 
 #[derive(Deserialize)]
@@ -3972,7 +4440,8 @@ async fn wallet_people(
     wallet_people_for(state, db, tenant, tenant_slug, None).await
 }
 
-/// The tenant's active stores that hold wallets, canteen first.
+/// The tenant's active stores that hold wallets, in the administrator's shop
+/// order (canteen first among shops never placed).
 async fn wallet_stores(pool: &sqlx::PgPool, tenant: Uuid) -> ApiResult<Vec<Value>> {
     Ok(sqlx::query_scalar::<_, Value>(
         r#"SELECT jsonb_build_object('shopKey', shop.shop_key, 'name', shop.name,
@@ -3981,7 +4450,8 @@ async fn wallet_stores(pool: &sqlx::PgPool, tenant: Uuid) -> ApiResult<Vec<Value
            FROM campus_ops.shops shop
            WHERE shop.tenant_id=$1 AND shop.is_active
              AND lower(shop.category) = ANY($2)
-           ORDER BY array_position($2, lower(shop.category)), shop.created_at, shop.shop_key"#,
+           ORDER BY shop.sort_order NULLS LAST, array_position($2, lower(shop.category)),
+             shop.created_at, shop.shop_key"#,
     )
     .bind(tenant)
     .bind(WALLET_STORE_CATEGORIES.map(str::to_owned).to_vec())
@@ -8550,12 +9020,59 @@ pub(crate) fn require_any(access: &EffectiveAccess, permissions: &[&str]) -> Api
     }
 }
 pub(crate) async fn tenant_id(pool: &sqlx::PgPool, slug: &str) -> ApiResult<Uuid> {
+    // Every tenant-scoped handler resolves the tenant first, so this is the
+    // one place that guarantees the shop display order column exists before
+    // any shop listing (here, sales, reports, wallets) sorts by it.
+    ensure_shop_order_schema(pool).await;
     sqlx::query_scalar("SELECT id FROM platform.tenants WHERE slug=$1")
         .bind(slug)
         .fetch_optional(pool)
         .await?
         .ok_or_else(|| ApiError::NotFound("Tenant not found".into()))
 }
+/// Mirrors migrations/runtime/0132_shop_display_order.sql for databases the
+/// migration runner has not reached: the administrator's shop sequence. Runs
+/// the DDL at most once per database per process, and only when the column
+/// is missing, so the hot path is a set lookup.
+pub(crate) async fn ensure_shop_order_schema(pool: &sqlx::PgPool) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static READY: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let ready = READY.get_or_init(|| Mutex::new(HashSet::new()));
+    let options = pool.connect_options();
+    let key = format!(
+        "{}:{}/{}",
+        options.get_host(),
+        options.get_port(),
+        options.get_database().unwrap_or_default()
+    );
+    if ready.lock().map(|set| set.contains(&key)).unwrap_or(false) {
+        return;
+    }
+    let present = sqlx::query_scalar::<_, bool>(
+        r#"SELECT to_regclass('campus_ops.shops') IS NULL OR EXISTS (
+             SELECT 1 FROM information_schema.columns
+             WHERE table_schema='campus_ops' AND table_name='shops'
+               AND column_name='sort_order')"#,
+    )
+    .fetch_one(pool)
+    .await;
+    let done = match present {
+        Ok(true) => true,
+        Ok(false) => sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0132_shop_display_order.sql"
+        ))
+        .execute(pool)
+        .await
+        .map_err(|error| tracing::warn!(%error, "shop display order column unavailable"))
+        .is_ok(),
+        Err(_) => false,
+    };
+    if done && let Ok(mut set) = ready.lock() {
+        set.insert(key);
+    }
+}
+
 pub(crate) fn token_hash(value: &str) -> String {
     let mut h = Sha256::new();
     h.update(value.as_bytes());
@@ -9006,6 +9523,80 @@ fn require_any_role(principal: &AuthPrincipal) -> ApiResult<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn keys(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn reorder_places_requested_shops_first_then_the_rest_in_current_order() {
+        let current = keys(&["canteen", "laundry", "stationery", "juice"]);
+        let arranged = arrange_shop_keys(&keys(&["stationery", "canteen"]), &current).unwrap();
+        assert_eq!(arranged, keys(&["stationery", "canteen", "laundry", "juice"]));
+        let full = arrange_shop_keys(&keys(&["juice", "laundry", "stationery", "canteen"]), &current)
+            .unwrap();
+        assert_eq!(full, keys(&["juice", "laundry", "stationery", "canteen"]));
+    }
+
+    #[test]
+    fn reorder_refuses_unknown_repeated_or_empty_lists() {
+        let current = keys(&["canteen", "laundry"]);
+        assert!(arrange_shop_keys(&keys(&["canteen", "ghost"]), &current).is_err());
+        assert!(arrange_shop_keys(&keys(&["canteen", "canteen"]), &current).is_err());
+        assert!(arrange_shop_keys(&[], &current).is_err());
+    }
+
+    #[test]
+    fn shop_staff_without_a_counter_are_told_so() {
+        // A captain (order grants, no shop configuration) with no shop.
+        assert!(shop_assignment_pending(true, false, 0));
+        assert!(!shop_assignment_pending(true, false, 1));
+        // Shop administrators already cover every shop; students hold no
+        // shop-staff grants at all.
+        assert!(!shop_assignment_pending(true, true, 0));
+        assert!(!shop_assignment_pending(false, false, 0));
+    }
+
+    #[test]
+    fn refused_counter_actions_explain_the_missing_assignment() {
+        assert!(assignment_decision(true, true).is_ok());
+        match assignment_decision(false, false) {
+            Err(ApiError::ForbiddenWithMessage(message)) => {
+                assert_eq!(message, NOT_ASSIGNED_TO_SHOP_MESSAGE);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match assignment_decision(false, true) {
+            Err(ApiError::ForbiddenWithMessage(message)) => {
+                assert!(message.contains("not assigned to"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assignment_match_accepts_account_id_replica_id_or_email() {
+        let sql = assignment_names_user_sql!("$2", "$3");
+        assert!(sql.contains("assignment.user_id=$2"));
+        assert!(sql.contains("lower(assignment.user_id)=lower($3)"));
+        assert!(sql.contains("assigned_user.id::text=assignment.user_id"));
+    }
+
+    #[test]
+    fn a_person_listed_twice_on_a_shop_keeps_one_row_and_owner_wins() {
+        let user = ShopUser {
+            user_id: Uuid::nil(),
+            email: "cap@campus.local".into(),
+            name: "Cap".into(),
+            initials: "C".into(),
+        };
+        let mut resolved = Vec::new();
+        merge_shop_operator(&mut resolved, user.clone(), "captain");
+        merge_shop_operator(&mut resolved, user.clone(), "owner");
+        merge_shop_operator(&mut resolved, user, "captain");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].1, "owner");
+    }
 
     #[test]
     fn instant_items_go_straight_to_delivered() {

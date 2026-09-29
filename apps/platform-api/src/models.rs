@@ -133,6 +133,10 @@ pub struct UpdateStudentMasterRequest {
     pub department_id: Option<Uuid>,
     #[serde(default)]
     pub section_id: Option<Uuid>,
+    /// A programme from the academic catalog; when present it decides the
+    /// student's department and must own the section.
+    #[serde(default)]
+    pub programme_id: Option<Uuid>,
     #[serde(default)]
     pub guardian_name: Option<String>,
     #[serde(default)]

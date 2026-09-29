@@ -15,7 +15,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod admin_users;
+mod role_admin;
 mod student_accounts;
+mod user_deletion;
 
 use crate::{
     error::{ApiError, ApiResult},
@@ -54,7 +56,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/authorization/roles/{role_id}",
-            put(update_authorization_role).delete(delete_authorization_role),
+            put(update_authorization_role).delete(role_admin::delete_role),
         )
         .route(
             "/authorization/roles/{role_id}/permissions",
@@ -65,8 +67,14 @@ pub fn router(state: AppState) -> Router {
             get(list_tenant_users).post(create_tenant_user),
         )
         .route(
+            "/authorization/users/bulk-delete",
+            post(user_deletion::bulk_delete_tenant_users),
+        )
+        .route(
             "/authorization/users/{user_id}",
-            put(admin_users::update_tenant_user).patch(admin_users::update_tenant_user),
+            put(admin_users::update_tenant_user)
+                .patch(admin_users::update_tenant_user)
+                .delete(user_deletion::delete_tenant_user),
         )
         .route(
             "/authorization/users/{user_id}/roles",
@@ -161,6 +169,7 @@ pub fn router(state: AppState) -> Router {
             "/academic-assignments",
             crate::academic_assignments::router(),
         )
+        .nest("/academic-structure", crate::academic_structure::router())
         .nest("/timetable", crate::timetable::router())
         .nest("/operations", crate::operations::router())
         .nest("/platform-admin", crate::platform_admin::router())
@@ -530,6 +539,7 @@ async fn list_authorization_roles(
     // Tell clients which roles this caller may hand out, so a tenant admin is
     // never offered a platform or super-administrator role to assign.
     let platform_admin = crate::platform_admin::is_platform_admin(&access);
+    let member_counts = role_admin::member_counts(&state, &principal.student.tenant_id).await?;
     if let Some(list) = roles.as_array_mut() {
         for role in list {
             let key = role.get("key").and_then(Value::as_str).unwrap_or_default();
@@ -539,8 +549,17 @@ async fn list_authorization_roles(
                 .unwrap_or_default();
             let assignable =
                 admin_users::may_change_role(&access.roles, platform_admin, key, family);
+            let system = role_admin::is_system_role_key(key);
+            let member_count = role
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .and_then(|id| member_counts.get(&id).copied())
+                .unwrap_or(0);
             if let Some(object) = role.as_object_mut() {
                 object.insert("assignable".into(), Value::Bool(assignable));
+                object.insert("system".into(), Value::Bool(system));
+                object.insert("memberCount".into(), json!(member_count));
             }
         }
     }
@@ -608,6 +627,14 @@ async fn update_authorization_role(
         request.portal_family.as_deref().map(str::trim),
     )
     .await?;
+    role_admin::ensure_role_editable(&state, &principal.student.tenant_id, role_id).await?;
+    if request
+        .name
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(ApiError::BadRequest("role name cannot be empty".into()));
+    }
     Ok(Json(ApiResponse::new(
         state
             .update_authorization_role(
@@ -618,28 +645,6 @@ async fn update_authorization_role(
             )
             .await?,
     )))
-}
-
-async fn delete_authorization_role(
-    State(state): State<AppState>,
-    Extension(principal): Extension<AuthPrincipal>,
-    Extension(access): Extension<EffectiveAccess>,
-    Path(role_id): Path<Uuid>,
-) -> ApiResult<StatusCode> {
-    require_effective_permission(&access, "authorization.roles.delete")?;
-    admin_users::guard_role_definition(
-        &state,
-        &principal.student.tenant_id,
-        &access,
-        Some(role_id),
-        None,
-        None,
-    )
-    .await?;
-    state
-        .delete_authorization_role(&principal.student.tenant_id, &principal.student.id, role_id)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn set_authorization_role_permissions(
@@ -659,6 +664,15 @@ async fn set_authorization_role_permissions(
         None,
     )
     .await?;
+    role_admin::ensure_role_editable(&state, &principal.student.tenant_id, role_id).await?;
+    if let Some(key) = role_admin::forbidden_permission_grant(
+        request.permissions.iter().map(|grant| grant.key.trim()),
+        crate::platform_admin::is_platform_admin(&access),
+    ) {
+        return Err(ApiError::ForbiddenWithMessage(format!(
+            "Only a platform administrator can grant {key}"
+        )));
+    }
     validate_surface(&request.surface)?;
     if request
         .permissions
@@ -1061,6 +1075,28 @@ async fn update_student_master(
     if request.guardian_name.is_some() != request.guardian_phone.is_some() {
         return Err(ApiError::BadRequest(
             "Guardian name and WhatsApp phone number must be supplied together".into(),
+        ));
+    }
+    if let Some(phone) = request.guardian_phone.as_deref() {
+        crate::student_master_save::validate_guardian_phone(phone)
+            .map_err(|message| ApiError::BadRequest(message.into()))?;
+    }
+    if request.name.trim().chars().count() > 160
+        || request.roll_no.trim().chars().count() > 64
+        || request.department.trim().chars().count() > 200
+        || request.section.trim().chars().count() > 32
+        || request.mobile_number.trim().chars().count() > 32
+        || request
+            .guardian_name
+            .as_deref()
+            .is_some_and(|value| value.trim().chars().count() > 160)
+        || request
+            .guardian_relationship
+            .as_deref()
+            .is_some_and(|value| value.trim().chars().count() > 40)
+    {
+        return Err(ApiError::BadRequest(
+            "One of the student details is too long".into(),
         ));
     }
 

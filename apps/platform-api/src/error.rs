@@ -21,6 +21,7 @@ pub enum ApiError {
     ForbiddenWithMessage(String),
     NotFound(String),
     ServiceUnavailable(String),
+    TooManyRequests(String),
     BadGateway(String),
     PaymentProviderUnauthorized(String),
     PaymentProvider(String),
@@ -103,6 +104,9 @@ impl IntoResponse for ApiError {
                 None,
             ),
             Self::BadGateway(error) => (StatusCode::BAD_GATEWAY, "upstream_error", error, None),
+            Self::TooManyRequests(error) => {
+                (StatusCode::TOO_MANY_REQUESTS, "too_many_requests", error, None)
+            }
             Self::PaymentProviderUnauthorized(error) => (
                 StatusCode::UNAUTHORIZED,
                 "payment_provider_auth_failed",

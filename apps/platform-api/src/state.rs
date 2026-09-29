@@ -276,6 +276,14 @@ impl AppState {
         self.effective_access_cache.write().await.clear();
     }
 
+    /// Drops cached principals and effective access after an identity change
+    /// made outside this file (for example a user deletion), so revoked
+    /// sessions stop working on their next request.
+    pub async fn forget_cached_identities(&self) {
+        self.validated_principals.write().await.clear();
+        self.invalidate_effective_access().await;
+    }
+
     pub fn with_database(database: Database) -> Self {
         Self {
             database: Some(database.clone()),
@@ -702,6 +710,7 @@ impl AppState {
                       student.student_number, student.full_name,
                       student.department_id AS department_id,
                       student.section_id AS section_id,
+                      student.program_id::text AS program_id,
                       COALESCE(
                           NULLIF(student.profile ->> 'department', ''),
                           department.name,
@@ -751,6 +760,8 @@ impl AppState {
                  LIMIT 1
                ) guardian ON true
                WHERE tenant.slug = $1
+                 -- Records of deleted accounts are kept for history only.
+                 AND student.status <> 'deleted'
                ORDER BY student.student_number, student.full_name"#,
         )
         .bind(tenant_slug)
@@ -769,6 +780,7 @@ impl AppState {
                     "department": row.try_get::<String, _>("department")?,
                     "departmentId": row.try_get::<Option<String>, _>("department_id")?,
                     "sectionId": row.try_get::<Option<String>, _>("section_id")?,
+                    "programmeId": row.try_get::<Option<String>, _>("program_id")?,
                     "mobileNumber": row.try_get::<Option<String>, _>("phone")?.unwrap_or_default(),
                     "email": row.try_get::<Option<String>, _>("email")?.unwrap_or_default(),
                     "status": row.try_get::<String, _>("status")?,
@@ -950,6 +962,20 @@ impl AppState {
         request: &UpdateStudentMasterRequest,
     ) -> ApiResult<Option<Value>> {
         let database = self.tenant_database(tenant_slug).await?;
+        crate::student_master_save::ensure_student_guardian_schema(database.pool(), tenant_slug)
+            .await;
+        self.save_student_master(&database, tenant_slug, student_id, request)
+            .await
+            .map_err(ApiError::from)
+    }
+
+    async fn save_student_master(
+        &self,
+        database: &Database,
+        tenant_slug: &str,
+        student_id: Uuid,
+        request: &UpdateStudentMasterRequest,
+    ) -> Result<Option<Value>, crate::student_master_save::StudentSaveError> {
         let mut transaction = database.pool().begin().await?;
         let tenant_id: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM platform.tenants WHERE slug = $1")
@@ -1001,7 +1027,7 @@ impl AppState {
             transaction.rollback().await?;
             return Err(ApiError::Conflict(
                 "That roll number already belongs to another student".into(),
-            ));
+            ).into());
         }
         if sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM core.students WHERE tenant_id = $1 AND id <> $2 AND lower(COALESCE(email, '')) = lower($3))",
@@ -1015,7 +1041,7 @@ impl AppState {
             transaction.rollback().await?;
             return Err(ApiError::Conflict(
                 "That email address already belongs to another student".into(),
-            ));
+            ).into());
         }
         if let Some(user_id) = user_id {
             if sqlx::query_scalar::<_, bool>(
@@ -1029,7 +1055,7 @@ impl AppState {
                 transaction.rollback().await?;
                 return Err(ApiError::Conflict(
                     "That email address already belongs to another account".into(),
-                ));
+                ).into());
             }
             if let Some(control) = &self.database
                 && sqlx::query_scalar::<_, bool>(
@@ -1043,7 +1069,7 @@ impl AppState {
                 transaction.rollback().await?;
                 return Err(ApiError::Conflict(
                     "That email address already belongs to another account".into(),
-                ));
+                ).into());
             }
         }
 
@@ -1083,69 +1109,199 @@ impl AppState {
             "section": section,
             "residency": request.residency,
         });
-        let student = sqlx::query(
+        // Department and section links are resolved first, as uuids. The
+        // student columns are text on most databases and uuid on some older
+        // ones; a uuid value assigns to either, while a text expression (or a
+        // COALESCE mixing both) fails on one of them.
+        //
+        // A programme chosen from the academic catalog must belong to this
+        // tenant; it then decides the department and which sections fit.
+        let programme = match request.programme_id {
+            Some(programme_id) => {
+                let found = sqlx::query_as::<_, (Uuid, Uuid)>(
+                    "SELECT id, department_id FROM core.programmes WHERE tenant_id = $1 AND id = $2",
+                )
+                .bind(tenant_id)
+                .bind(programme_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                if found.is_none() {
+                    transaction.rollback().await?;
+                    return Err(ApiError::BadRequest(
+                        "That programme is not part of this institution's catalog. Choose it again"
+                            .into(),
+                    )
+                    .into());
+                }
+                found
+            }
+            None => None,
+        };
+        let department_id = match programme {
+            Some((_, programme_department)) => Some(programme_department),
+            None => {
+                sqlx::query_scalar::<_, Uuid>(
+                    r#"SELECT id FROM core.departments
+                       WHERE tenant_id = $1 AND (
+                           ($2::uuid IS NOT NULL AND id = $2)
+                           OR lower(name) = lower($3)
+                           OR lower(code) = lower($3)
+                           OR ($4 <> '' AND lower(code) = lower($4))
+                           OR lower(name) = lower(split_part($3, ' in ', 2))
+                           OR lower(replace(name, '&', 'and')) = lower(replace(split_part($3, ' in ', 2), '&', 'and'))
+                           OR lower(replace(name, '&', 'and')) = lower(replace($3, '&', 'and'))
+                       )
+                       -- The department the administrator chose (by name) wins
+                       -- over the id the app echoes back from the old record,
+                       -- which only decides when the name matches nothing.
+                       ORDER BY (lower(name) = lower($3)
+                                 OR lower(name) = lower(split_part($3, ' in ', 2))
+                                 OR lower(replace(name, '&', 'and')) = lower(replace(split_part($3, ' in ', 2), '&', 'and'))
+                                 OR lower(replace(name, '&', 'and')) = lower(replace($3, '&', 'and'))) DESC,
+                                ($2::uuid IS NOT NULL AND id = $2) DESC,
+                                active DESC
+                       LIMIT 1"#,
+                )
+                .bind(tenant_id)
+                .bind(request.department_id)
+                .bind(department)
+                .bind(dept_abbr)
+                .fetch_optional(&mut *transaction)
+                .await?
+            }
+        };
+        let current_section: Option<String> = sqlx::query_scalar(
+            "SELECT section_id::text FROM core.students WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(student_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .flatten();
+        let anchor_section = request
+            .section_id
+            .map(|id| id.to_string())
+            .or(current_section);
+        // With a programme: a section of one of its batches (the one sent, or
+        // the same-named one), and no section at all rather than one that
+        // belongs to another programme.
+        let mut clear_section = false;
+        let section_id = if let Some((programme_id, _)) = programme {
+            let found = sqlx::query_scalar::<_, Uuid>(
+                r#"SELECT section.id
+                   FROM core.sections section
+                   JOIN core.batches batch
+                     ON batch.tenant_id = section.tenant_id AND batch.id = section.batch_id
+                   WHERE section.tenant_id = $1 AND batch.programme_id = $2
+                     AND (COALESCE(section.id::text = $3, false)
+                          OR ($4 <> '' AND (lower(section.code) = lower($4)
+                                            OR lower(section.name) = lower($4))))
+                   ORDER BY COALESCE(section.id::text = $3, false) DESC,
+                            batch.starts_on DESC NULLS LAST
+                   LIMIT 1"#,
+            )
+            .bind(tenant_id)
+            .bind(programme_id)
+            .bind(anchor_section.as_deref())
+            .bind(section)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            clear_section = found.is_none();
+            found
+        } else if let Some(anchor) = anchor_section.as_deref() {
+            // The section the record is linked to (or the one the app sent)
+            // when it still matches the typed section; otherwise the
+            // same-named section of that batch, so "A" to "B" moves the link.
+            sqlx::query_scalar::<_, Uuid>(
+                r#"SELECT candidate.id
+                   FROM core.sections candidate
+                   JOIN core.sections anchor
+                     ON anchor.tenant_id = candidate.tenant_id
+                    AND anchor.id::text = $2
+                   WHERE candidate.tenant_id = $1
+                     AND (
+                       candidate.id = anchor.id
+                       OR (candidate.batch_id = anchor.batch_id AND $3 <> ''
+                           AND (lower(candidate.code) = lower($3)
+                                OR lower(candidate.name) = lower($3)))
+                     )
+                   -- The typed section first; with no such section in the
+                   -- batch, the (existing) anchor section is kept.
+                   ORDER BY ($3 <> '' AND (lower(candidate.code) = lower($3)
+                                           OR lower(candidate.name) = lower($3))) DESC,
+                            (candidate.id = anchor.id) DESC
+                   LIMIT 1"#,
+            )
+            .bind(tenant_id)
+            .bind(anchor)
+            .bind(section)
+            .fetch_optional(&mut *transaction)
+            .await?
+        } else {
+            None
+        };
+        let update_sql = format!(
             r#"UPDATE core.students
                SET student_number = $3,
                    full_name = $4,
                    email = $5,
                    phone = NULLIF($6, ''),
-                   department_id = COALESCE(
-                       (SELECT id::text FROM core.departments
-                        WHERE tenant_id = $1 AND id = $12),
-                       (SELECT id::text FROM core.departments
-                        WHERE tenant_id = $1 AND (
-                            lower(name) = lower($7)
-                            OR lower(code) = lower($7)
-                            OR (NULLIF($14, '') IS NOT NULL AND lower(code) = lower($14))
-                            OR lower(name) = lower(split_part($7, ' in ', 2))
-                            OR lower(replace(name, '&', 'and')) = lower(replace(split_part($7, ' in ', 2), '&', 'and'))
-                            OR lower(replace(name, '&', 'and')) = lower(replace($7, '&', 'and'))
-                        )
-                        ORDER BY active DESC
-                        LIMIT 1),
-                       student.department_id
-                   ),
-                   section_id = COALESCE(
-                       (SELECT id::text FROM core.sections
-                        WHERE tenant_id = $1 AND id = $13),
-                       student.section_id
-                   ),
-                   academic_year = $9,
-                   status = $10,
-                   profile = COALESCE(profile, '{}'::jsonb) || $11,
+                   {department_assignment}
+                   {section_assignment}
+                   {programme_assignment}
+                   academic_year = $7,
+                   status = $8,
+                   profile = COALESCE(profile, '{{}}'::jsonb) || $9,
                    updated_at = now()
                WHERE tenant_id = $1 AND id = $2
-               RETURNING id, user_account_id, department_id, section_id,
+               RETURNING id, user_account_id,
+                         department_id::text AS department_id,
+                         section_id::text AS section_id,
+                         program_id::text AS program_id,
                          created_at, updated_at,
                          NULLIF(profile ->> 'photoUrl', '') AS photo_url"#,
-        )
-        .bind(tenant_id)
-        .bind(student_id)
-        .bind(roll_no)
-        .bind(name)
-        .bind(&email)
-        .bind(mobile_number)
-        .bind(department)
-        .bind(section)
-        .bind(&academic_year)
-        .bind(&request.status)
-        .bind(&profile)
-        .bind(request.department_id)
-        .bind(request.section_id)
-        .bind(dept_abbr)
-        .fetch_one(&mut *transaction)
-        .await?;
+            department_assignment = if department_id.is_some() {
+                "department_id = $10,"
+            } else {
+                ""
+            },
+            section_assignment = if section_id.is_some() {
+                "section_id = $11,"
+            } else if clear_section {
+                "section_id = NULL,"
+            } else {
+                ""
+            },
+            programme_assignment = if programme.is_some() {
+                "program_id = $12,"
+            } else {
+                ""
+            },
+        );
+        let student = sqlx::query(&update_sql)
+            .bind(tenant_id)
+            .bind(student_id)
+            .bind(roll_no)
+            .bind(name)
+            .bind(&email)
+            .bind(mobile_number)
+            .bind(&academic_year)
+            .bind(&request.status)
+            .bind(&profile)
+            .bind(department_id)
+            .bind(section_id)
+            .bind(programme.map(|(programme_id, _)| programme_id))
+            .fetch_one(&mut *transaction)
+            .await?;
 
         if let (Some(guardian_name), Some(guardian_phone)) = (
             request.guardian_name.as_deref(),
             request.guardian_phone.as_deref(),
         ) {
-            let relationship = request
-                .guardian_relationship
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("Parent");
+            let relationship = crate::student_master_save::normalize_guardian_relationship(
+                request.guardian_relationship.as_deref(),
+            );
+            let relationship = relationship.as_str();
             let existing_guardian = sqlx::query_scalar::<_, Uuid>(
                 r#"SELECT guardian.id
                    FROM core.guardians guardian
@@ -1163,9 +1319,16 @@ impl AppState {
             .fetch_optional(&mut *transaction).await?;
             let guardian_id = match existing_guardian {
                 Some(guardian_id) => {
+                    // A guardian shared through the link table may belong to
+                    // a sibling's record; it keeps that owner (and its own
+                    // primary flag) and this student's link carries primacy.
                     sqlx::query(
                         r#"UPDATE core.guardians SET full_name=$3,phone=$4,
-                           relationship=$5,student_id=$2,is_primary=true,updated_at=now()
+                           relationship=$5,
+                           is_primary=CASE WHEN student_id IS NULL OR student_id=$2
+                                           THEN true ELSE is_primary END,
+                           student_id=COALESCE(student_id,$2),
+                           updated_at=now()
                            WHERE tenant_id=$1 AND id=$6"#,
                     )
                     .bind(tenant_id)
@@ -1193,12 +1356,22 @@ impl AppState {
                     .await?
                 }
             };
+            // Update-then-insert rather than ON CONFLICT: link tables created
+            // by older schemas may lack the (tenant, student, guardian) key.
+            // Other guardians of this student stop being primary so the
+            // lookups above keep a single answer.
             sqlx::query(
-                r#"INSERT INTO core.student_guardians
-                   (tenant_id,student_id,guardian_id,relationship,is_primary)
-                   VALUES($1,$2,$3,$4,true)
-                   ON CONFLICT(tenant_id,student_id,guardian_id) DO UPDATE SET
-                     relationship=EXCLUDED.relationship,is_primary=true"#,
+                r#"UPDATE core.student_guardians SET is_primary=false
+                   WHERE tenant_id=$1 AND student_id=$2 AND guardian_id<>$3 AND is_primary"#,
+            )
+            .bind(tenant_id)
+            .bind(student_id)
+            .bind(guardian_id)
+            .execute(&mut *transaction)
+            .await?;
+            let linked = sqlx::query(
+                r#"UPDATE core.student_guardians SET relationship=$4,is_primary=true
+                   WHERE tenant_id=$1 AND student_id=$2 AND guardian_id=$3"#,
             )
             .bind(tenant_id)
             .bind(student_id)
@@ -1206,6 +1379,19 @@ impl AppState {
             .bind(relationship)
             .execute(&mut *transaction)
             .await?;
+            if linked.rows_affected() == 0 {
+                sqlx::query(
+                    r#"INSERT INTO core.student_guardians
+                       (tenant_id,student_id,guardian_id,relationship,is_primary)
+                       VALUES($1,$2,$3,$4,true)"#,
+                )
+                .bind(tenant_id)
+                .bind(student_id)
+                .bind(guardian_id)
+                .bind(relationship)
+                .execute(&mut *transaction)
+                .await?;
+            }
         }
 
         let guardian = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
@@ -1304,6 +1490,7 @@ impl AppState {
             "department": department,
             "departmentId": student.try_get::<Option<String>, _>("department_id")?,
             "sectionId": student.try_get::<Option<String>, _>("section_id")?,
+            "programmeId": student.try_get::<Option<String>, _>("program_id")?,
             "mobileNumber": mobile_number,
             "email": email,
             "status": request.status,
@@ -3003,6 +3190,39 @@ impl AppState {
         .bind(user_id)
         .bind(new_name)
         .bind(&new_email)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+        // Live sessions carry a login-time snapshot of the profile, and a
+        // token refresh re-issues it as-is. Without this the renamed user's
+        // app kept greeting them by the old name for the life of the session
+        // (30 days), which read as the rename "going back".
+        sqlx::query(
+            r#"UPDATE identity.auth_sessions
+               SET profile = COALESCE(profile, '{}'::jsonb)
+                       || jsonb_build_object('name', $2::text, 'email', $3::text,
+                                             'initials', $4::text)
+               WHERE user_id = $1::text AND revoked_at IS NULL"#,
+        )
+        .bind(user_id)
+        .bind(new_name)
+        .bind(&new_email)
+        .bind(&new_initials)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        sqlx::query(
+            r#"UPDATE identity.local_sessions
+               SET student = COALESCE(student, '{}'::jsonb)
+                       || jsonb_build_object('name', $2::text, 'email', $3::text,
+                                             'initials', $4::text)
+               WHERE user_id = $1::text AND expires_at > now()"#,
+        )
+        .bind(user_id)
+        .bind(new_name)
+        .bind(&new_email)
+        .bind(&new_initials)
         .execute(&mut *transaction)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;

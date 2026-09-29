@@ -31,10 +31,33 @@ pub struct EmailMessage {
     pub html_body: Option<String>,
 }
 
+/// A file sent with an email (a report PDF or CSV).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailAttachment {
+    pub filename: String,
+    /// A MIME type such as `application/pdf` or `text/csv`.
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Delivery transport for outbound email.
 #[async_trait]
 pub trait Mailer: Send + Sync {
     async fn send(&self, message: EmailMessage) -> anyhow::Result<()>;
+
+    /// Sends `message` with files attached. Transports that cannot carry
+    /// attachments refuse rather than silently dropping them.
+    async fn send_with_attachments(
+        &self,
+        message: EmailMessage,
+        attachments: Vec<EmailAttachment>,
+    ) -> anyhow::Result<()> {
+        if attachments.is_empty() {
+            return self.send(message).await;
+        }
+        let _ = message;
+        bail!("the {} email transport cannot send attachments", self.transport())
+    }
 
     /// Human-readable transport name, used in startup logs.
     fn transport(&self) -> &'static str;
@@ -56,6 +79,26 @@ impl Mailer for LogMailer {
         Ok(())
     }
 
+    /// Logs who it was for and what was attached — never the file contents.
+    async fn send_with_attachments(
+        &self,
+        message: EmailMessage,
+        attachments: Vec<EmailAttachment>,
+    ) -> anyhow::Result<()> {
+        let files = attachments
+            .iter()
+            .map(|a| format!("{} ({}, {} bytes)", a.filename, a.content_type, a.bytes.len()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::info!(
+            to = %message.to,
+            subject = %message.subject,
+            attachments = %files,
+            "email not sent: SMTP is not configured, logging message instead"
+        );
+        Ok(())
+    }
+
     fn transport(&self) -> &'static str {
         "log"
     }
@@ -68,6 +111,15 @@ pub struct DisabledMailer;
 #[async_trait]
 impl Mailer for DisabledMailer {
     async fn send(&self, _message: EmailMessage) -> anyhow::Result<()> {
+        tracing::warn!("email delivery is disabled; message discarded");
+        Ok(())
+    }
+
+    async fn send_with_attachments(
+        &self,
+        _message: EmailMessage,
+        _attachments: Vec<EmailAttachment>,
+    ) -> anyhow::Result<()> {
         tracing::warn!("email delivery is disabled; message discarded");
         Ok(())
     }
@@ -127,6 +179,15 @@ struct BrevoEmailRequest<'a> {
     text_content: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     html_content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attachment: Vec<BrevoAttachment>,
+}
+
+/// Brevo takes attachments inline as base64 with the file name.
+#[derive(Debug, Serialize)]
+struct BrevoAttachment {
+    content: String,
+    name: String,
 }
 
 impl BrevoMailer {
@@ -158,12 +219,28 @@ impl BrevoMailer {
 #[async_trait]
 impl Mailer for BrevoMailer {
     async fn send(&self, message: EmailMessage) -> anyhow::Result<()> {
+        self.send_with_attachments(message, Vec::new()).await
+    }
+
+    async fn send_with_attachments(
+        &self,
+        message: EmailMessage,
+        attachments: Vec<EmailAttachment>,
+    ) -> anyhow::Result<()> {
+        use base64::Engine as _;
         let request = BrevoEmailRequest {
             sender: &self.sender,
             to: [BrevoRecipient { email: &message.to }],
             subject: &message.subject,
             text_content: &message.text_body,
             html_content: message.html_body.as_deref(),
+            attachment: attachments
+                .into_iter()
+                .map(|a| BrevoAttachment {
+                    content: base64::engine::general_purpose::STANDARD.encode(a.bytes),
+                    name: a.filename,
+                })
+                .collect(),
         };
 
         let response = self
@@ -246,22 +323,30 @@ impl SmtpMailer {
     }
 }
 
-#[async_trait]
-impl Mailer for SmtpMailer {
-    async fn send(&self, message: EmailMessage) -> anyhow::Result<()> {
-        use lettre::{AsyncTransport, Message, message::MultiPart, message::header};
+/// Builds the MIME message: plain text (and HTML when given), with any
+/// attachments in a `multipart/mixed` envelope.
+fn build_smtp_message(
+    from: lettre::message::Mailbox,
+    message: EmailMessage,
+    attachments: Vec<EmailAttachment>,
+) -> anyhow::Result<lettre::Message> {
+    use lettre::{
+        Message,
+        message::{Attachment, MultiPart, SinglePart, header},
+    };
 
-        let to = message
-            .to
-            .parse::<lettre::message::Mailbox>()
-            .with_context(|| format!("recipient is not a valid mailbox: {}", message.to))?;
+    let to = message
+        .to
+        .parse::<lettre::message::Mailbox>()
+        .with_context(|| format!("recipient is not a valid mailbox: {}", message.to))?;
 
-        let builder = Message::builder()
-            .from(self.from.clone())
-            .to(to)
-            .subject(message.subject);
+    let builder = Message::builder()
+        .from(from)
+        .to(to)
+        .subject(message.subject);
 
-        let email = match message.html_body {
+    if attachments.is_empty() {
+        return match message.html_body {
             Some(html) => {
                 builder.multipart(MultiPart::alternative_plain_html(message.text_body, html))
             }
@@ -269,7 +354,40 @@ impl Mailer for SmtpMailer {
                 .header(header::ContentType::TEXT_PLAIN)
                 .body(message.text_body),
         }
-        .context("failed to assemble the email message")?;
+        .context("failed to assemble the email message");
+    }
+
+    let body = match message.html_body {
+        Some(html) => MultiPart::alternative_plain_html(message.text_body, html),
+        None => MultiPart::mixed().singlepart(SinglePart::plain(message.text_body)),
+    };
+    let mut mixed = MultiPart::mixed().multipart(body);
+    for attachment in attachments {
+        let content_type = header::ContentType::parse(&attachment.content_type)
+            .with_context(|| format!("invalid attachment type {}", attachment.content_type))?;
+        mixed = mixed.singlepart(
+            Attachment::new(attachment.filename).body(attachment.bytes, content_type),
+        );
+    }
+    builder
+        .multipart(mixed)
+        .context("failed to assemble the email message")
+}
+
+#[async_trait]
+impl Mailer for SmtpMailer {
+    async fn send(&self, message: EmailMessage) -> anyhow::Result<()> {
+        self.send_with_attachments(message, Vec::new()).await
+    }
+
+    async fn send_with_attachments(
+        &self,
+        message: EmailMessage,
+        attachments: Vec<EmailAttachment>,
+    ) -> anyhow::Result<()> {
+        use lettre::AsyncTransport;
+
+        let email = build_smtp_message(self.from.clone(), message, attachments)?;
 
         self.transport
             .send(email)
@@ -434,5 +552,102 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(mailer.transport(), "disabled");
+    }
+
+    fn report_message() -> EmailMessage {
+        EmailMessage {
+            to: "accounts@example.com".into(),
+            subject: "Credits report".into(),
+            text_body: "Total credited 600.50".into(),
+            html_body: Some("<p>Total credited 600.50</p>".into()),
+        }
+    }
+
+    #[test]
+    fn smtp_message_carries_attachments_beside_the_body() {
+        let from = "SuperCampus <no-reply@example.com>".parse().unwrap();
+        let email = build_smtp_message(
+            from,
+            report_message(),
+            vec![
+                EmailAttachment {
+                    filename: "credits.pdf".into(),
+                    content_type: "application/pdf".into(),
+                    bytes: b"%PDF-1.4 test".to_vec(),
+                },
+                EmailAttachment {
+                    filename: "credits.csv".into(),
+                    content_type: "text/csv; charset=utf-8".into(),
+                    bytes: b"Report,Credits\r\n".to_vec(),
+                },
+            ],
+        )
+        .expect("message builds");
+        let raw = String::from_utf8_lossy(&email.formatted()).to_string();
+        assert!(raw.contains("multipart/mixed"));
+        assert!(raw.contains("multipart/alternative"));
+        assert!(raw.contains("filename=\"credits.pdf\""));
+        assert!(raw.contains("filename=\"credits.csv\""));
+        assert!(raw.contains("application/pdf"));
+        assert!(raw.contains("Total credited 600.50"));
+    }
+
+    #[test]
+    fn smtp_message_without_attachments_is_unchanged() {
+        let from = "SuperCampus <no-reply@example.com>".parse().unwrap();
+        let email = build_smtp_message(from, report_message(), Vec::new()).unwrap();
+        let raw = String::from_utf8_lossy(&email.formatted()).to_string();
+        assert!(!raw.contains("multipart/mixed"));
+        assert!(raw.contains("multipart/alternative"));
+    }
+
+    #[test]
+    fn brevo_request_lists_attachments_as_base64() {
+        let sender = BrevoSender {
+            email: "no-reply@example.com".into(),
+            name: None,
+        };
+        let request = BrevoEmailRequest {
+            sender: &sender,
+            to: [BrevoRecipient {
+                email: "accounts@example.com",
+            }],
+            subject: "s",
+            text_content: "t",
+            html_content: None,
+            attachment: vec![BrevoAttachment {
+                content: "JVBERi0=".into(),
+                name: "r.pdf".into(),
+            }],
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["attachment"][0]["name"], "r.pdf");
+        assert_eq!(json["attachment"][0]["content"], "JVBERi0=");
+        let plain = BrevoEmailRequest {
+            attachment: Vec::new(),
+            ..request
+        };
+        assert!(serde_json::to_value(&plain).unwrap().get("attachment").is_none());
+    }
+
+    #[tokio::test]
+    async fn log_and_disabled_mailers_accept_attachments() {
+        let file = EmailAttachment {
+            filename: "r.csv".into(),
+            content_type: "text/csv".into(),
+            bytes: b"a,b".to_vec(),
+        };
+        assert!(
+            LogMailer
+                .send_with_attachments(report_message(), vec![file.clone()])
+                .await
+                .is_ok()
+        );
+        assert!(
+            DisabledMailer
+                .send_with_attachments(report_message(), vec![file])
+                .await
+                .is_ok()
+        );
     }
 }

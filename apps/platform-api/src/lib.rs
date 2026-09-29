@@ -1,4 +1,5 @@
 pub mod academic_assignments;
+pub mod academic_structure;
 pub mod app_versions;
 pub mod dashboard;
 pub mod error;
@@ -20,11 +21,13 @@ pub mod razorpay;
 pub mod reports;
 pub mod security_logs;
 pub mod shop_analytics;
+pub mod student_master_save;
 pub mod support;
 pub mod vendor_sales;
 pub mod visitors;
 
 pub mod realtime;
+pub mod release_patches;
 pub mod routes;
 pub mod state;
 pub mod timetable;
@@ -253,30 +256,19 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to apply the accountant wallet access release patch")?;
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/runtime/0073_abhinaya_accountant_portal.sql"
-        ))
-        .execute(control_database.pool())
-        .await
-        .context("failed to apply the Abhinaya accountant release patch")?;
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/runtime/0074_gate_security_portal.sql"
-        ))
-        .execute(control_database.pool())
-        .await
-        .context("failed to apply the gate security portal release patch")?;
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/runtime/0075_mec_canteen_captains.sql"
-        ))
-        .execute(control_database.pool())
-        .await
-        .context("failed to apply the canteen captain release patch")?;
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/runtime/0079_mec_librarian_and_stationery_accounts.sql"
-        ))
-        .execute(control_database.pool())
-        .await
-        .context("failed to apply the MEC librarian and stationery accounts release patch")?;
+        // Identity patches write names, passwords, roles and `active`; they
+        // run once per database (see release_patches) so a deploy never
+        // reverts a rename, reactivates, or recreates a deleted account.
+        for patch in [
+            &release_patches::MEC_ACCOUNTANT_IDENTITY,
+            &release_patches::MEC_GATE_SECURITY_ACCOUNTS,
+            &release_patches::MEC_CANTEEN_CAPTAIN_ACCOUNTS,
+            &release_patches::MEC_LIBRARIAN_STATIONERY_ACCOUNTS,
+        ] {
+            release_patches::apply_once(control_database.pool(), patch)
+                .await
+                .with_context(|| format!("failed to apply release patch {}", patch.key))?;
+        }
         sqlx::raw_sql(include_str!(
             "../../../migrations/runtime/0084_announcement_format.sql"
         ))
@@ -322,10 +314,10 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(control_database.pool())
         .await
         .context("failed to grant library lending app access")?;
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/runtime/0095_restore_mec_user_identities.sql"
-        ))
-        .execute(control_database.pool())
+        release_patches::apply_once(
+            control_database.pool(),
+            &release_patches::MEC_IDENTITY_RESTORE,
+        )
         .await
         .context("failed to restore canonical MEC identities in the control plane")?;
         sqlx::raw_sql(include_str!(
@@ -490,12 +482,9 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(mec_database.pool())
         .await
         .context("failed to grant MEC library lending app access")?;
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/runtime/0095_restore_mec_user_identities.sql"
-        ))
-        .execute(mec_database.pool())
-        .await
-        .context("failed to restore canonical MEC identities in the tenant database")?;
+        release_patches::apply_once(mec_database.pool(), &release_patches::MEC_IDENTITY_RESTORE)
+            .await
+            .context("failed to restore canonical MEC identities in the tenant database")?;
         sqlx::raw_sql(include_str!(
             "../../../migrations/runtime/0097_geofence_qr_lifecycle.sql"
         ))
@@ -549,6 +538,7 @@ pub async fn run() -> anyhow::Result<()> {
     // Payment requests and online payment tracking grants (idempotent).
     if let Some(control) = state.database() {
         payment_requests::ensure_permissions(control.pool()).await;
+        release_patches::ensure_user_delete_permission(control.pool()).await;
     }
     if platform_admin::seed_platform_admin_from_environment(&state).await? {
         tracing::info!("platform administrator synchronized from environment");

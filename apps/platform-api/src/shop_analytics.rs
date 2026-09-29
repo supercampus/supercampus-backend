@@ -1,5 +1,5 @@
 //! One shop's sales, cost, profit and counter-staff performance over an
-//! explicit date range — the owner workspace's "Sales & Profit" tab.
+//! explicit date range — the owner workspace's "Sales" destination.
 //!
 //! `GET /canteen/shop-analytics?shop=<key>&from=YYYY-MM-DD&to=YYYY-MM-DD`
 //!
@@ -12,11 +12,18 @@
 //!   item has since been deleted is costed at its selling price, so it never
 //!   reports profit that cannot be traced to a configured cost.
 //! * Staff performance is attributed by `canteen_orders.handled_by` — the
-//!   account that last moved the order. Every active captain assigned to the
-//!   shop is listed, including those with no orders in the range; anyone else
-//!   who handled an order (an owner, or a captain since unassigned) follows.
+//!   account that last moved the order. Every active account the admin has
+//!   assigned to the shop as a captain (Vendors & shops → Counter staff) is
+//!   listed, including those with no orders in the range; anyone else who
+//!   handled an order (an owner, or a captain since unassigned) follows.
+//!   Deactivated and deleted accounts are never listed; the orders they moved
+//!   still count in the shop's totals.
+//!
+//! Adding `captain=<userId>` (with optional `page` and `pageSize`) returns
+//! that person's detail for the same range under `captainDetail`: their
+//! figures, a per-day series and every order they handled, paginated.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use axum::{
     Extension, Json,
@@ -52,14 +59,31 @@ const TENANT_TIMEZONE: &str = "Asia/Kolkata";
 /// The longest range one request may cover (two years, leap day included).
 const MAX_RANGE_DAYS: i64 = 731;
 
-/// Most recent orders listed under each staff member.
+/// Most recent orders listed under each staff member in the overview.
 const RECENT_PER_STAFF: usize = 10;
 
+/// Orders per page of a captain's detail, by default and at most.
+const DEFAULT_PAGE_SIZE: usize = 20;
+const MAX_PAGE_SIZE: usize = 100;
+
+/// An account that is switched off or was deleted (see `user_deletion`).
+/// Deletion tombstones the row: inactive, with a `deleted+…@deleted.invalid`
+/// placeholder address and `profile.deleted = true`.
+const LIVE_ACCOUNT_SQL: &str = "u.active \
+     AND lower(COALESCE(u.email, '')) NOT LIKE 'deleted+%@deleted.invalid' \
+     AND COALESCE(u.profile->>'deleted', 'false') <> 'true'";
+
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ShopAnalyticsQuery {
     shop: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    /// Adds this staff member's detail (`captainDetail`) to the report.
+    captain: Option<String>,
+    page: Option<usize>,
+    #[serde(alias = "page_size")]
+    page_size: Option<usize>,
 }
 
 pub(crate) async fn shop_analytics(
@@ -107,50 +131,67 @@ pub(crate) async fn shop_analytics(
     .ok_or_else(|| ApiError::NotFound("Shop not found".into()))?;
 
     let orders = shop_orders(pool, tenant, &shop_key, range).await?;
-    // Only real people are ranked; orders a demo account moved still count
-    // in the shop's totals.
-    let (demo_staff, staff): (Vec<StaffMember>, Vec<StaffMember>) =
-        shop_staff(pool, tenant, &shop_key)
-            .await?
-            .into_iter()
-            .partition(|member| {
-                is_demo_account(member.email.as_deref(), member.assigned_by.as_deref())
-            });
-    let mut hidden: std::collections::HashSet<String> = demo_staff
-        .iter()
-        .flat_map(|member| {
-            std::iter::once(member.assignment_user_id.clone()).chain(member.identity_id.clone())
-        })
-        .collect();
+    let staff = shop_staff(pool, tenant, &shop_key).await?;
     let unknown: Vec<String> = orders
         .iter()
         .filter_map(|order| order.handled_by.clone())
-        .filter(|id| !staff.iter().any(|member| member.matches(id)) && !hidden.contains(id))
-        .collect::<std::collections::BTreeSet<_>>()
+        .filter(|id| !staff.iter().any(|member| member.matches(id)))
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let others = if unknown.is_empty() {
-        HashMap::new()
-    } else {
-        sqlx::query_as::<_, (String, String, Option<String>)>(
-            "SELECT id::text, display_name, email FROM identity.users WHERE id::text = ANY($1)",
+    let mut hidden = HashSet::new();
+    let mut others = HashMap::new();
+    if !unknown.is_empty() {
+        let rows = sqlx::query_as::<_, (String, String, Option<String>, bool, Option<DateTime<Utc>>)>(
+            &format!(
+                "SELECT u.id::text, COALESCE(NULLIF(trim(u.display_name), ''), u.email, u.id::text), \
+                        u.email, ({LIVE_ACCOUNT_SQL}) AS live, u.last_login_at \
+                 FROM identity.users u WHERE u.id::text = ANY($1)"
+            ),
         )
         .bind(&unknown)
         .fetch_all(pool)
-        .await?
-        .into_iter()
-        .filter(|(id, _, email)| {
-            let demo = is_demo_account(email.as_deref(), None);
-            if demo {
-                hidden.insert(id.clone());
+        .await?;
+        for (id, name, email, live, last_login) in rows {
+            if live {
+                others.insert(
+                    id,
+                    OtherHandler {
+                        name,
+                        email,
+                        last_login,
+                    },
+                );
+            } else {
+                // Deactivated or deleted: not listed, still in the totals.
+                hidden.insert(id);
             }
-            !demo
-        })
-        .map(|(id, name, email)| (id, (name, email)))
-        .collect()
-    };
+        }
+    }
 
-    let mut body = build_report(&orders, &staff, &others, &hidden);
+    let rows = staff_rows(&orders, &staff, &others, &hidden);
+    let mut body = build_report(&orders, &rows);
+    if let Some(captain) = query
+        .captain
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let row = rows
+            .iter()
+            .find(|row| row.user_id == captain || row.aliases.iter().any(|alias| alias == captain))
+            .ok_or_else(|| {
+                ApiError::NotFound("That staff member has no record at this shop".into())
+            })?;
+        body["captainDetail"] = captain_detail(
+            row,
+            range,
+            total_revenue(&orders),
+            query.page.unwrap_or(1),
+            query.page_size.unwrap_or(DEFAULT_PAGE_SIZE),
+            &shop.0,
+        );
+    }
     body["shop"] = json!({ "shopKey": shop.0, "name": shop.1, "category": shop.2 });
     body["range"] = json!({
         "from": range.from.to_string(),
@@ -215,6 +256,11 @@ struct OrderFact {
     total: f64,
     cost: f64,
     items: i64,
+    /// The calendar day it was placed, in the tenant's time zone.
+    day: NaiveDate,
+    fulfilment_mode: String,
+    token_number: Option<i32>,
+    lines: Value,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -237,43 +283,36 @@ impl OrderFact {
     }
     /// Placement to hand-over, for completed orders.
     fn handling_minutes(&self) -> Option<f64> {
-        self.is_completed().then(|| {
-            ((self.updated_at - self.created_at).num_seconds().max(0) as f64) / 60.0
-        })
+        self.is_completed()
+            .then(|| ((self.updated_at - self.created_at).num_seconds().max(0) as f64) / 60.0)
     }
 }
 
-/// An active operator assignment of the shop.
+/// A live account actively assigned to the shop.
 #[derive(Debug, Clone, PartialEq)]
 struct StaffMember {
-    /// `shop_user_assignments.user_id` as stored.
+    /// `shop_user_assignments.user_id` as stored (an id, or a legacy email).
     assignment_user_id: String,
-    /// The matching `identity.users` id, when the account exists.
-    identity_id: Option<String>,
+    /// The account's `identity.users` id.
+    identity_id: String,
     role: String,
     name: String,
     email: Option<String>,
-    /// Who made the assignment: a user id, or a seed/migration marker.
-    assigned_by: Option<String>,
-}
-
-/// Demo accounts are not people: the seed's sample captains live on the
-/// reserved `.local` domain, which cannot receive mail, and their
-/// assignments are stamped by the seed or a migration rather than by a user.
-fn is_demo_account(email: Option<&str>, assigned_by: Option<&str>) -> bool {
-    let demo_email = email
-        .map(|e| e.trim().to_ascii_lowercase().ends_with(".local"))
-        .unwrap_or(false);
-    let seeded = assigned_by
-        .map(|by| by.contains("seed") || by.starts_with("runtime-migration"))
-        .unwrap_or(false);
-    demo_email || seeded
+    last_login: Option<DateTime<Utc>>,
 }
 
 impl StaffMember {
     fn matches(&self, handler: &str) -> bool {
-        self.assignment_user_id == handler || self.identity_id.as_deref() == Some(handler)
+        self.assignment_user_id == handler || self.identity_id == handler
     }
+}
+
+/// Someone who handled an order without being assigned to the shop.
+#[derive(Debug, Clone, PartialEq)]
+struct OtherHandler {
+    name: String,
+    email: Option<String>,
+    last_login: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -358,6 +397,14 @@ fn round_one(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
 
+fn total_revenue(orders: &[OrderFact]) -> f64 {
+    orders
+        .iter()
+        .filter(|order| order.is_completed())
+        .map(|order| order.total)
+        .sum()
+}
+
 fn order_json(order: &OrderFact) -> Value {
     json!({
         "id": order.id,
@@ -373,43 +420,59 @@ fn order_json(order: &OrderFact) -> Value {
     })
 }
 
-/// Rolls the range's orders up for the shop and per staff member. `orders`
-/// are newest first; `others` names handlers who are not assigned staff.
-fn build_report(
-    orders: &[OrderFact],
-    staff: &[StaffMember],
-    others: &HashMap<String, (String, Option<String>)>,
-    hidden: &std::collections::HashSet<String>,
-) -> Value {
-    let mut summary = Totals::default();
-    for order in orders {
-        summary.add(order);
-    }
-    let unattributed = orders.iter().filter(|o| o.handled_by.is_none()).count();
+/// Everything the order detail page shows, in the shape the canteen order
+/// endpoints use, plus the analytics figures.
+fn detailed_order_json(order: &OrderFact, handler_name: &str, shop_key: &str) -> Value {
+    let mut value = order_json(order);
+    value["lines"] = order.lines.clone();
+    value["fulfilmentMode"] = json!(order.fulfilment_mode);
+    value["tokenNumber"] = json!(order.token_number);
+    value["captainName"] = json!(handler_name);
+    value["shopKey"] = json!(shop_key);
+    value
+}
 
-    struct Row<'a> {
-        user_id: String,
-        name: String,
-        email: Option<String>,
-        role: Option<String>,
-        assigned: bool,
-        totals: Totals,
-        recent: Vec<&'a OrderFact>,
-        last_handled: Option<DateTime<Utc>>,
-    }
-    let mut rows: Vec<Row> = staff
+/// One person's share of the range.
+struct StaffRow<'a> {
+    user_id: String,
+    /// Other ids the same person's orders may carry (a legacy assignment id).
+    aliases: Vec<String>,
+    name: String,
+    email: Option<String>,
+    role: Option<String>,
+    assigned: bool,
+    last_login: Option<DateTime<Utc>>,
+    totals: Totals,
+    /// Newest first.
+    orders: Vec<&'a OrderFact>,
+    last_handled: Option<DateTime<Utc>>,
+}
+
+/// Credits the range's orders (newest first) to the shop's staff. Every
+/// assigned captain is kept, idle or not; anyone else only when they handled
+/// an order. Hidden (deactivated or deleted) handlers are left out.
+fn staff_rows<'a>(
+    orders: &'a [OrderFact],
+    staff: &[StaffMember],
+    others: &HashMap<String, OtherHandler>,
+    hidden: &HashSet<String>,
+) -> Vec<StaffRow<'a>> {
+    let mut rows: Vec<StaffRow> = staff
         .iter()
-        .map(|member| Row {
-            user_id: member
-                .identity_id
-                .clone()
-                .unwrap_or_else(|| member.assignment_user_id.clone()),
+        .map(|member| StaffRow {
+            user_id: member.identity_id.clone(),
+            aliases: if member.assignment_user_id == member.identity_id {
+                Vec::new()
+            } else {
+                vec![member.assignment_user_id.clone()]
+            },
             name: member.name.clone(),
             email: member.email.clone(),
             role: Some(member.role.clone()),
             assigned: true,
+            last_login: member.last_login,
             totals: Totals::default(),
-            recent: Vec::new(),
+            orders: Vec::new(),
             last_handled: None,
         })
         .collect();
@@ -418,27 +481,30 @@ fn build_report(
         let Some(handler) = order.handled_by.as_deref() else {
             continue;
         };
-        // Demo accounts are not ranked; their orders stay in the totals.
         if hidden.contains(handler) {
             continue;
         }
         let index = match staff.iter().position(|member| member.matches(handler)) {
             Some(index) => index,
-            None => match rows.iter().position(|row| !row.assigned && row.user_id == handler) {
+            None => match rows
+                .iter()
+                .position(|row| !row.assigned && row.user_id == handler)
+            {
                 Some(index) => index,
                 None => {
-                    let (name, email) = others
-                        .get(handler)
-                        .cloned()
-                        .unwrap_or_else(|| ("Former staff".into(), None));
-                    rows.push(Row {
+                    let other = others.get(handler);
+                    rows.push(StaffRow {
                         user_id: handler.to_owned(),
-                        name,
-                        email,
+                        aliases: Vec::new(),
+                        name: other
+                            .map(|o| o.name.clone())
+                            .unwrap_or_else(|| "Former staff".into()),
+                        email: other.and_then(|o| o.email.clone()),
                         role: None,
                         assigned: false,
+                        last_login: other.and_then(|o| o.last_login),
                         totals: Totals::default(),
-                        recent: Vec::new(),
+                        orders: Vec::new(),
                         last_handled: None,
                     });
                     rows.len() - 1
@@ -447,15 +513,13 @@ fn build_report(
         };
         let row = &mut rows[index];
         row.totals.add(order);
-        if row.recent.len() < RECENT_PER_STAFF {
-            row.recent.push(order);
-        }
+        row.orders.push(order);
         row.last_handled = row.last_handled.max(Some(order.updated_at));
     }
 
     // Captains first — every one of them, even idle — then owners and anyone
     // else who handled orders; busiest first within each group.
-    let rank = |row: &Row| match row.role.as_deref() {
+    let rank = |row: &StaffRow| match row.role.as_deref() {
         Some("captain") => 0,
         Some(_) => 1,
         None => 2,
@@ -468,25 +532,98 @@ fn build_report(
             .then(b.totals.orders.cmp(&a.totals.orders))
             .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
+    rows
+}
 
+fn row_json(row: &StaffRow, total_revenue: f64) -> Value {
+    let mut value = row.totals.json(total_revenue);
+    value["userId"] = json!(row.user_id);
+    value["name"] = json!(row.name);
+    value["email"] = json!(row.email);
+    value["role"] = json!(row.role);
+    value["assigned"] = json!(row.assigned);
+    value["lastHandledAt"] = json!(row.last_handled);
+    value["lastSeenAt"] = json!(row.last_login);
+    value["recentOrders"] = Value::Array(
+        row.orders
+            .iter()
+            .take(RECENT_PER_STAFF)
+            .map(|o| order_json(o))
+            .collect(),
+    );
+    value
+}
+
+/// Rolls the range's orders up for the shop and per staff member.
+fn build_report(orders: &[OrderFact], rows: &[StaffRow]) -> Value {
+    let mut summary = Totals::default();
+    for order in orders {
+        summary.add(order);
+    }
+    let unattributed = orders.iter().filter(|o| o.handled_by.is_none()).count();
     let captains: Vec<Value> = rows
         .iter()
-        .map(|row| {
-            let mut value = row.totals.json(summary.revenue);
-            value["userId"] = json!(row.user_id);
-            value["name"] = json!(row.name);
-            value["email"] = json!(row.email);
-            value["role"] = json!(row.role);
-            value["assigned"] = json!(row.assigned);
-            value["lastHandledAt"] = json!(row.last_handled);
-            value["recentOrders"] = Value::Array(row.recent.iter().map(|o| order_json(o)).collect());
-            value
-        })
+        .map(|row| row_json(row, summary.revenue))
         .collect();
-
     let mut summary_json = summary.json(summary.revenue);
     summary_json["unattributedOrders"] = json!(unattributed);
     json!({ "summary": summary_json, "captains": captains })
+}
+
+/// One person's figures, a day-by-day series across the whole range (idle
+/// days included) and one page of every order they handled, newest first.
+fn captain_detail(
+    row: &StaffRow,
+    range: DateRange,
+    total_revenue: f64,
+    page: usize,
+    page_size: usize,
+    shop_key: &str,
+) -> Value {
+    let mut days: Vec<(NaiveDate, Totals)> = range
+        .from
+        .iter_days()
+        .take_while(|day| *day <= range.to)
+        .map(|day| (day, Totals::default()))
+        .collect();
+    for order in &row.orders {
+        if let Ok(index) = days.binary_search_by(|(day, _)| day.cmp(&order.day)) {
+            days[index].1.add(order);
+        }
+    }
+    let daily: Vec<Value> = days
+        .iter()
+        .map(|(day, totals)| {
+            json!({
+                "date": day.to_string(),
+                "orders": totals.orders,
+                "completedOrders": totals.completed,
+                "revenue": round_money(totals.revenue),
+                "profit": round_money(totals.profit()),
+            })
+        })
+        .collect();
+
+    let page_size = page_size.clamp(1, MAX_PAGE_SIZE);
+    let total = row.orders.len();
+    let total_pages = total.div_ceil(page_size).max(1);
+    let page = page.clamp(1, total_pages);
+    let orders: Vec<Value> = row
+        .orders
+        .iter()
+        .skip((page - 1) * page_size)
+        .take(page_size)
+        .map(|order| detailed_order_json(order, &row.name, shop_key))
+        .collect();
+
+    let mut value = row_json(row, total_revenue);
+    value["daily"] = Value::Array(daily);
+    value["orders"] = Value::Array(orders);
+    value["page"] = json!(page);
+    value["pageSize"] = json!(page_size);
+    value["totalOrders"] = json!(total);
+    value["totalPages"] = json!(total_pages);
+    value
 }
 
 async fn shop_orders(
@@ -497,6 +634,7 @@ async fn shop_orders(
 ) -> ApiResult<Vec<OrderFact>> {
     // Orders whose `store` predates the shop register resolve to the shop of
     // the matching category, exactly as ordering and the sales dashboard do.
+    #[allow(clippy::type_complexity)]
     let rows = sqlx::query_as::<
         _,
         (
@@ -508,6 +646,10 @@ async fn shop_orders(
             f64,
             f64,
             i64,
+            NaiveDate,
+            String,
+            Option<i32>,
+            Value,
             DateTime<Utc>,
             DateTime<Utc>,
         ),
@@ -516,6 +658,7 @@ async fn shop_orders(
           SELECT o.id, o.order_number, o.customer_name, o.status, o.handled_by,
                  o.total::float8 AS total,
                  CASE WHEN jsonb_typeof(o.lines)='array' THEN o.lines ELSE '[]'::jsonb END AS lines,
+                 o.fulfilment_mode, o.token_number,
                  o.created_at, o.updated_at
           FROM campus_ops.canteen_orders o
           LEFT JOIN campus_ops.shops exact ON exact.tenant_id=o.tenant_id AND exact.shop_key=o.store
@@ -542,6 +685,8 @@ async fn shop_orders(
               ON mi.tenant_id=$1 AND mi.id::text = l.value->>'itemId'), 0)::float8 AS cost,
           COALESCE((SELECT sum(COALESCE(NULLIF(l.value->>'quantity','')::float8, 1))
             FROM jsonb_array_elements(x.lines) l), 0)::int8 AS items,
+          (x.created_at AT TIME ZONE $3)::date AS day,
+          x.fulfilment_mode, x.token_number, x.lines,
           x.created_at, x.updated_at
         FROM scoped x
         ORDER BY x.created_at DESC"#,
@@ -564,31 +709,52 @@ async fn shop_orders(
             total: r.5,
             cost: r.6,
             items: r.7,
-            created_at: r.8,
-            updated_at: r.9,
+            day: r.8,
+            fulfilment_mode: r.9,
+            token_number: r.10,
+            lines: r.11,
+            created_at: r.12,
+            updated_at: r.13,
         })
         .collect())
 }
 
+/// Exactly the live accounts the admin has actively assigned to the shop.
+/// An assignment names its account by id or, on older rows, by email.
 async fn shop_staff(
     pool: &sqlx::PgPool,
     tenant: Uuid,
     shop_key: &str,
 ) -> ApiResult<Vec<StaffMember>> {
-    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, Option<String>, Option<String>)>(
-        r#"SELECT a.user_id, a.assignment_role, u.id::text,
-             COALESCE(NULLIF(trim(u.display_name), ''), u.email, a.user_id), u.email, a.assigned_by
+    #[allow(clippy::type_complexity)]
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<DateTime<Utc>>,
+        ),
+    >(&format!(
+        r#"SELECT DISTINCT ON (u.id)
+             a.user_id, a.assignment_role, u.id::text,
+             COALESCE(NULLIF(trim(u.display_name), ''), u.email, a.user_id), u.email,
+             u.last_login_at
            FROM campus_ops.shop_user_assignments a
            JOIN campus_ops.shops s ON s.tenant_id=a.tenant_id AND s.id=a.shop_id
-           LEFT JOIN identity.users u ON u.id::text=a.user_id
+           JOIN identity.users u
+             ON u.id::text=a.user_id OR lower(u.email)=lower(a.user_id)
            WHERE a.tenant_id=$1 AND s.shop_key=$2 AND a.is_active
-           ORDER BY a.assignment_role, 4"#,
-    )
+             AND {LIVE_ACCOUNT_SQL}
+           ORDER BY u.id, CASE a.assignment_role WHEN 'captain' THEN 0 ELSE 1 END"#
+    ))
     .bind(tenant)
     .bind(shop_key)
     .fetch_all(pool)
     .await?;
-    Ok(rows
+    let mut staff: Vec<StaffMember> = rows
         .into_iter()
         .map(|r| StaffMember {
             assignment_user_id: r.0,
@@ -596,9 +762,15 @@ async fn shop_staff(
             identity_id: r.2,
             name: r.3,
             email: r.4,
-            assigned_by: r.5,
+            last_login: r.5,
         })
-        .collect())
+        .collect();
+    staff.sort_by(|a, b| {
+        a.role
+            .cmp(&b.role)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(staff)
 }
 
 #[cfg(test)]
@@ -610,8 +782,26 @@ mod tests {
         NaiveDate::parse_from_str(raw, "%Y-%m-%d").unwrap()
     }
 
-    fn order(handler: Option<&str>, status: &str, total: f64, cost: f64, minutes: i64) -> OrderFact {
-        let created = Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap();
+    fn order(
+        handler: Option<&str>,
+        status: &str,
+        total: f64,
+        cost: f64,
+        minutes: i64,
+    ) -> OrderFact {
+        order_on("2026-09-01", handler, status, total, cost, minutes)
+    }
+
+    fn order_on(
+        on: &str,
+        handler: Option<&str>,
+        status: &str,
+        total: f64,
+        cost: f64,
+        minutes: i64,
+    ) -> OrderFact {
+        let placed = day(on);
+        let created = Utc.from_utc_datetime(&placed.and_hms_opt(5, 0, 0).unwrap());
         OrderFact {
             id: Uuid::new_v4(),
             order_number: 1,
@@ -621,6 +811,10 @@ mod tests {
             total,
             cost,
             items: 2,
+            day: placed,
+            fulfilment_mode: "pickup".into(),
+            token_number: None,
+            lines: json!([{ "itemId": "dosa", "name": "Dosa", "price": total, "quantity": 2 }]),
             created_at: created,
             updated_at: created + chrono::Duration::minutes(minutes),
         }
@@ -629,23 +823,21 @@ mod tests {
     fn member(id: &str, role: &str, name: &str) -> StaffMember {
         StaffMember {
             assignment_user_id: id.into(),
-            identity_id: Some(id.into()),
+            identity_id: id.into(),
             role: role.into(),
             name: name.into(),
-            email: None,
-            assigned_by: None,
+            email: Some(format!("{}@mec.local", name.to_lowercase())),
+            last_login: None,
         }
     }
 
-    #[test]
-    fn demo_accounts_are_not_ranked_as_captains() {
-        assert!(is_demo_account(Some("canteen.captain1@mec.local"), None));
-        assert!(is_demo_account(Some("shashi@gmail.com"), Some("mec-seed")));
-        assert!(is_demo_account(None, Some("runtime-migration-0076")));
-        assert!(!is_demo_account(
-            Some("shashi@gmail.com"),
-            Some("3f1c2a9e-8d5b-4c6f-9a1e-2b7d4c8e9f01"),
-        ));
+    fn report(
+        orders: &[OrderFact],
+        staff: &[StaffMember],
+        others: &HashMap<String, OtherHandler>,
+        hidden: &HashSet<String>,
+    ) -> Value {
+        build_report(orders, &staff_rows(orders, staff, others, hidden))
     }
 
     #[test]
@@ -653,17 +845,66 @@ mod tests {
         let today = day("2026-09-28");
         assert_eq!(
             DateRange::parse(None, None, today).unwrap(),
-            DateRange { from: today, to: today }
+            DateRange {
+                from: today,
+                to: today
+            }
         );
         let range = DateRange::parse(Some("2026-09-01"), Some("2026-09-30"), today).unwrap();
         assert_eq!(range.days(), 30);
         assert_eq!(
-            DateRange::parse(Some("2026-09-05"), None, today).unwrap().days(),
+            DateRange::parse(Some("2026-09-05"), None, today)
+                .unwrap()
+                .days(),
             1
         );
         assert!(DateRange::parse(Some("2026-09-30"), Some("2026-09-01"), today).is_err());
         assert!(DateRange::parse(Some("30/09/2026"), None, today).is_err());
         assert!(DateRange::parse(Some("2020-01-01"), Some("2026-01-01"), today).is_err());
+    }
+
+    #[test]
+    fn assigned_mec_local_captains_are_listed_like_anyone_else() {
+        // The admin's Counter staff list is the membership: an address on the
+        // campus's own `.local` domain is a real captain, not a demo.
+        let staff = vec![
+            member("kesava", "captain", "Kesava"),
+            member("purusoth", "captain", "Purusoth"),
+            member("shashi", "captain", "Shashi"),
+            member("yuvaraj", "captain", "Yuvaraj"),
+        ];
+        let orders = vec![order(Some("shashi"), "completed", 80.0, 50.0, 12)];
+        let report = report(&orders, &staff, &HashMap::new(), &HashSet::new());
+        let captains = report["captains"].as_array().unwrap();
+        let names: Vec<&str> = captains
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Shashi", "Kesava", "Purusoth", "Yuvaraj"]);
+        assert_eq!(captains[0]["email"], "shashi@mec.local");
+        assert!(captains.iter().all(|c| c["assigned"] == true));
+    }
+
+    #[test]
+    fn deactivated_handlers_are_not_ranked_but_stay_in_the_totals() {
+        let staff = vec![member("cap-a", "captain", "Anu")];
+        let orders = vec![
+            order(Some("cap-a"), "completed", 100.0, 60.0, 10),
+            order(Some("deleted-one"), "completed", 40.0, 20.0, 10),
+        ];
+        let hidden: HashSet<String> = ["deleted-one".to_string()].into();
+        let report = report(&orders, &staff, &HashMap::new(), &hidden);
+        assert_eq!(report["summary"]["revenue"], 140.0);
+        let captains = report["captains"].as_array().unwrap();
+        assert_eq!(captains.len(), 1);
+        assert_eq!(captains[0]["name"], "Anu");
+    }
+
+    #[test]
+    fn no_assignments_means_no_captains() {
+        let report = report(&[], &[], &HashMap::new(), &HashSet::new());
+        assert!(report["captains"].as_array().unwrap().is_empty());
+        assert_eq!(report["summary"]["orders"], 0);
     }
 
     #[test]
@@ -681,8 +922,15 @@ mod tests {
             order(None, "pending", 25.0, 10.0, 0),
         ];
         let mut others = HashMap::new();
-        others.insert("gone".to_string(), ("Chitra".to_string(), None));
-        let report = build_report(&orders, &staff, &others, &Default::default());
+        others.insert(
+            "gone".to_string(),
+            OtherHandler {
+                name: "Chitra".into(),
+                email: None,
+                last_login: None,
+            },
+        );
+        let report = report(&orders, &staff, &others, &HashSet::new());
 
         let summary = &report["summary"];
         assert_eq!(summary["orders"], 5);
@@ -695,7 +943,10 @@ mod tests {
         assert_eq!(summary["unattributedOrders"], 1);
 
         let captains = report["captains"].as_array().unwrap();
-        let names: Vec<&str> = captains.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = captains
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
         // Idle Bala is still listed; the idle owner is not; the unassigned
         // handler follows the captains.
         assert_eq!(names, ["Anu", "Bala", "Chitra"]);
@@ -719,21 +970,68 @@ mod tests {
     #[test]
     fn handler_ids_match_either_the_assignment_or_the_identity_id() {
         let staff = vec![StaffMember {
-            assignment_user_id: "legacy-id".into(),
-            identity_id: Some("uuid-1".into()),
+            assignment_user_id: "dev@mec.local".into(),
+            identity_id: "uuid-1".into(),
             role: "captain".into(),
             name: "Dev".into(),
-            email: None,
-            assigned_by: None,
+            email: Some("dev@mec.local".into()),
+            last_login: None,
         }];
         let orders = vec![
             order(Some("uuid-1"), "completed", 10.0, 5.0, 3),
-            order(Some("legacy-id"), "completed", 20.0, 5.0, 3),
+            order(Some("dev@mec.local"), "completed", 20.0, 5.0, 3),
         ];
-        let report = build_report(&orders, &staff, &HashMap::new(), &Default::default());
+        let report = report(&orders, &staff, &HashMap::new(), &HashSet::new());
         let captains = report["captains"].as_array().unwrap();
         assert_eq!(captains.len(), 1);
         assert_eq!(captains[0]["orders"], 2);
         assert_eq!(captains[0]["userId"], "uuid-1");
+    }
+
+    #[test]
+    fn captain_detail_has_a_daily_series_and_paginated_orders() {
+        let staff = vec![member("cap-a", "captain", "Anu")];
+        let mut orders = vec![
+            order_on("2026-09-03", Some("cap-a"), "completed", 100.0, 60.0, 10),
+            order_on("2026-09-03", Some("cap-a"), "rejected", 30.0, 10.0, 2),
+            order_on("2026-09-01", Some("cap-a"), "completed", 50.0, 20.0, 10),
+            order_on("2026-09-01", Some("other"), "completed", 50.0, 20.0, 10),
+        ];
+        // Newest first, as the query returns them.
+        orders.sort_by(|a, b| b.day.cmp(&a.day));
+        let rows = staff_rows(&orders, &staff, &HashMap::new(), &HashSet::new());
+        let anu = rows.iter().find(|row| row.user_id == "cap-a").unwrap();
+        let range = DateRange {
+            from: day("2026-09-01"),
+            to: day("2026-09-04"),
+        };
+
+        let detail = captain_detail(anu, range, total_revenue(&orders), 1, 2, "mec-canteen");
+        let daily = detail["daily"].as_array().unwrap();
+        assert_eq!(daily.len(), 4);
+        assert_eq!(daily[0]["date"], "2026-09-01");
+        assert_eq!(daily[0]["orders"], 1);
+        assert_eq!(daily[0]["revenue"], 50.0);
+        assert_eq!(daily[1]["orders"], 0);
+        assert_eq!(daily[2]["orders"], 2);
+        assert_eq!(daily[2]["completedOrders"], 1);
+        assert_eq!(daily[2]["revenue"], 100.0);
+        assert_eq!(daily[2]["profit"], 40.0);
+        assert_eq!(detail["totalOrders"], 3);
+        assert_eq!(detail["totalPages"], 2);
+        assert_eq!(detail["revenueShare"], 75.0);
+        let first = detail["orders"].as_array().unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0]["captainName"], "Anu");
+        assert_eq!(first[0]["shopKey"], "mec-canteen");
+        assert_eq!(first[0]["fulfilmentMode"], "pickup");
+        assert_eq!(first[0]["lines"][0]["name"], "Dosa");
+
+        let second = captain_detail(anu, range, total_revenue(&orders), 2, 2, "mec-canteen");
+        assert_eq!(second["page"], 2);
+        assert_eq!(second["orders"].as_array().unwrap().len(), 1);
+        // Out-of-range pages clamp to the last one.
+        let clamped = captain_detail(anu, range, total_revenue(&orders), 9, 2, "mec-canteen");
+        assert_eq!(clamped["page"], 2);
     }
 }

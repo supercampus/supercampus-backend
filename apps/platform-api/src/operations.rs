@@ -23,6 +23,8 @@ pub fn router() -> Router<AppState> {
         .merge(crate::library_lending::router())
         .merge(crate::support::router())
         .merge(crate::gate_security::router())
+        .merge(crate::payment_requests::router())
+        .merge(crate::push_broadcasts::router())
         .route("/changes", get(changes))
         .route("/notifications", get(notifications))
         .route("/notifications/read-all", post(read_all_notifications))
@@ -78,6 +80,10 @@ pub fn router() -> Router<AppState> {
             get(wallet_top_up_settings).put(update_wallet_top_up_settings),
         )
         .route("/canteen/wallets/{user_id}/top-ups", post(top_up_wallet))
+        .route(
+            "/canteen/wallets/{user_id}/deductions",
+            post(deduct_from_wallet),
+        )
         .route("/canteen/wallet-pin", post(set_wallet_pin).put(change_wallet_pin))
         .route("/canteen/wallet-pin/verify", post(verify_wallet_owner))
         .route("/canteen/staff-state", put(update_canteen_staff_state))
@@ -4458,6 +4464,260 @@ async fn top_up_wallet(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WalletDeductionRequest {
+    amount: f64,
+    shop_key: Option<String>,
+    reason: Option<String>,
+    idempotency_key: Option<String>,
+}
+
+const WALLET_DEDUCTION_REASON_MAX_CHARS: usize = 200;
+
+/// Checks an accountant deduction and returns the rounded amount and the
+/// trimmed reason. The balance is deliberately not consulted: a deduction may
+/// take a wallet below zero.
+fn validate_wallet_deduction(amount: f64, reason: Option<&str>) -> Result<(f64, String), String> {
+    if !amount.is_finite() || amount <= 0.0 || amount > 100000.0 {
+        return Err("Deduction amount must be greater than zero and at most 100000".into());
+    }
+    let amount = (amount * 100.0).round() / 100.0;
+    if amount <= 0.0 {
+        return Err("Deduction amount must be greater than zero".into());
+    }
+    let reason = reason.map(str::trim).unwrap_or_default();
+    if reason.is_empty() {
+        return Err("Give a reason for the deduction".into());
+    }
+    if reason.chars().count() > WALLET_DEDUCTION_REASON_MAX_CHARS {
+        return Err(format!(
+            "Keep the reason under {WALLET_DEDUCTION_REASON_MAX_CHARS} characters"
+        ));
+    }
+    Ok((amount, reason.to_owned()))
+}
+
+fn deduction_notification_body(amount: f64, store_name: &str, reason: &str) -> String {
+    let store = store_name.trim();
+    let store = if store.is_empty() { "campus" } else { store };
+    let store = store
+        .strip_suffix(" wallet")
+        .or_else(|| store.strip_suffix(" Wallet"))
+        .unwrap_or(store);
+    format!(
+        "₹{} was deducted from your {store} wallet: {}",
+        format_wallet_amount(amount),
+        reason.trim()
+    )
+}
+
+/// Lets store wallets go below zero and ledger accountant deductions.
+///
+/// Mirrors migrations/runtime/0115_wallet_manual_deductions.sql for databases
+/// the (stuck) migrator cannot reach. DDL locks the tables, so it runs once
+/// per tenant per process.
+async fn ensure_wallet_deduction_schema(pool: &sqlx::PgPool, tenant_key: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static READY: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let ready = READY.get_or_init(|| Mutex::new(HashSet::new()));
+    if ready
+        .lock()
+        .map(|set| set.contains(tenant_key))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let applied = sqlx::raw_sql(include_str!(
+        "../../../migrations/runtime/0115_wallet_manual_deductions.sql"
+    ))
+    .execute(pool)
+    .await;
+    match applied {
+        Ok(_) => {
+            if let Ok(mut set) = ready.lock() {
+                set.insert(tenant_key.to_owned());
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, tenant = tenant_key, "wallet deduction schema not applied");
+        }
+    }
+}
+
+/// Takes money out of a campus user's store wallet. Only the accountant
+/// (whoever may top wallets up) can do this, a reason is required and shown
+/// to the user, and the wallet may go negative. Purchases still refuse to
+/// spend below zero; see place_order and pay_laundry_charge.
+async fn deduct_from_wallet(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(user_id): Path<String>,
+    Json(input): Json<WalletDeductionRequest>,
+) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
+    require(&access, "canteen.wallet.top_up")?;
+    let (amount, reason) = validate_wallet_deduction(input.amount, input.reason.as_deref())
+        .map_err(ApiError::BadRequest)?;
+    let requested_shop = input
+        .shop_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("Choose which store wallet to deduct from".into()))?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let target_user_id = Uuid::parse_str(user_id.trim())
+        .map_err(|_| ApiError::BadRequest("Wallet user id is invalid".into()))?;
+    let person = wallet_people_for(
+        &state,
+        &db,
+        tenant,
+        &principal.student.tenant_id,
+        Some(target_user_id),
+    )
+    .await?
+    .into_iter()
+    .next()
+    .ok_or_else(|| ApiError::NotFound("No active campus user with this wallet was found".into()))?;
+    let (shop_key, shop_name) =
+        resolve_top_up_store(db.pool(), tenant, Some(requested_shop)).await?;
+    let target_user_id = person.user_id.to_lowercase();
+    let idempotency_key = input
+        .idempotency_key
+        .as_deref()
+        .and_then(|key| non_empty(Some(key)));
+    ensure_wallet_deduction_schema(db.pool(), &principal.student.tenant_id).await;
+    let mut tx = db.pool().begin().await?;
+    // Ledger first, exactly like a top-up: a retried request with the same
+    // idempotency key replays the original result and deducts nothing twice.
+    let transaction = sqlx::query_scalar::<_, Value>(
+        r#"INSERT INTO campus_ops.canteen_wallet_transactions
+             (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,
+              idempotency_key,actor_user_id)
+           VALUES($1,$2,$3,$4,'manual_debit',$5,NULL,$6,$7)
+           ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+           RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'amount',amount::float8,
+             'transactionType',transaction_type,'description',description,
+             'referenceId',reference_id,'actorUserId',actor_user_id,'createdAt',created_at)"#,
+    )
+    .bind(tenant)
+    .bind(&target_user_id)
+    .bind(&shop_key)
+    .bind(-amount)
+    .bind(&reason)
+    .bind(&idempotency_key)
+    .bind(&principal.student.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(transaction) = transaction else {
+        tx.rollback().await?;
+        let (existing, existing_user, existing_shop, existing_amount, existing_type) =
+            sqlx::query_as::<_, (Value, String, String, f64, String)>(
+                r#"SELECT jsonb_build_object('id',id,'shopKey',shop_key,'amount',amount::float8,
+                     'transactionType',transaction_type,'description',description,
+                     'referenceId',reference_id,'actorUserId',actor_user_id,
+                     'createdAt',created_at),
+                     user_id, shop_key, amount::float8, transaction_type
+                   FROM campus_ops.canteen_wallet_transactions
+                   WHERE tenant_id=$1 AND idempotency_key=$2"#,
+            )
+            .bind(tenant)
+            .bind(&idempotency_key)
+            .fetch_one(db.pool())
+            .await?;
+        if existing_type != "manual_debit"
+            || !existing_user.eq_ignore_ascii_case(&target_user_id)
+            || existing_shop != shop_key
+            || (existing_amount + amount).abs() > 0.004
+        {
+            return Err(ApiError::Conflict(
+                "This idempotency key was already used for a different wallet change".into(),
+            ));
+        }
+        let balance = sqlx::query_scalar::<_, f64>(
+            "SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 AND shop_key=$3",
+        )
+        .bind(tenant)
+        .bind(&target_user_id)
+        .bind(&shop_key)
+        .fetch_optional(db.pool())
+        .await?
+        .unwrap_or(0.0);
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::new(json!({
+                "userId": target_user_id,
+                "name": person.name,
+                "shopKey": shop_key,
+                "shopName": shop_name,
+                "balance": balance,
+                "transaction": existing,
+                "replayed": true,
+            }))),
+        ));
+    };
+    let balance = sqlx::query_scalar::<_, f64>(
+        r#"INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version)
+           VALUES($1,$2,$3,$4,1)
+           ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET
+             balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,
+             version=campus_ops.canteen_wallets.version+1,
+             updated_at=now()
+           RETURNING balance::float8"#,
+    )
+    .bind(tenant)
+    .bind(&target_user_id)
+    .bind(&shop_key)
+    .bind(-amount)
+    .fetch_one(&mut *tx)
+    .await?;
+    let payload = json!({
+        "userId": target_user_id,
+        "name": person.name,
+        "shopKey": shop_key,
+        "shopName": shop_name,
+        "balance": balance,
+        "previousBalance": ((balance + amount) * 100.0).round() / 100.0,
+        "reason": reason,
+        "transaction": transaction,
+        "replayed": false,
+    });
+    emit_tx(
+        &mut tx,
+        tenant,
+        "canteen",
+        "wallet",
+        &target_user_id,
+        "wallet.debited",
+        &principal.student.id,
+        &payload,
+    )
+    .await?;
+    notify_tx(
+        &mut tx,
+        tenant,
+        Some(&target_user_id),
+        None,
+        "canteen",
+        "Wallet debited",
+        &deduction_notification_body(amount, &shop_name, &reason),
+        &payload,
+    )
+    .await?;
+    tx.commit().await?;
+    publish_operation_change(
+        &state,
+        &principal.student.tenant_id,
+        "canteen",
+        "wallet",
+        &target_user_id,
+        "wallet.debited",
+    );
+    Ok((StatusCode::CREATED, Json(ApiResponse::new(payload))))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StaffStateRequest {
     mode: String,
     shop_open: Option<bool>,
@@ -8373,6 +8633,7 @@ pub(crate) async fn notify_tx(
     };
     let event_type = match title {
         "Wallet credited" => "wallet.credited",
+        "Wallet debited" => "wallet.debited",
         "Order rejected and refunded" => "canteen.order.refunded",
         "Order updated" => "canteen.order.updated",
         "Gatepass updated" => "gatepass.request.decided",
@@ -9046,6 +9307,52 @@ mod tests {
             top_up_notification_body(10.0, " "),
             "₹10 was added to your campus wallet"
         );
+    }
+
+    #[test]
+    fn wallet_deduction_requires_a_positive_amount_and_a_reason() {
+        assert_eq!(
+            validate_wallet_deduction(50.0, Some("  Lost library card fine ")),
+            Ok((50.0, "Lost library card fine".to_owned()))
+        );
+        assert_eq!(
+            validate_wallet_deduction(12.345, Some("Correction")).map(|(amount, _)| amount),
+            Ok(12.35)
+        );
+        assert!(validate_wallet_deduction(0.0, Some("Correction")).is_err());
+        assert!(validate_wallet_deduction(-5.0, Some("Correction")).is_err());
+        assert!(validate_wallet_deduction(f64::NAN, Some("Correction")).is_err());
+        assert!(validate_wallet_deduction(100000.01, Some("Correction")).is_err());
+        assert!(validate_wallet_deduction(0.001, Some("Correction")).is_err());
+        assert!(validate_wallet_deduction(10.0, None).is_err());
+        assert!(validate_wallet_deduction(10.0, Some("   ")).is_err());
+        assert!(validate_wallet_deduction(10.0, Some(&"x".repeat(201))).is_err());
+        assert!(validate_wallet_deduction(10.0, Some(&"x".repeat(200))).is_ok());
+    }
+
+    #[test]
+    fn wallet_deduction_notification_names_store_and_reason() {
+        assert_eq!(
+            deduction_notification_body(50.0, "Campus Canteen", " Broken plate "),
+            "₹50 was deducted from your Campus Canteen wallet: Broken plate"
+        );
+        assert_eq!(
+            deduction_notification_body(9.5, "Laundry Wallet", "Correction"),
+            "₹9.50 was deducted from your Laundry wallet: Correction"
+        );
+    }
+
+    #[test]
+    fn wallet_deduction_migration_lifts_the_balance_floor_and_allows_manual_debits() {
+        let sql = include_str!("../../../migrations/runtime/0115_wallet_manual_deductions.sql");
+        assert!(sql.contains("ILIKE '%balance >=%'"));
+        assert!(sql.contains("'manual_debit'"));
+        for kind in ["manual_top_up", "online_top_up", "order_debit", "refund"] {
+            assert!(
+                sql.contains(&format!("'{kind}'")),
+                "{kind} must stay allowed"
+            );
+        }
     }
 
     #[test]

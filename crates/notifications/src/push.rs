@@ -159,38 +159,7 @@ impl FcmPushSender {
 impl PushSender for FcmPushSender {
     async fn send(&self, message: PushMessage) -> anyhow::Result<DeliveryOutcome> {
         let access_token = self.access_token().await?;
-        let mut data = HashMap::from([
-            ("category".to_owned(), message.category),
-            ("eventType".to_owned(), message.event_type),
-        ]);
-        if let Some(deep_link) = message.deep_link {
-            data.insert("deepLink".to_owned(), deep_link);
-        }
-        if let Value::Object(values) = message.data {
-            for (key, value) in values {
-                data.insert(
-                    key,
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| value.to_string()),
-                );
-            }
-        }
-        let android_priority = if matches!(message.priority.as_str(), "high" | "urgent") {
-            "high"
-        } else {
-            "normal"
-        };
-        let payload = json!({
-            "message": {
-                "token": message.token,
-                "notification": {"title": message.title, "body": message.body},
-                "data": data,
-                "android": {"priority": android_priority},
-                "apns": {"payload": {"aps": {"sound": "default"}}}
-            }
-        });
+        let payload = fcm_payload(message);
         let response = self
             .client
             .post(format!(
@@ -227,6 +196,73 @@ impl PushSender for FcmPushSender {
     }
 }
 
+/// The FCM HTTP v1 request body for one device.
+///
+/// An `imageUrl` in the notification data becomes the rich-notification image
+/// on every platform: `notification.image` (Android and iOS through FCM),
+/// `android.notification.image`, and `apns.fcm_options.image` with
+/// `mutable-content` so an iOS notification service extension can attach it.
+fn fcm_payload(message: PushMessage) -> Value {
+    let image_url = push_image_url(&message.data);
+    let mut data = HashMap::from([
+        ("category".to_owned(), message.category),
+        ("eventType".to_owned(), message.event_type),
+    ]);
+    if let Some(deep_link) = message.deep_link {
+        data.insert("deepLink".to_owned(), deep_link);
+    }
+    if let Value::Object(values) = message.data {
+        for (key, value) in values {
+            if value.is_null() {
+                continue;
+            }
+            data.insert(
+                key,
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string()),
+            );
+        }
+    }
+    let android_priority = if matches!(message.priority.as_str(), "high" | "urgent") {
+        "high"
+    } else {
+        "normal"
+    };
+    let mut notification = json!({"title": message.title, "body": message.body});
+    let mut android = json!({"priority": android_priority});
+    let mut apns = json!({"payload": {"aps": {"sound": "default"}}});
+    if let Some(image) = image_url {
+        notification["image"] = json!(image);
+        android["notification"] = json!({"image": image});
+        apns["payload"]["aps"]["mutable-content"] = json!(1);
+        apns["fcm_options"] = json!({"image": image});
+    }
+    json!({
+        "message": {
+            "token": message.token,
+            "notification": notification,
+            "data": data,
+            "android": android,
+            "apns": apns
+        }
+    })
+}
+
+/// A notification image FCM can fetch: an absolute http(s) URL.
+fn push_image_url(data: &Value) -> Option<String> {
+    data.get("imageUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| {
+            (url.starts_with("https://") || url.starts_with("http://"))
+                && url.len() <= 2048
+                && !url.chars().any(char::is_whitespace)
+        })
+        .map(str::to_owned)
+}
+
 pub fn push_from_environment() -> anyhow::Result<Option<Arc<dyn PushSender>>> {
     let enabled = std::env::var("FCM_ENABLED")
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE"))
@@ -256,6 +292,55 @@ fn safe_provider_error(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn message(data: Value) -> PushMessage {
+        PushMessage {
+            token: "device-token".into(),
+            title: "Title".into(),
+            body: "Body".into(),
+            deep_link: None,
+            category: "broadcast".into(),
+            event_type: "broadcast.sent".into(),
+            priority: "high".into(),
+            data,
+        }
+    }
+
+    #[test]
+    fn an_image_becomes_a_rich_notification_on_every_platform() {
+        let payload = fcm_payload(message(
+            json!({"broadcastId": "b1", "imageUrl": "https://cdn.example.test/a.png"}),
+        ));
+        let message = &payload["message"];
+        assert_eq!(
+            message["notification"]["image"],
+            "https://cdn.example.test/a.png"
+        );
+        assert_eq!(
+            message["android"]["notification"]["image"],
+            "https://cdn.example.test/a.png"
+        );
+        assert_eq!(message["apns"]["payload"]["aps"]["mutable-content"], 1);
+        assert_eq!(
+            message["apns"]["fcm_options"]["image"],
+            "https://cdn.example.test/a.png"
+        );
+        assert_eq!(
+            message["data"]["imageUrl"],
+            "https://cdn.example.test/a.png"
+        );
+        assert_eq!(message["android"]["priority"], "high");
+    }
+
+    #[test]
+    fn a_message_without_an_image_stays_plain() {
+        let payload = fcm_payload(message(json!({"imageUrl": "not a url", "empty": null})));
+        let message = &payload["message"];
+        assert!(message["notification"].get("image").is_none());
+        assert!(message["android"].get("notification").is_none());
+        assert!(message["apns"].get("fcm_options").is_none());
+        assert!(message["data"].get("empty").is_none());
+    }
 
     #[test]
     fn provider_errors_are_bounded() {

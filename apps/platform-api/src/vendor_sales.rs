@@ -36,6 +36,8 @@ pub fn router() -> Router<AppState> {
             "/canteen/shop-analytics",
             get(crate::shop_analytics::shop_analytics),
         )
+        // Finance reports (PDF / CSV in the app) over the same sales and ledger.
+        .merge(crate::reports::router())
 }
 
 /// Grants that may read shop sales.
@@ -51,7 +53,7 @@ const TENANT_TIMEZONE: &str = "Asia/Kolkata";
 /// Every sale on campus as one row set. `$1` is the tenant, `$2` the time
 /// zone. Orders whose `store` predates the shop register (e.g. `classic`)
 /// resolve to the shop of the matching category, exactly as ordering does.
-const SALES_CTE: &str = r#"
+pub(crate) const SALES_CTE: &str = r#"
 WITH shop_list AS (
   SELECT shop_key, name, category, created_at FROM campus_ops.shops WHERE tenant_id=$1
 ),

@@ -1,6 +1,8 @@
 pub mod academic_assignments;
+pub mod app_versions;
 pub mod dashboard;
 pub mod error;
+pub mod finance_audit;
 pub mod gate_security;
 pub mod governance;
 pub mod guardian_link;
@@ -11,8 +13,12 @@ pub mod models;
 pub mod notification;
 pub mod operations;
 pub mod passes;
+pub mod payment_requests;
 pub mod platform_admin;
+pub mod push_broadcasts;
 pub mod razorpay;
+pub mod reports;
+pub mod security_logs;
 pub mod shop_analytics;
 pub mod support;
 pub mod vendor_sales;
@@ -540,6 +546,10 @@ pub async fn run() -> anyhow::Result<()> {
         .with_auth(auth)
         .with_mailer(mailer)
         .with_whatsapp(whatsapp);
+    // Payment requests and online payment tracking grants (idempotent).
+    if let Some(control) = state.database() {
+        payment_requests::ensure_permissions(control.pool()).await;
+    }
     if platform_admin::seed_platform_admin_from_environment(&state).await? {
         tracing::info!("platform administrator synchronized from environment");
     }

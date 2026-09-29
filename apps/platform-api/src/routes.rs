@@ -164,6 +164,9 @@ pub fn router(state: AppState) -> Router {
         .nest("/timetable", crate::timetable::router())
         .nest("/operations", crate::operations::router())
         .nest("/platform-admin", crate::platform_admin::router())
+        .merge(crate::finance_audit::router())
+        .merge(crate::security_logs::router())
+        .merge(crate::app_versions::router())
         .route(
             "/{module_key}/records",
             get(list_records).post(create_record),
@@ -175,6 +178,7 @@ pub fn router(state: AppState) -> Router {
 
     let api = Router::new()
         .route("/maintenance", get(public_maintenance_status))
+        .route("/app-version", get(crate::app_versions::public_app_version))
         .route("/auth/login", post(login))
         .route("/auth/forgot-password", post(forgot_password))
         .route("/auth/reset-password", post(reset_password))
@@ -192,6 +196,7 @@ pub fn router(state: AppState) -> Router {
             post(upload_public_application_media)
                 .layer(DefaultBodyLimit::max(crate::media::MULTIPART_BODY_LIMIT)),
         )
+        .route("/media/files/{tenant}/{id}/{name}", get(serve_media_file))
         .nest("/v1", v1);
 
     Router::new()
@@ -297,11 +302,55 @@ async fn put_maintenance_window(
 }
 
 async fn upload_media(
+    State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
     multipart: Multipart,
 ) -> ApiResult<(StatusCode, Json<ApiResponse<Value>>)> {
-    let media = crate::media::upload(&principal.student.tenant_id, multipart).await?;
+    let database = state.tenant_database(&principal.student.tenant_id).await?;
+    let media = crate::media::upload(
+        &principal.student.tenant_id,
+        &database,
+        &crate::media::public_base_url(&headers),
+        Some(principal.student.id.as_str()),
+        multipart,
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(media))))
+}
+
+/// Serves a file kept in the tenant database by the media fallback.
+///
+/// Public by design, like a Cloudinary URL: the unguessable id is the access
+/// control, because image widgets and PDF viewers cannot send a bearer token.
+async fn serve_media_file(
+    State(state): State<AppState>,
+    Path((tenant, id, _name)): Path<(String, Uuid, String)>,
+) -> ApiResult<Response> {
+    if !crate::media::valid_tenant_slug(&tenant) {
+        return Err(ApiError::NotFound("File not found".into()));
+    }
+    let database = state
+        .tenant_database(&tenant)
+        .await
+        .map_err(|_| ApiError::NotFound("File not found".into()))?;
+    let file = crate::media::load_from_database(&database, &tenant, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("File not found".into()))?;
+    let disposition = format!("inline; filename=\"{}\"", file.file_name.replace('"', ""));
+    Ok((
+        [
+            (header::CONTENT_TYPE, file.content_type),
+            (header::CONTENT_DISPOSITION, disposition),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_owned(),
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+        ],
+        file.content,
+    )
+        .into_response())
 }
 
 async fn upload_public_application_media(
@@ -346,7 +395,14 @@ async fn upload_public_application_media(
     if !authorized {
         return Err(ApiError::Unauthorized);
     }
-    let media = crate::media::upload(tenant, multipart).await?;
+    let media = crate::media::upload(
+        tenant,
+        &database,
+        &crate::media::public_base_url(&headers),
+        None,
+        multipart,
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::new(media))))
 }
 
@@ -1352,24 +1408,53 @@ async fn validate_workflow_transition(
 
 async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    // Security log (best-effort, in the background): never changes the outcome.
+    let client = crate::security_logs::client_context(&headers, request.device_name.as_deref());
+    let login_event =
+        |outcome: &'static str, reason: Option<&str>| crate::security_logs::LoginEvent {
+            outcome,
+            reason: reason.map(str::to_owned),
+            email: Some(request.email.clone()),
+            device_id: request.device_id.clone(),
+            device_name: request.device_name.clone(),
+            ..Default::default()
+        };
     let identity = state
         // Email addresses are globally unique in identity.users. The selected
         // primary membership supplies the tenant; clients never choose one.
         .authenticate_credentials(&request.email, &request.password, None)
         .await?;
     let Some(identity) = identity else {
+        crate::security_logs::record_in_background(
+            &state,
+            login_event("failure", Some("invalid_credentials")),
+            client,
+        );
         return Err(ApiError::InvalidCredentials);
     };
+    let identified_event =
+        |outcome: &'static str, reason: Option<&str>| crate::security_logs::LoginEvent {
+            tenant_slug: Some(identity.student.tenant_id.clone()),
+            user_id: Some(identity.student.id.clone()),
+            ..login_event(outcome, reason)
+        };
     if !is_maintenance_admin(&identity.roles)
         && let Some(window) = state
             .maintenance_window(&identity.student.tenant_id)
             .await?
             .filter(MaintenanceWindow::is_active)
     {
+        crate::security_logs::record_in_background(
+            &state,
+            identified_event("blocked", Some("maintenance")),
+            client,
+        );
         return Err(maintenance_error(&window));
     }
+    let blocked_event = identified_event("blocked", Some("active_on_another_device"));
     let session = match state
         .create_session(
             identity,
@@ -1380,12 +1465,23 @@ async fn login(
     {
         crate::state::CreateSessionResult::Created(session) => *session,
         crate::state::CreateSessionResult::ActiveOnAnotherDevice => {
+            crate::security_logs::record_in_background(&state, blocked_event, client);
             return Err(ApiError::Conflict(
                 "This account is already signed in on another device. Sign out there before trying again."
                     .into(),
             ));
         }
     };
+    crate::security_logs::record_in_background(
+        &state,
+        crate::security_logs::LoginEvent {
+            outcome: "success",
+            reason: None,
+            session_id: Some(session.session_id),
+            ..blocked_event
+        },
+        client,
+    );
     state.publish_realtime(
         RealtimePublication::tenant(
             &session.student.tenant_id,
@@ -1554,6 +1650,17 @@ async fn logout(
         match state.authenticate_access_token(&token).await? {
             AccessTokenAuthentication::Authenticated(principal) => {
                 state.revoke_session(principal.session_id).await?;
+                crate::security_logs::record_in_background(
+                    &state,
+                    crate::security_logs::LoginEvent {
+                        outcome: "signed_out",
+                        tenant_slug: Some(principal.student.tenant_id.clone()),
+                        user_id: Some(principal.student.id.clone()),
+                        session_id: Some(principal.session_id),
+                        ..Default::default()
+                    },
+                    crate::security_logs::client_context(&headers, None),
+                );
             }
             AccessTokenAuthentication::Expired
             | AccessTokenAuthentication::Invalid

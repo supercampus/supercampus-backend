@@ -206,6 +206,7 @@ pub fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(crate::media::MULTIPART_BODY_LIMIT)),
         )
         .route("/media/files/{tenant}/{id}/{name}", get(serve_media_file))
+        .route("/media/proxy", get(proxy_media_file))
         .nest("/v1", v1);
 
     Router::new()
@@ -332,6 +333,40 @@ async fn upload_media(
 ///
 /// Public by design, like a Cloudinary URL: the unguessable id is the access
 /// control, because image widgets and PDF viewers cannot send a bearer token.
+#[derive(Deserialize)]
+struct MediaProxyQuery {
+    url: String,
+}
+
+/// Relays one of this account's SuperCampus Cloudinary attachments.
+///
+/// Public like `/media/files`: the asset URL was already the credential (a
+/// random public id), and only URLs of this cloud's `supercampus/` folder are
+/// accepted. It exists because Cloudinary refuses to deliver PDFs to the app
+/// unless the account allows it; its download API does not have that limit.
+async fn proxy_media_file(Query(query): Query<MediaProxyQuery>) -> ApiResult<Response> {
+    let fetched = crate::media::fetch_cloudinary_original(query.url.trim())
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = ?error, "attachment proxy could not fetch from Cloudinary");
+            ApiError::BadGateway("The attachment could not be fetched".into())
+        })?;
+    let Some((bytes, content_type, file_name)) = fetched else {
+        return Err(ApiError::NotFound("File not found".into()));
+    };
+    let disposition = format!("inline; filename=\"{}\"", file_name.replace('"', ""));
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type.to_owned()),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, "public, max-age=3600".to_owned()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 async fn serve_media_file(
     State(state): State<AppState>,
     Path((tenant, id, _name)): Path<(String, Uuid, String)>,

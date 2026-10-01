@@ -571,6 +571,149 @@ fn cloudinary_signature(parameters: &[(&str, &str)], api_secret: &str) -> String
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Largest original the attachment proxy will relay.
+pub const MAX_PROXIED_BYTES: usize = 25 * 1024 * 1024;
+
+/// One of this account's SuperCampus assets, read from its delivery URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudinaryAsset {
+    resource_type: String,
+    public_id: String,
+    format: Option<String>,
+}
+
+impl CloudinaryAsset {
+    /// The file name the asset was delivered under.
+    pub fn file_name(&self) -> String {
+        let last = self.public_id.rsplit('/').next().unwrap_or("attachment");
+        match &self.format {
+            Some(format) => format!("{last}.{format}"),
+            None => last.to_owned(),
+        }
+    }
+}
+
+/// Reads a `res.cloudinary.com` delivery URL of *this* cloud's SuperCampus
+/// media. Anything else — another cloud, another host, a path outside the
+/// `supercampus/` folder, a transformation — is refused, so the proxy cannot
+/// be used to fetch arbitrary URLs.
+fn parse_cloudinary_asset(url: &str, cloud_name: &str) -> Option<CloudinaryAsset> {
+    let rest = url
+        .strip_prefix("https://res.cloudinary.com/")
+        .or_else(|| url.strip_prefix("http://res.cloudinary.com/"))?;
+    let rest = rest.split(['?', '#']).next()?;
+    let mut segments = rest.split('/');
+    if segments.next()? != cloud_name {
+        return None;
+    }
+    let resource_type = segments.next()?;
+    if !matches!(resource_type, "image" | "raw" | "video") {
+        return None;
+    }
+    if segments.next()? != "upload" {
+        return None;
+    }
+    let mut remaining: Vec<&str> = segments.collect();
+    // An optional version segment (v1727000000) comes before the public id.
+    if remaining
+        .first()
+        .is_some_and(|first| first.len() > 1 && first.starts_with('v') && first[1..].bytes().all(|b| b.is_ascii_digit()))
+    {
+        remaining.remove(0);
+    }
+    if remaining.is_empty() || remaining.iter().any(|segment| segment.is_empty() || *segment == "..") {
+        return None;
+    }
+    let decoded: Vec<String> = remaining
+        .iter()
+        .map(|segment| percent_decode(segment).ok())
+        .collect::<Option<_>>()?;
+    let path = decoded.join("/");
+    if !path.starts_with("supercampus/") {
+        return None;
+    }
+    if resource_type == "raw" {
+        return Some(CloudinaryAsset {
+            resource_type: resource_type.to_owned(),
+            public_id: path,
+            format: None,
+        });
+    }
+    let (public_id, format) = path.rsplit_once('.')?;
+    if public_id.is_empty() || !format.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(CloudinaryAsset {
+        resource_type: resource_type.to_owned(),
+        public_id: public_id.to_owned(),
+        format: Some(format.to_ascii_lowercase()),
+    })
+}
+
+/// Fetches an original from Cloudinary through its signed download API.
+///
+/// New Cloudinary accounts refuse to *deliver* PDFs ("Allow delivery of PDF
+/// and ZIP files" is off), so an attachment uploaded there returns 401 to the
+/// app. The authenticated download API is not subject to that setting, so
+/// the API relays the file instead. Returns None when the URL is not one of
+/// this account's SuperCampus assets or Cloudinary is not configured.
+pub async fn fetch_cloudinary_original(
+    url: &str,
+) -> anyhow::Result<Option<(Vec<u8>, &'static str, String)>> {
+    let Ok(config) = CloudinaryConfig::from_environment() else {
+        return Ok(None);
+    };
+    let Some(asset) = parse_cloudinary_asset(url, &config.cloud_name) else {
+        return Ok(None);
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs()
+        .to_string();
+    let mut signed: Vec<(&str, &str)> = vec![
+        ("public_id", asset.public_id.as_str()),
+        ("timestamp", timestamp.as_str()),
+        ("type", "upload"),
+    ];
+    if let Some(format) = &asset.format {
+        signed.push(("format", format.as_str()));
+    }
+    let signature = cloudinary_signature(&signed, &config.api_secret);
+    let mut query: Vec<(&str, &str)> = signed.clone();
+    query.push(("api_key", config.api_key.as_str()));
+    query.push(("signature", signature.as_str()));
+    let client = reqwest::Client::builder()
+        .use_native_tls()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("Cloudinary HTTP client could not be created")?;
+    let response = client
+        .get(format!(
+            "https://api.cloudinary.com/v1_1/{}/{}/download",
+            config.cloud_name, asset.resource_type
+        ))
+        .query(&query)
+        .send()
+        .await
+        .context("Cloudinary download request failed")?;
+    if !response.status().is_success() {
+        bail!("Cloudinary download returned {}", response.status());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length as usize > MAX_PROXIED_BYTES)
+    {
+        bail!("attachment is larger than the proxy relays");
+    }
+    let bytes = response.bytes().await.context("Cloudinary download was cut short")?;
+    if bytes.len() > MAX_PROXIED_BYTES {
+        bail!("attachment is larger than the proxy relays");
+    }
+    let content_type = detect_media_type(&bytes).unwrap_or("application/octet-stream");
+    Ok(Some((bytes.to_vec(), content_type, asset.file_name())))
+}
+
 fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         Some("image/jpeg")
@@ -608,6 +751,47 @@ fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_reads_this_clouds_supercampus_assets_only() {
+        let pdf = parse_cloudinary_asset(
+            "https://res.cloudinary.com/campus/image/upload/v1727581442/supercampus/mec/media/SCAN_2026.pdf",
+            "campus",
+        )
+        .expect("a SuperCampus PDF");
+        assert_eq!(pdf.resource_type, "image");
+        assert_eq!(pdf.public_id, "supercampus/mec/media/SCAN_2026");
+        assert_eq!(pdf.format.as_deref(), Some("pdf"));
+        assert_eq!(pdf.file_name(), "SCAN_2026.pdf");
+
+        let raw = parse_cloudinary_asset(
+            "https://res.cloudinary.com/campus/raw/upload/supercampus/mec/media/sheet.csv",
+            "campus",
+        )
+        .expect("a raw asset");
+        assert_eq!(raw.public_id, "supercampus/mec/media/sheet.csv");
+        assert_eq!(raw.format, None);
+
+        let spaced = parse_cloudinary_asset(
+            "https://res.cloudinary.com/campus/image/upload/v1/supercampus/mec/media/Fee%20notice.pdf",
+            "campus",
+        )
+        .expect("a percent-encoded name");
+        assert_eq!(spaced.public_id, "supercampus/mec/media/Fee notice");
+
+        for refused in [
+            // Another cloud, another host, outside the folder, a transformation.
+            "https://res.cloudinary.com/other/image/upload/v1/supercampus/mec/a.pdf",
+            "https://evil.example/campus/image/upload/v1/supercampus/mec/a.pdf",
+            "https://res.cloudinary.com/campus/image/upload/v1/private/a.pdf",
+            "https://res.cloudinary.com/campus/image/upload/w_100/supercampus/a.pdf",
+            "https://res.cloudinary.com/campus/image/private/v1/supercampus/a.pdf",
+            "https://res.cloudinary.com/campus/image/upload/v1/supercampus/../x.pdf",
+            "not a url",
+        ] {
+            assert_eq!(parse_cloudinary_asset(refused, "campus"), None, "{refused}");
+        }
+    }
 
     #[test]
     fn content_detection_does_not_trust_a_file_extension() {

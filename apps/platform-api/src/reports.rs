@@ -64,6 +64,25 @@ const MAX_LEDGER_ROWS: usize = 20_000;
 /// Students listed by name in the spending report.
 const TOP_SPENDERS: i64 = 25;
 
+/// The shop a ledger row (aliased `t`) belongs to for a shop's figures: a
+/// purchase or refund belongs to the counter the order was placed at, even
+/// when the canteen's general credit paid for it; every other row (top-ups,
+/// deductions) belongs to the wallet bucket it changed.
+const TXN_SHOP_SQL: &str = "(CASE WHEN t.transaction_type IN ('order_debit','refund')      THEN COALESCE(t.counter_shop_key, t.shop_key) ELSE t.shop_key END)";
+
+/// Whether a wallet bucket key (an SQL expression) is shop `$5` or one of
+/// its counters: a canteen's wallet holds its general credit and the credit
+/// restricted to each of its counters.
+macro_rules! bucket_of_shop_sql {
+    ($key:literal) => {
+        concat!(
+            "($5::text IS NULL OR ", $key, "=$5 OR EXISTS(SELECT 1 FROM campus_ops.shops counter_of",
+            " WHERE counter_of.tenant_id=$1 AND counter_of.shop_key=", $key,
+            " AND counter_of.parent_shop_key=$5))"
+        )
+    };
+}
+
 fn require_report_access(access: &EffectiveAccess) -> ApiResult<()> {
     for grant in REPORT_GRANTS {
         require(access, grant)?;
@@ -724,22 +743,36 @@ type LedgerTuple = (
 async fn ledger(ctx: &Ctx<'_>, filter: &str) -> ApiResult<(Vec<LedgerRow>, bool)> {
     let sql = format!(
         r#"SELECT t.id, to_char(t.created_at AT TIME ZONE $2, 'YYYY-MM-DD"T"HH24:MI:SS'),
-             t.user_id, t.shop_key, shop.name, t.amount::float8, t.transaction_type,
+             t.user_id, t.shop_key,
+             -- A purchase or refund names the counter it was at and, at a
+             -- counter, which credit paid: the canteen's general credit or
+             -- the counter-only credit.
+             CASE WHEN t.transaction_type IN ('order_debit','refund') AND spent.name IS NOT NULL
+                  THEN spent.name || CASE
+                    WHEN spent.shop_key<>t.shop_key THEN ' (' || COALESCE(shop.name, t.shop_key) || ' credit)'
+                    WHEN spent.parent_shop_key IS NOT NULL THEN ' (' || spent.name || '-only credit)'
+                    ELSE '' END
+                  ELSE {bucket_label} END,
+             t.amount::float8, t.transaction_type,
              t.description, t.actor_user_id, student.full_name, student.student_number,
              o.order_number, o.rejection_reason
            FROM campus_ops.canteen_wallet_transactions t
            LEFT JOIN campus_ops.shops shop
              ON shop.tenant_id=t.tenant_id AND shop.shop_key=t.shop_key
+           LEFT JOIN campus_ops.shops spent
+             ON spent.tenant_id=t.tenant_id AND spent.shop_key=t.counter_shop_key
            LEFT JOIN core.students student
              ON student.tenant_id=t.tenant_id AND student.user_account_id::text=t.user_id
            LEFT JOIN campus_ops.canteen_orders o
              ON o.tenant_id=t.tenant_id AND o.id::text=t.reference_id
            WHERE t.tenant_id=$1
              AND (t.created_at AT TIME ZONE $2)::date BETWEEN $3 AND $4
-             AND ($5::text IS NULL OR t.shop_key=$5)
+             AND ($5::text IS NULL OR {txn_shop}=$5)
              AND ({filter})
            ORDER BY t.created_at, t.id
-           LIMIT $6"#
+           LIMIT $6"#,
+        bucket_label = crate::operations::WALLET_BUCKET_LABEL_SQL,
+        txn_shop = TXN_SHOP_SQL,
     );
     let rows = sqlx::query_as::<_, LedgerTuple>(&sql)
         .bind(ctx.tenant)
@@ -1021,7 +1054,9 @@ async fn payables(ctx: &Ctx<'_>) -> ApiResult<Vec<Payable>> {
              COALESCE(sum(t.amount) FILTER (WHERE t.transaction_type='refund'), 0)::float8
            FROM campus_ops.shops s
            LEFT JOIN campus_ops.canteen_wallet_transactions t
-             ON t.tenant_id=s.tenant_id AND t.shop_key=s.shop_key
+             ON t.tenant_id=s.tenant_id
+            AND (CASE WHEN t.transaction_type IN ('order_debit','refund')
+                      THEN COALESCE(t.counter_shop_key, t.shop_key) ELSE t.shop_key END)=s.shop_key
             AND (t.created_at AT TIME ZONE $2)::date BETWEEN $3 AND $4
            WHERE s.tenant_id=$1 AND ($5::text IS NULL OR s.shop_key=$5)
            GROUP BY s.shop_key, s.name, s.category, s.sort_order
@@ -1368,7 +1403,7 @@ async fn student_eod_report(ctx: &Ctx<'_>) -> ApiResult<Report> {
          through every later ledger entry."
             .to_owned(),
     );
-    let rows = sqlx::query_as::<_, (NaiveDate, Option<String>, String, f64)>(
+    let rows = sqlx::query_as::<_, (NaiveDate, Option<String>, String, f64)>(concat!(
         r#"WITH days AS (
              SELECT generate_series($3::date, $4::date, interval '1 day')::date AS day
            ),
@@ -1379,20 +1414,20 @@ async fn student_eod_report(ctx: &Ctx<'_>) -> ApiResult<Report> {
            balances AS (
              SELECT lower(w.user_id) AS user_id, sum(w.balance)::float8 AS balance
              FROM campus_ops.canteen_wallets w
-             WHERE w.tenant_id=$1 AND ($5::text IS NULL OR w.shop_key=$5)
+             WHERE w.tenant_id=$1 AND "#, bucket_of_shop_sql!("w.shop_key"), r#"
              GROUP BY lower(w.user_id)
            )
            SELECT d.day, st.student_number, st.full_name,
              round((COALESCE(b.balance, 0) - COALESCE((
                SELECT sum(t.amount)::float8 FROM campus_ops.canteen_wallet_transactions t
                WHERE t.tenant_id=$1 AND lower(t.user_id)=st.user_id
-                 AND ($5::text IS NULL OR t.shop_key=$5)
+                 AND "#, bucket_of_shop_sql!("t.shop_key"), r#"
                  AND t.created_at >= ((d.day + 1)::timestamp AT TIME ZONE $2)
              ), 0))::numeric, 2)::float8
            FROM days d CROSS JOIN students st
            LEFT JOIN balances b ON b.user_id=st.user_id
-           ORDER BY d.day, st.student_number NULLS LAST, st.full_name"#,
-    )
+           ORDER BY d.day, st.student_number NULLS LAST, st.full_name"#
+    ))
     .bind(ctx.tenant)
     .bind(TENANT_TIMEZONE)
     .bind(range.from)
@@ -1487,13 +1522,13 @@ async fn master_report(ctx: &Ctx<'_>) -> ApiResult<Report> {
     let payables = payables(ctx).await?;
     let payable_table = payable_table("Vendor payable", &payables);
 
-    let ledger = sqlx::query_as::<_, (String, i64, f64)>(
+    let ledger = sqlx::query_as::<_, (String, i64, f64)>(&format!(
         r#"SELECT t.transaction_type, count(*)::int8, sum(t.amount)::float8
            FROM campus_ops.canteen_wallet_transactions t
            WHERE t.tenant_id=$1 AND (t.created_at AT TIME ZONE $2)::date BETWEEN $3 AND $4
-             AND ($5::text IS NULL OR t.shop_key=$5)
-           GROUP BY 1 ORDER BY 1"#,
-    )
+             AND ($5::text IS NULL OR {TXN_SHOP_SQL}=$5)
+           GROUP BY 1 ORDER BY 1"#
+    ))
     .bind(ctx.tenant)
     .bind(TENANT_TIMEZONE)
     .bind(ctx.range.from)
@@ -2175,9 +2210,9 @@ async fn cancelled_orders_report(ctx: &Ctx<'_>) -> ApiResult<Report> {
 // ---------------------------------------------------------------------------
 
 async fn top_ups_report(ctx: &Ctx<'_>) -> ApiResult<Report> {
-    let rows = sqlx::query_as::<_, (NaiveDate, String, Option<String>, String, i64, f64)>(
+    let rows = sqlx::query_as::<_, (NaiveDate, String, Option<String>, String, i64, f64)>(&format!(
         r#"SELECT (t.created_at AT TIME ZONE $2)::date, t.transaction_type, r.payment_method,
-             COALESCE(shop.name, t.shop_key), count(*)::int8, sum(t.amount)::float8
+             COALESCE({bucket_label}, t.shop_key), count(*)::int8, sum(t.amount)::float8
            FROM campus_ops.canteen_wallet_transactions t
            LEFT JOIN campus_ops.razorpay_orders r
              ON r.tenant_id=t.tenant_id AND r.order_id=t.reference_id
@@ -2189,7 +2224,8 @@ async fn top_ups_report(ctx: &Ctx<'_>) -> ApiResult<Report> {
              AND t.transaction_type IN ('manual_top_up', 'online_top_up')
            GROUP BY 1, 2, 3, 4
            ORDER BY 1"#,
-    )
+        bucket_label = crate::operations::WALLET_BUCKET_LABEL_SQL,
+    ))
     .bind(ctx.tenant)
     .bind(TENANT_TIMEZONE)
     .bind(ctx.range.from)

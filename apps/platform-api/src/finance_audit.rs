@@ -94,6 +94,7 @@ fn timeline_sql(sources: Sources) -> String {
     } else {
         "LEFT JOIN (SELECT NULL::uuid AS id, NULL::text AS name) lc ON false"
     };
+    let bucket_label = crate::operations::WALLET_BUCKET_LABEL_SQL;
     let mut sql = format!(
         r#"SELECT 'wallet'::text AS source, t.id::text AS id,
                   CASE WHEN lc.id IS NOT NULL THEN 'laundry_payment'
@@ -103,7 +104,7 @@ fn timeline_sql(sources: Sources) -> String {
                        ELSE t.transaction_type END AS kind,
                   CASE WHEN t.amount > 0 THEN 'credit' ELSE 'debit' END AS direction,
                   t.user_id, t.actor_user_id, t.amount::float8 AS amount,
-                  t.shop_key, shop.name AS shop_name, t.description,
+                  t.shop_key, {bucket_label} AS shop_name, t.description,
                   t.reference_id AS reference, 'completed'::text AS status,
                   (w.balance - COALESCE(sum(t.amount) OVER (
                       PARTITION BY t.user_id, t.shop_key
@@ -112,6 +113,11 @@ fn timeline_sql(sources: Sources) -> String {
                   t.created_at,
                   jsonb_strip_nulls(jsonb_build_object(
                       'transactionType', t.transaction_type,
+                      -- Which credit a canteen wallet row touched: 'all' or the
+                      -- counter it is restricted to; and where a purchase was.
+                      'walletScope', COALESCE(t.wallet_scope,
+                        CASE WHEN shop.parent_shop_key IS NOT NULL THEN t.shop_key END),
+                      'counterShopKey', t.counter_shop_key,
                       'laundryChargeId', lc.id, 'laundryItem', lc.name)) AS details
            FROM campus_ops.canteen_wallet_transactions t
            LEFT JOIN campus_ops.canteen_wallets w

@@ -1452,11 +1452,12 @@ async fn canteen_store(
           'customerUserId',customer_user_id,'customerName',customer_name,'lines',lines,
           'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,
           'tokenNumber',token_number,'qrPayload',id::text,'createdAt',created_at,'updatedAt',updated_at,
-          'store',store,'shopKey',"#, order_shop_key_sql!(), r#")
+          'store',store,'walletSplit',wallet_split,'shopKey',"#, order_shop_key_sql!(), r#")
           ORDER BY created_at DESC) FROM campus_ops.canteen_orders
           WHERE tenant_id=$1 AND (($7 AND (NOT $9 OR "#, order_in_shops_sql!(), r#")) OR customer_user_id=$2)), '[]'::jsonb),
         'walletTransactions', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,
           'shopKey',shop_key,'amount',amount::float8,'transactionType',transaction_type,'description',description,
+          'walletScope',wallet_scope,'counterShopKey',counter_shop_key,
           'referenceId',reference_id,'createdAt',created_at) ORDER BY created_at DESC)
           FROM campus_ops.canteen_wallet_transactions WHERE tenant_id=$1 AND user_id=$2), '[]'::jsonb),
         'staffState', jsonb_build_object(
@@ -1594,6 +1595,88 @@ struct ShopRequest {
     qr_payments: bool,
     /// Omitted preserves assignments; an empty list clears them.
     operators: Option<Vec<ShopOperatorRequest>>,
+    /// The canteen this shop is a counter of. Omitted keeps the current
+    /// parent (older clients never send it); `null` or `""` makes the shop
+    /// stand on its own again.
+    #[serde(default, deserialize_with = "present_option")]
+    parent_shop_key: Option<Option<String>>,
+    /// Position in the shop sequence (counters sort by it within their
+    /// canteen). Omitted keeps the current position.
+    #[serde(default)]
+    sort_order: Option<i32>,
+}
+
+/// Tells an omitted field (`None`) from an explicit `null` (`Some(None)`).
+fn present_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+/// The parent a shop write asks for: `None` keeps whatever is stored,
+/// `Some(None)` clears it, `Some(Some(key))` sets it.
+fn requested_parent(input: &ShopRequest) -> Option<Option<String>> {
+    input.parent_shop_key.as_ref().map(|parent| {
+        parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Checks a counter's parent: an existing active shop of this campus that is
+/// not itself a counter, not the shop itself, and — when the shop already
+/// exists — the shop has no counters of its own (counters are one level
+/// deep). Returns the parent's category, which the counter takes.
+async fn validate_counter_parent(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: Uuid,
+    shop_id: Option<Uuid>,
+    shop_key: &str,
+    parent_key: &str,
+) -> ApiResult<String> {
+    if parent_key == shop_key {
+        return Err(ApiError::BadRequest(
+            "A counter cannot be its own canteen".into(),
+        ));
+    }
+    let parent = sqlx::query_as::<_, (String, bool, Option<String>)>(
+        "SELECT category, is_active, parent_shop_key FROM campus_ops.shops WHERE tenant_id=$1 AND shop_key=$2",
+    )
+    .bind(tenant)
+    .bind(parent_key)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest(format!("Unknown canteen {parent_key}")))?;
+    if !parent.1 {
+        return Err(ApiError::BadRequest(
+            "Counters can only be added to an active canteen".into(),
+        ));
+    }
+    if parent.2.is_some() {
+        return Err(ApiError::BadRequest(
+            "A counter cannot have counters of its own".into(),
+        ));
+    }
+    if let Some(shop_id) = shop_id {
+        let has_counters = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(SELECT 1 FROM campus_ops.shops child
+                 JOIN campus_ops.shops me ON me.tenant_id=child.tenant_id AND me.id=$2
+                 WHERE child.tenant_id=$1 AND child.parent_shop_key=me.shop_key)"#,
+        )
+        .bind(tenant)
+        .bind(shop_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if has_counters {
+            return Err(ApiError::BadRequest(
+                "This canteen has counters, so it cannot become a counter itself".into(),
+            ));
+        }
+    }
+    Ok(parent.0)
 }
 
 #[derive(Deserialize)]
@@ -1644,18 +1727,30 @@ async fn create_shop(
     .await?;
     let mut tx = db.pool().begin().await?;
     let shop_id = Uuid::new_v4();
+    let parent = requested_parent(&input).flatten();
+    // A counter is the same kind of shop as its canteen, so its wallet and
+    // figures sit with the canteen's.
+    let category = match &parent {
+        Some(parent_key) => {
+            validate_counter_parent(&mut tx, tenant, None, input.shop_key.trim(), parent_key)
+                .await?
+        }
+        None => input.category.trim().to_owned(),
+    };
     let shop = sqlx::query_scalar::<_, Value>(r#"
       INSERT INTO campus_ops.shops
-        (id,tenant_id,shop_key,name,category,description,is_active,meal_compliance,qr_payments,created_by,sort_order)
+        (id,tenant_id,shop_key,name,category,description,is_active,meal_compliance,qr_payments,created_by,sort_order,parent_shop_key)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
         -- A new shop joins the end of the administrator's sequence.
-        (SELECT max(sort_order)+1 FROM campus_ops.shops WHERE tenant_id=$2))
+        COALESCE($11,(SELECT max(sort_order)+1 FROM campus_ops.shops WHERE tenant_id=$2)),$12)
       RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'name',name,'category',category,
         'description',description,'isActive',is_active,'mealCompliance',meal_compliance,
-        'qrPayments',qr_payments,'sortOrder',sort_order,'createdAt',created_at,'updatedAt',updated_at)"#)
+        'qrPayments',qr_payments,'sortOrder',sort_order,'parentShopKey',parent_shop_key,
+        'createdAt',created_at,'updatedAt',updated_at)"#)
       .bind(shop_id).bind(tenant).bind(input.shop_key.trim()).bind(input.name.trim())
-      .bind(input.category.trim()).bind(input.description.trim()).bind(input.is_active)
+      .bind(&category).bind(input.description.trim()).bind(input.is_active)
       .bind(input.meal_compliance).bind(input.qr_payments).bind(&principal.student.id)
+      .bind(input.sort_order).bind(&parent)
       .fetch_one(&mut *tx).await?;
     sync_shop_operators(
         &mut tx,
@@ -1713,7 +1808,9 @@ async fn update_shop(
                  OR EXISTS(SELECT 1 FROM campus_ops.canteen_orders o
                       WHERE o.tenant_id=$1 AND o.store=shop.shop_key)
                  OR EXISTS(SELECT 1 FROM campus_ops.canteen_wallet_transactions t
-                      WHERE t.tenant_id=$1 AND t.shop_key=shop.shop_key)))"#,
+                      WHERE t.tenant_id=$1 AND t.shop_key=shop.shop_key)
+                 OR EXISTS(SELECT 1 FROM campus_ops.shops child
+                      WHERE child.tenant_id=$1 AND child.parent_shop_key=shop.shop_key)))"#,
     )
     .bind(tenant)
     .bind(shop_id)
@@ -1722,31 +1819,70 @@ async fn update_shop(
     .await?;
     if in_use {
         return Err(ApiError::BadRequest(
-            "A shop's key cannot change once it has menu items, orders or wallet activity".into(),
+            "A shop's key cannot change once it has counters, menu items, orders or wallet activity"
+                .into(),
         ));
     }
     let mut tx = db.pool().begin().await?;
+    let current_parent = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT parent_shop_key FROM campus_ops.shops WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(shop_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Shop not found".into()))?;
+    let parent = requested_parent(&input).unwrap_or(current_parent);
+    let category = match &parent {
+        Some(parent_key) => {
+            validate_counter_parent(
+                &mut tx,
+                tenant,
+                Some(shop_id),
+                input.shop_key.trim(),
+                parent_key,
+            )
+            .await?
+        }
+        None => input.category.trim().to_owned(),
+    };
+    if !input.is_active {
+        refuse_closing_canteen_with_counters(&mut tx, tenant, shop_id).await?;
+    }
     let shop = sqlx::query_scalar::<_, Value>(
         r#"
       UPDATE campus_ops.shops SET shop_key=$3,name=$4,category=$5,description=$6,
-        is_active=$7,meal_compliance=$8,qr_payments=$9,updated_at=now()
+        is_active=$7,meal_compliance=$8,qr_payments=$9,parent_shop_key=$10,
+        sort_order=COALESCE($11,sort_order),updated_at=now()
       WHERE tenant_id=$1 AND id=$2
       RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'name',name,'category',category,
         'description',description,'isActive',is_active,'mealCompliance',meal_compliance,
-        'qrPayments',qr_payments,'sortOrder',sort_order,'createdAt',created_at,'updatedAt',updated_at)"#,
+        'qrPayments',qr_payments,'sortOrder',sort_order,'parentShopKey',parent_shop_key,
+        'createdAt',created_at,'updatedAt',updated_at)"#,
     )
     .bind(tenant)
     .bind(shop_id)
     .bind(input.shop_key.trim())
     .bind(input.name.trim())
-    .bind(input.category.trim())
+    .bind(&category)
     .bind(input.description.trim())
     .bind(input.is_active)
     .bind(input.meal_compliance)
     .bind(input.qr_payments)
+    .bind(&parent)
+    .bind(input.sort_order)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::NotFound("Shop not found".into()))?;
+    // A canteen's counters stay the same kind of shop as the canteen.
+    sqlx::query(
+        "UPDATE campus_ops.shops SET category=$3,updated_at=now() WHERE tenant_id=$1 AND parent_shop_key=$2 AND category<>$3",
+    )
+    .bind(tenant)
+    .bind(input.shop_key.trim())
+    .bind(&category)
+    .execute(&mut *tx)
+    .await?;
     sync_shop_operators(
         &mut tx,
         tenant,
@@ -1781,13 +1917,16 @@ async fn delete_shop(
     require(&access, "vendor_management.vendors.delete")?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    refuse_closing_canteen_with_counters(&mut tx, tenant, shop_id).await?;
     let shop_key = sqlx::query_scalar::<_, String>(
         "UPDATE campus_ops.shops SET is_active=false,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND is_active RETURNING shop_key",
     )
-    .bind(tenant).bind(shop_id).fetch_optional(db.pool()).await?
+    .bind(tenant).bind(shop_id).fetch_optional(&mut *tx).await?
     .ok_or_else(|| ApiError::NotFound("Active shop not found".into()))?;
     sqlx::query("UPDATE campus_ops.canteen_menu_items SET is_available=false,updated_at=now() WHERE tenant_id=$1 AND store=$2")
-        .bind(tenant).bind(&shop_key).execute(db.pool()).await?;
+        .bind(tenant).bind(&shop_key).execute(&mut *tx).await?;
+    tx.commit().await?;
     emit(
         &state,
         &principal.student.tenant_id,
@@ -1802,6 +1941,30 @@ async fn delete_shop(
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A canteen holds its counters' general wallet credit and is what students
+/// see them under, so it stays open while any counter does.
+async fn refuse_closing_canteen_with_counters(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: Uuid,
+    shop_id: Uuid,
+) -> ApiResult<()> {
+    let open_counters = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(SELECT 1 FROM campus_ops.shops child
+             JOIN campus_ops.shops me ON me.tenant_id=child.tenant_id AND me.id=$2
+             WHERE child.tenant_id=$1 AND child.parent_shop_key=me.shop_key AND child.is_active)"#,
+    )
+    .bind(tenant)
+    .bind(shop_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if open_counters {
+        return Err(ApiError::BadRequest(
+            "Deactivate or move this canteen's counters first".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_shop(input: &ShopRequest) -> ApiResult<()> {
@@ -1847,7 +2010,8 @@ async fn shops_json(
       SELECT COALESCE(jsonb_agg(jsonb_build_object('id',shop.id,'shopKey',shop.shop_key,'name',shop.name,
         'category',shop.category,'description',shop.description,'isActive',shop.is_active,'shopOpen',shop.shop_open,
         'mealCompliance',shop.meal_compliance,'qrPayments',shop.qr_payments,'createdAt',shop.created_at,
-        'updatedAt',shop.updated_at,'sortOrder',shop.sort_order,'operators',COALESCE((SELECT jsonb_agg(jsonb_build_object(
+        'updatedAt',shop.updated_at,'sortOrder',shop.sort_order,'parentShopKey',shop.parent_shop_key,
+        'operators',COALESCE((SELECT jsonb_agg(jsonb_build_object(
           'userId',assignment.user_id,'assignmentRole',assignment.assignment_role,
           -- Staff names only in the administrator's register ($2), never in
           -- the storefront payload every customer receives.
@@ -1901,7 +2065,7 @@ async fn assigned_shop_roles(
 ) -> ApiResult<Vec<Value>> {
     Ok(sqlx::query_scalar::<_, Value>(concat!(
         r#"SELECT jsonb_build_object('shopKey', shop.shop_key, 'name', shop.name,
-             'category', lower(shop.category),
+             'category', lower(shop.category), 'parentShopKey', shop.parent_shop_key,
              'assignmentRole', CASE WHEN bool_or(assignment.assignment_role='owner')
                                     THEN 'owner' ELSE 'captain' END)
            FROM campus_ops.shop_user_assignments assignment
@@ -1909,7 +2073,7 @@ async fn assigned_shop_roles(
            WHERE assignment.tenant_id=$1 AND "#,
         assignment_names_user_sql!("$2", "$3"),
         r#" AND assignment.is_active AND shop.is_active
-           GROUP BY shop.shop_key, shop.name, shop.category, shop.sort_order
+           GROUP BY shop.shop_key, shop.name, shop.category, shop.sort_order, shop.parent_shop_key
            ORDER BY shop.sort_order NULLS LAST, shop.name, shop.shop_key"#
     ))
     .bind(tenant)
@@ -2317,6 +2481,7 @@ async fn user_shop_assignments_json(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
              'shopId', shop.id, 'shopKey', shop.shop_key, 'name', shop.name,
              'category', shop.category, 'sortOrder', shop.sort_order,
+             'parentShopKey', shop.parent_shop_key,
              'assignmentRole', (SELECT assignment.assignment_role
                FROM campus_ops.shop_user_assignments assignment
                WHERE assignment.tenant_id=shop.tenant_id AND assignment.shop_id=shop.id
@@ -2742,16 +2907,17 @@ async fn place_order(
     // food over at its own counter — so the cart becomes one order per shop,
     // each with its own QR. They are created in a single transaction: the
     // wallet must not be charged for one shop and not the other.
-    let mut baskets: Vec<(String, Vec<Value>, f64)> = Vec::new();
-    let mut grand_total = 0.0;
+    let mut baskets: Vec<Basket> = Vec::new();
     for requested in &input.lines {
         // The line is a snapshot, so it carries everything history needs to stay
         // readable after the item is edited or removed — including whether it was
         // vegetarian, which the streak screens count.
         // The item's own shop takes the order — never a sibling of the same
-        // category because its own counter happens to be closed.
-        let item=sqlx::query_as::<_,(String,String,String,f64,bool,bool,bool,String)>(concat!(r#"SELECT item.name,resolved_shop.shop_key,item.category,item.price::float8,item.is_vegetarian,item.is_instant,
-            resolved_shop.shop_open,resolved_shop.name
+        // category because its own counter happens to be closed. A counter's
+        // item is that counter's order, never its canteen's or another
+        // counter's.
+        let item=sqlx::query_as::<_,(String,String,String,f64,bool,bool,bool,String,Option<String>)>(concat!(r#"SELECT item.name,resolved_shop.shop_key,item.category,item.price::float8,item.is_vegetarian,item.is_instant,
+            resolved_shop.shop_open,resolved_shop.name,resolved_shop.parent_shop_key
           FROM campus_ops.canteen_menu_items item
           JOIN campus_ops.shops resolved_shop ON resolved_shop.tenant_id=item.tenant_id
             AND resolved_shop.is_active
@@ -2766,65 +2932,149 @@ async fn place_order(
             )));
         }
         let line_total = item.3 * f64::from(requested.quantity);
-        grand_total += line_total;
         let line = json!({"itemId":requested.item_id,"name":item.0,"store":item.1,"category":item.2,
             "price":item.3,"isVegetarian":item.4,"isInstant":item.5,"quantity":requested.quantity});
-        match baskets.iter_mut().find(|(store, _, _)| *store == item.1) {
+        match baskets.iter_mut().find(|basket| basket.shop == item.1) {
             Some(basket) => {
-                basket.1.push(line);
-                basket.2 += line_total;
+                basket.lines.push(line);
+                basket.total += line_total;
             }
-            None => baskets.push((item.1.clone(), vec![line], line_total)),
+            None => baskets.push(Basket {
+                shop: item.1.clone(),
+                parent: item.8.clone(),
+                name: item.7.clone(),
+                lines: vec![line],
+                total: line_total,
+            }),
         }
     }
 
-    for (store, _store_lines, store_total) in &baskets {
-        let balance=sqlx::query_scalar::<_,f64>("SELECT balance::float8 FROM campus_ops.canteen_wallets WHERE tenant_id=$1 AND user_id=$2 AND shop_key=$3 FOR UPDATE")
-          .bind(tenant).bind(&principal.student.id).bind(store).fetch_optional(&mut *tx).await?.unwrap_or(0.0);
-        if balance + 0.0001 < *store_total {
-            return Err(ApiError::Conflict(format!("Insufficient wallet balance for {}", store)));
-        }
-    }
+    // Every wallet bucket the cart may draw on, locked in key order so two
+    // checkouts of the same person never deadlock: each shop's own wallet
+    // (a counter's restricted credit) and, for counters, their canteen's
+    // general credit.
+    let mut bucket_keys: Vec<String> = baskets
+        .iter()
+        .flat_map(|basket| std::iter::once(basket.shop.clone()).chain(basket.parent.clone()))
+        .collect();
+    bucket_keys.sort();
+    bucket_keys.dedup();
+    let balances: std::collections::HashMap<String, i64> = sqlx::query_as::<_, (String, f64)>(
+        r#"SELECT shop_key, balance::float8 FROM campus_ops.canteen_wallets
+           WHERE tenant_id=$1 AND user_id=$2 AND shop_key = ANY($3)
+           ORDER BY shop_key FOR UPDATE"#,
+    )
+    .bind(tenant)
+    .bind(&principal.student.id)
+    .bind(&bucket_keys)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|(key, balance)| (key, to_paise(balance)))
+    .collect();
+    let charges: Vec<BasketCharge> = baskets
+        .iter()
+        .map(|basket| BasketCharge {
+            shop: basket.shop.clone(),
+            parent: basket.parent.clone(),
+            total_paise: to_paise(basket.total),
+        })
+        .collect();
+    let plans = plan_wallet_debits(&charges, &balances).map_err(|index| {
+        let basket = &baskets[index];
+        ApiError::Conflict(match &basket.parent {
+            Some(_) => format!(
+                "Insufficient wallet balance for {}: credit for it plus your canteen credit doesn't cover ₹{}",
+                basket.name,
+                format_wallet_amount(basket.total)
+            ),
+            None => format!("Insufficient wallet balance for {}", basket.shop),
+        })
+    })?;
 
     let mut orders = Vec::new();
     let mut transactions = Vec::new();
     let mut new_balance = 0.0;
-    for (store, store_lines, store_total) in baskets {
+    let mut new_balances = serde_json::Map::new();
+    for (basket, plan) in baskets.into_iter().zip(plans) {
+        let Basket {
+            shop: store,
+            parent,
+            lines: store_lines,
+            total: store_total,
+            ..
+        } = basket;
         let raw_qr = Uuid::new_v4().to_string();
         let hash = token_hash(&raw_qr);
         let order_id = Uuid::new_v4();
+        // Which wallet buckets paid, so a refund returns each its share.
+        let wallet_split = Value::Array(
+            plan.iter()
+                .map(|(bucket, paise)| {
+                    json!({
+                        "shopKey": bucket,
+                        "amount": from_paise(*paise),
+                        "scope": wallet_scope_of(bucket, &store, parent.as_deref()),
+                    })
+                })
+                .collect(),
+        );
         // The basket is already one shop's worth, so the order records which
         // shop it is. Everything that shows a counter its own orders filters on
         // this, and it is the only place the value is known.
         let order=sqlx::query_scalar::<_,Value>(r#"INSERT INTO campus_ops.canteen_orders
-          (id,tenant_id,customer_user_id,customer_name,lines,total,fulfilment_mode,qr_token_hash,store)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$10) RETURNING jsonb_build_object('id',id,'orderNumber',order_number,
+          (id,tenant_id,customer_user_id,customer_name,lines,total,fulfilment_mode,qr_token_hash,store,wallet_split)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$10,$11) RETURNING jsonb_build_object('id',id,'orderNumber',order_number,
           'lines',lines,'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,
-          'qrPayload',$9::text,'createdAt',created_at,'store',store,'shopKey',store)"#)
+          'qrPayload',$9::text,'createdAt',created_at,'store',store,'shopKey',store,'walletSplit',wallet_split)"#)
           .bind(order_id).bind(tenant).bind(&principal.student.id).bind(&principal.student.name)
           .bind(Value::Array(store_lines)).bind(store_total).bind(input.fulfilment_mode()).bind(hash).bind(&raw_qr)
-          .bind(&store)
+          .bind(&store).bind(&wallet_split)
           .fetch_one(&mut *tx).await?;
 
-        // Debiting per order keeps the ledger aligned with what can be refunded:
-        // rejecting one shop's order returns exactly that order's money.
-        new_balance=sqlx::query_scalar::<_,f64>("UPDATE campus_ops.canteen_wallets SET balance=balance-$3,version=version+1,updated_at=now() WHERE tenant_id=$1 AND user_id=$2 AND shop_key=$4 RETURNING balance::float8")
-          .bind(tenant).bind(&principal.student.id).bind(store_total).bind(&store).fetch_one(&mut *tx).await?;
-
-        // The caller sends one key for the cart; each shop's debit needs its own
-        // so the uniqueness guard does not collapse them into a single row.
-        let idempotency_key = input
-            .idempotency_key
-            .as_ref()
-            .map(|key| format!("{key}:{store}"));
-        let transaction=sqlx::query_scalar::<_,Value>(r#"INSERT INTO campus_ops.canteen_wallet_transactions
-          (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id)
-          VALUES($1,$2,$3,$4,'order_debit',$7,$5,$6,$2)
-          RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'amount',amount::float8,'transactionType',transaction_type,
-          'description',description,'referenceId',reference_id,'createdAt',created_at)"#)
-          .bind(tenant).bind(&principal.student.id).bind(&store).bind(-store_total).bind(order_id.to_string())
-          .bind(idempotency_key).bind(format!("{} order", shop_label(&store)))
-          .fetch_one(&mut *tx).await?;
+        // Debiting per order (and per bucket) keeps the ledger aligned with
+        // what can be refunded: rejecting one shop's order returns exactly
+        // that order's money to the buckets it came from.
+        for (bucket, paise) in &plan {
+            let amount = from_paise(*paise);
+            new_balance = sqlx::query_scalar::<_, f64>(
+                "UPDATE campus_ops.canteen_wallets SET balance=balance-$3,version=version+1,updated_at=now() WHERE tenant_id=$1 AND user_id=$2 AND shop_key=$4 RETURNING balance::float8",
+            )
+            .bind(tenant)
+            .bind(&principal.student.id)
+            .bind(amount)
+            .bind(bucket)
+            .fetch_one(&mut *tx)
+            .await?;
+            new_balances.insert(bucket.clone(), json!(new_balance));
+            // The caller sends one key for the cart; each shop's (and each
+            // bucket's) debit needs its own so the uniqueness guard does not
+            // collapse them into a single row.
+            let idempotency_key = input.idempotency_key.as_ref().map(|key| {
+                if *bucket == store {
+                    format!("{key}:{store}")
+                } else {
+                    format!("{key}:{store}:{bucket}")
+                }
+            });
+            let scope = wallet_scope_of(bucket, &store, parent.as_deref());
+            let description = if *bucket == store {
+                format!("{} order", shop_label(&store))
+            } else {
+                format!("{} order · canteen credit", shop_label(&store))
+            };
+            let transaction=sqlx::query_scalar::<_,Value>(r#"INSERT INTO campus_ops.canteen_wallet_transactions
+              (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id,
+               wallet_scope,counter_shop_key)
+              VALUES($1,$2,$3,$4,'order_debit',$7,$5,$6,$2,$8,$9)
+              RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'amount',amount::float8,'transactionType',transaction_type,
+              'description',description,'walletScope',wallet_scope,'counterShopKey',counter_shop_key,
+              'referenceId',reference_id,'createdAt',created_at)"#)
+              .bind(tenant).bind(&principal.student.id).bind(bucket).bind(-amount).bind(order_id.to_string())
+              .bind(idempotency_key).bind(description).bind(&scope).bind(&store)
+              .fetch_one(&mut *tx).await?;
+            transactions.push(transaction);
+        }
 
         emit_tx(
             &mut tx,
@@ -2877,7 +3127,6 @@ async fn place_order(
             .await?;
         }
         orders.push(order);
-        transactions.push(transaction);
     }
     tx.commit().await?;
     publish_operation_change(
@@ -2891,9 +3140,85 @@ async fn place_order(
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse::new(
-            json!({"balance":new_balance,"orders":orders,"transactions":transactions}),
+            json!({"balance":new_balance,"balances":new_balances,"orders":orders,"transactions":transactions}),
         )),
     ))
+}
+
+/// One shop's part of a cart: the order that shop will take.
+struct Basket {
+    shop: String,
+    /// The canteen the shop is a counter of.
+    parent: Option<String>,
+    name: String,
+    lines: Vec<Value>,
+    total: f64,
+}
+
+fn to_paise(amount: f64) -> i64 {
+    (amount * 100.0).round() as i64
+}
+
+fn from_paise(paise: i64) -> f64 {
+    paise as f64 / 100.0
+}
+
+/// One shop's share of a cart: the shop that takes the order, the canteen it
+/// is a counter of (whose general credit it may also spend), and its cost.
+#[derive(Debug, Clone, PartialEq)]
+struct BasketCharge {
+    shop: String,
+    parent: Option<String>,
+    total_paise: i64,
+}
+
+/// How each basket of a cart is paid from the person's wallet buckets
+/// (`balances`, in paise, keyed by bucket shop key).
+///
+/// A counter's order spends credit restricted to that counter first, then
+/// the canteen's general credit; a shop that is not a counter spends only its
+/// own wallet, exactly as before counters existed. A negative bucket (an
+/// accountant deduction can leave one) counts as empty. Baskets are paid in
+/// order and share the general credit, so a cart can never spend it twice.
+/// `Err(index)` names the first basket the buckets cannot cover.
+fn plan_wallet_debits(
+    baskets: &[BasketCharge],
+    balances: &std::collections::HashMap<String, i64>,
+) -> Result<Vec<Vec<(String, i64)>>, usize> {
+    let mut left = balances.clone();
+    let mut plans = Vec::with_capacity(baskets.len());
+    for (index, basket) in baskets.iter().enumerate() {
+        let mut remaining = basket.total_paise.max(0);
+        let mut plan = Vec::new();
+        for bucket in std::iter::once(&basket.shop).chain(basket.parent.as_ref()) {
+            if remaining == 0 {
+                break;
+            }
+            let available = left.get(bucket).copied().unwrap_or(0).max(0);
+            let take = available.min(remaining);
+            if take > 0 {
+                plan.push((bucket.clone(), take));
+                remaining -= take;
+                *left.entry(bucket.clone()).or_default() -= take;
+            }
+        }
+        if remaining > 0 {
+            return Err(index);
+        }
+        plans.push(plan);
+    }
+    Ok(plans)
+}
+
+/// What a bucket a purchase at `store` drew on stands for: `all` (the
+/// canteen's general credit, or a shop's only wallet) or the counter the
+/// credit is restricted to.
+fn wallet_scope_of(bucket: &str, store: &str, parent: Option<&str>) -> String {
+    if parent.is_some() && bucket == store {
+        store.to_owned()
+    } else {
+        "all".into()
+    }
 }
 
 /// How a shop names itself on a wallet line.
@@ -3629,11 +3954,18 @@ async fn update_order_status(
    'tokenNumber',token_number,'updatedAt',updated_at)"#).bind(tenant).bind(order_id).bind(&input.status).bind(&principal.student.id).bind(input.reason)
    .fetch_one(&mut *tx).await?;
     if input.status == "rejected" && current.0 != "rejected" {
-        sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version) VALUES($1,$2,$3,$4,1) ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now()")
-            .bind(tenant).bind(&current.1).bind(&current.3).bind(current.2).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO campus_ops.canteen_wallet_transactions(tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id) VALUES($1,$2,$3,$4,'refund','Rejected canteen order refund',$5,$6,$7) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING")
-            .bind(tenant).bind(&current.1).bind(&current.3).bind(current.2).bind(order_id.to_string())
-            .bind(format!("order-refund-{order_id}")).bind(&principal.student.id).execute(&mut *tx).await?;
+        refund_order_to_wallets(
+            &mut tx,
+            tenant,
+            RefundedOrder {
+                id: order_id,
+                customer: &current.1,
+                shop_key: &current.3,
+                total: current.2,
+            },
+            &principal.student.id,
+        )
+        .await?;
         notify_tx(
             &mut tx,
             tenant,
@@ -3679,6 +4011,87 @@ async fn update_order_status(
         &format!("order.{}", input.status),
     );
     Ok(Json(ApiResponse::new(order)))
+}
+
+/// The refund lines of a rejected order: each wallet bucket the order was
+/// paid from gets its share back. Orders from before scoped credit carry no
+/// split; their whole total goes back to the order's shop, as it always did.
+fn refund_lines(split: Option<&Value>, shop_key: &str, total: f64) -> Vec<(String, f64, String)> {
+    let lines: Vec<(String, f64, String)> = split
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let bucket = entry.get("shopKey")?.as_str()?.to_owned();
+                    let amount = entry.get("amount")?.as_f64()?;
+                    let scope = entry
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .unwrap_or("all")
+                        .to_owned();
+                    (amount > 0.0).then_some((bucket, amount, scope))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if lines.is_empty() && total > 0.0 {
+        vec![(shop_key.to_owned(), total, "all".to_owned())]
+    } else {
+        lines
+    }
+}
+
+/// Returns a rejected order's money to the wallet buckets it came from and
+/// ledgers each return. Runs inside the rejecting transaction, which holds
+/// the order row, so it happens once.
+/// The order a refund is for: its id, who paid, the shop it was placed with
+/// and its total.
+struct RefundedOrder<'a> {
+    id: Uuid,
+    customer: &'a str,
+    shop_key: &'a str,
+    total: f64,
+}
+
+async fn refund_order_to_wallets(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: Uuid,
+    order: RefundedOrder<'_>,
+    actor: &str,
+) -> ApiResult<()> {
+    let RefundedOrder {
+        id: order_id,
+        customer,
+        shop_key,
+        total,
+    } = order;
+    let split = sqlx::query_scalar::<_, Option<Value>>(
+        "SELECT wallet_split FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND id=$2",
+    )
+    .bind(tenant)
+    .bind(order_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten();
+    for (position, (bucket, amount, scope)) in refund_lines(split.as_ref(), shop_key, total)
+        .into_iter()
+        .enumerate()
+    {
+        sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version) VALUES($1,$2,$3,$4,1) ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now()")
+            .bind(tenant).bind(customer).bind(&bucket).bind(amount).execute(&mut **tx).await?;
+        // The first return keeps the key refunds always had.
+        let idempotency_key = if position == 0 {
+            format!("order-refund-{order_id}")
+        } else {
+            format!("order-refund-{order_id}:{bucket}")
+        };
+        sqlx::query("INSERT INTO campus_ops.canteen_wallet_transactions(tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id,wallet_scope,counter_shop_key) VALUES($1,$2,$3,$4,'refund','Rejected canteen order refund',$5,$6,$7,$8,$9) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING")
+            .bind(tenant).bind(customer).bind(&bucket).bind(amount).bind(order_id.to_string())
+            .bind(idempotency_key).bind(actor).bind(&scope).bind(shop_key)
+            .execute(&mut **tx).await?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -3756,11 +4169,18 @@ async fn scan_order(
     let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.canteen_orders SET status=$3,handled_by=$4,lines=COALESCE($5,lines),token_number=CASE WHEN $3<>'pending' AND token_number IS NULL THEN (order_number % 1000)::int ELSE token_number END,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'orderNumber',order_number,'tokenNumber',token_number,'status',status,'customerUserId',customer_user_id,'lines',lines,'total',total::float8,'isInstant',true,'updatedAt',updated_at)")
  .bind(tenant).bind(current.0).bind(&next_status).bind(&principal.student.id).bind(next_lines).fetch_one(&mut *tx).await?;
     if desired == "rejected" && current.1 != "rejected" {
-        sqlx::query("INSERT INTO campus_ops.canteen_wallets(tenant_id,user_id,shop_key,balance,version) VALUES($1,$2,$3,$4,1) ON CONFLICT(tenant_id,user_id,shop_key) DO UPDATE SET balance=campus_ops.canteen_wallets.balance+EXCLUDED.balance,version=campus_ops.canteen_wallets.version+1,updated_at=now()")
-            .bind(tenant).bind(&current.2).bind(&current.4).bind(current.3).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO campus_ops.canteen_wallet_transactions(tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id) VALUES($1,$2,$3,$4,'refund','Rejected canteen order refund',$5,$6,$7) ON CONFLICT(tenant_id,idempotency_key) DO NOTHING")
-            .bind(tenant).bind(&current.2).bind(&current.4).bind(current.3).bind(current.0.to_string())
-            .bind(format!("order-refund-{}", current.0)).bind(&principal.student.id).execute(&mut *tx).await?;
+        refund_order_to_wallets(
+            &mut tx,
+            tenant,
+            RefundedOrder {
+                id: current.0,
+                customer: &current.2,
+                shop_key: &current.4,
+                total: current.3,
+            },
+            &principal.student.id,
+        )
+        .await?;
         notify_tx(
             &mut tx,
             tenant,
@@ -3818,6 +4238,9 @@ async fn scan_order(
 struct TopUpRequest {
     amount: f64,
     shop_key: Option<String>,
+    /// `all` (the default) or the counter the credit is restricted to, for a
+    /// canteen with counters.
+    scope: Option<String>,
     source: Option<String>,
     reference: Option<String>,
     idempotency_key: Option<String>,
@@ -4622,7 +5045,7 @@ async fn wallet_stores(pool: &sqlx::PgPool, tenant: Uuid) -> ApiResult<Vec<Value
     Ok(sqlx::query_scalar::<_, Value>(
         r#"SELECT jsonb_build_object('shopKey', shop.shop_key, 'name', shop.name,
                   'category', lower(shop.category), 'active', shop.is_active,
-                  'isOpen', shop.shop_open)
+                  'isOpen', shop.shop_open, 'parentShopKey', shop.parent_shop_key)
            FROM campus_ops.shops shop
            WHERE shop.tenant_id=$1 AND shop.is_active
              AND lower(shop.category) = ANY($2)
@@ -4665,14 +5088,124 @@ pub(crate) async fn resolve_top_up_store(
                     "'{key}' is not an active canteen, stationery or laundry store of this campus"
                 ))
             }),
+        // A counter is never "the canteen wallet": its credit is restricted.
         None => stores
             .iter()
+            .filter(|store| store.get("parentShopKey").is_none_or(Value::is_null))
             .filter_map(store_of)
             .find(|(_, _, category)| category == "canteen")
             .map(|(shop_key, name, _)| (shop_key, name))
             .ok_or_else(|| ApiError::BadRequest("Choose which store wallet to top up".into())),
     }
 }
+
+/// The wallet bucket a credit or deduction lands in.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WalletBucket {
+    /// The `canteen_wallets` row: the canteen's own key for general credit,
+    /// a counter's key for credit restricted to that counter.
+    pub(crate) key: String,
+    /// `all`, or the counter key the credit is restricted to.
+    pub(crate) scope: String,
+    /// How the person and the ledger name it: "Canteen" or
+    /// "Canteen · Snacks only".
+    pub(crate) label: String,
+}
+
+/// Picks the bucket for a wallet `shop_key` (as the accountant's wallet list
+/// names it) and an optional `scope` (`all` or one of its counters):
+///
+/// - a canteen with counters: `all` (or no scope) is its general credit;
+///   a counter key is credit only that counter accepts;
+/// - a counter named directly: its restricted credit, or with `all` its
+///   canteen's general credit;
+/// - any other wallet store: its one wallet; only `all` fits.
+///
+/// `stores` is [`wallet_stores`]'s list.
+fn pick_wallet_bucket(
+    stores: &[Value],
+    shop_key: &str,
+    scope: Option<&str>,
+) -> Result<WalletBucket, String> {
+    let find = |key: &str| {
+        stores
+            .iter()
+            .find(|store| store.get("shopKey").and_then(Value::as_str) == Some(key))
+    };
+    let name_of = |store: &Value| {
+        store
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let parent_of = |store: &Value| {
+        store
+            .get("parentShopKey")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let store = find(shop_key)
+        .ok_or_else(|| format!("'{shop_key}' is not an active canteen, stationery or laundry store of this campus"))?;
+    // The wallet is the canteen; a counter named directly stands for its canteen.
+    let (wallet, wallet_store) = match parent_of(store) {
+        Some(parent) => {
+            let parent_store = find(&parent).ok_or_else(|| {
+                format!("The canteen of '{shop_key}' is not active, so its wallet cannot change")
+            })?;
+            (parent, parent_store)
+        }
+        None => (shop_key.to_owned(), store),
+    };
+    let scope = scope.map(str::trim).filter(|scope| !scope.is_empty());
+    let scope = match scope {
+        Some(scope) => scope.to_owned(),
+        None if wallet != shop_key => shop_key.to_owned(),
+        None => "all".to_owned(),
+    };
+    if scope == "all" {
+        return Ok(WalletBucket {
+            key: wallet,
+            scope,
+            label: name_of(wallet_store),
+        });
+    }
+    let counter = find(&scope)
+        .filter(|counter| parent_of(counter).as_deref() == Some(wallet.as_str()))
+        .ok_or_else(|| {
+            format!(
+                "'{scope}' is not an active counter of {}",
+                name_of(wallet_store)
+            )
+        })?;
+    Ok(WalletBucket {
+        key: scope,
+        scope: counter
+            .get("shopKey")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        label: format!("{} · {} only", name_of(wallet_store), name_of(counter)),
+    })
+}
+
+/// [`pick_wallet_bucket`] against this campus's wallet stores.
+pub(crate) async fn resolve_wallet_bucket(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    shop_key: Option<&str>,
+    scope: Option<&str>,
+) -> ApiResult<WalletBucket> {
+    let (shop_key, _) = resolve_top_up_store(pool, tenant, shop_key).await?;
+    let stores = wallet_stores(pool, tenant).await?;
+    pick_wallet_bucket(&stores, &shop_key, scope).map_err(ApiError::BadRequest)
+}
+
+/// How a wallet bucket is named in ledgers and reports, for a
+/// `campus_ops.shops` row aliased `shop` (the bucket's shop): the canteen's
+/// own name for general credit, "Canteen · Snacks only" for credit
+/// restricted to a counter.
+pub(crate) const WALLET_BUCKET_LABEL_SQL: &str = "(CASE WHEN shop.parent_shop_key IS NOT NULL THEN      COALESCE((SELECT bucket_parent.name FROM campus_ops.shops bucket_parent        WHERE bucket_parent.tenant_id=shop.tenant_id AND bucket_parent.shop_key=shop.parent_shop_key),        shop.parent_shop_key) || ' · ' || shop.name || ' only'      ELSE shop.name END)";
 
 async fn wallet_transactions(
     State(state): State<AppState>,
@@ -4684,12 +5217,16 @@ async fn wallet_transactions(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let mut transactions = sqlx::query_scalar::<_, Value>(
+    let mut transactions = sqlx::query_scalar::<_, Value>(&format!(
         r#"
         SELECT jsonb_build_object(
           'id', transaction.id,
           'shopKey', transaction.shop_key,
-          'shopName', shop.name,
+          'shopName', {WALLET_BUCKET_LABEL_SQL},
+          'walletShopKey', COALESCE(shop.parent_shop_key, transaction.shop_key),
+          'walletScope', COALESCE(transaction.wallet_scope,
+            CASE WHEN shop.parent_shop_key IS NOT NULL THEN transaction.shop_key ELSE 'all' END),
+          'counterShopKey', transaction.counter_shop_key,
           'shopCategory', lower(shop.category),
           'userId', transaction.user_id,
           'studentName', student.full_name,
@@ -4715,8 +5252,8 @@ async fn wallet_transactions(
          AND shop.shop_key=transaction.shop_key
         WHERE transaction.tenant_id=$1
         ORDER BY transaction.created_at DESC
-        LIMIT $2"#,
-    )
+        LIMIT $2"#
+    ))
     .bind(tenant)
     .bind(limit)
     .fetch_all(db.pool())
@@ -4846,13 +5383,15 @@ async fn own_wallet_transaction(
     )?;
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
-    let row = sqlx::query_as::<_, (Value, String, Option<String>)>(
+    let row = sqlx::query_as::<_, (Value, String, Option<String>)>(&format!(
         r#"
         SELECT jsonb_build_object(
           'id', t.id,
           'shopKey', t.shop_key,
-          'shopName', (SELECT shop.name FROM campus_ops.shops shop
+          'shopName', (SELECT {WALLET_BUCKET_LABEL_SQL} FROM campus_ops.shops shop
                         WHERE shop.tenant_id=t.tenant_id AND shop.shop_key=t.shop_key LIMIT 1),
+          'walletScope', t.wallet_scope,
+          'counterShopKey', t.counter_shop_key,
           'amount', t.amount::float8,
           'transactionType', t.transaction_type,
           'description', t.description,
@@ -4902,8 +5441,8 @@ async fn own_wallet_transaction(
           'institutionName', (SELECT tenant.name FROM platform.tenants tenant WHERE tenant.id=t.tenant_id)
         ), t.transaction_type, t.idempotency_key
         FROM campus_ops.canteen_wallet_transactions t
-        WHERE t.tenant_id=$1 AND t.user_id=$2 AND t.id=$3"#,
-    )
+        WHERE t.tenant_id=$1 AND t.user_id=$2 AND t.id=$3"#
+    ))
     .bind(tenant)
     .bind(&principal.student.id)
     .bind(transaction_id)
@@ -4970,8 +5509,14 @@ async fn top_up_wallet(
     .into_iter()
     .next()
     .ok_or_else(|| ApiError::NotFound("No active campus user with this wallet was found".into()))?;
-    let (shop_key, shop_name) =
-        resolve_top_up_store(db.pool(), tenant, input.shop_key.as_deref()).await?;
+    let bucket = resolve_wallet_bucket(
+        db.pool(),
+        tenant,
+        input.shop_key.as_deref(),
+        input.scope.as_deref(),
+    )
+    .await?;
+    let (shop_key, shop_name) = (bucket.key.clone(), bucket.label.clone());
     // A shop's own staff may credit only their own shop's wallet.
     let scope = caller_shop_scope(db.pool(), tenant, &principal, &access).await?;
     require_in_scope(scope.as_deref(), &shop_key)?;
@@ -4992,12 +5537,12 @@ async fn top_up_wallet(
     let transaction = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.canteen_wallet_transactions
              (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,
-              idempotency_key,actor_user_id)
-           VALUES($1,$2,$3,$4,$5,'Wallet top-up',$6,$7,$8)
+              idempotency_key,actor_user_id,wallet_scope)
+           VALUES($1,$2,$3,$4,$5,$9,$6,$7,$8,$10)
            ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
            RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'amount',amount::float8,
              'transactionType',transaction_type,'description',description,
-             'referenceId',reference_id,'createdAt',created_at)"#,
+             'walletScope',wallet_scope,'referenceId',reference_id,'createdAt',created_at)"#,
     )
     .bind(tenant)
     .bind(&target_user_id)
@@ -5007,6 +5552,12 @@ async fn top_up_wallet(
     .bind(&reference)
     .bind(&idempotency_key)
     .bind(&principal.student.id)
+    .bind(if bucket.scope == "all" {
+        "Wallet top-up".to_owned()
+    } else {
+        format!("Wallet top-up ({})", bucket.label)
+    })
+    .bind(&bucket.scope)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(transaction) = transaction else {
@@ -5047,6 +5598,7 @@ async fn top_up_wallet(
                 "userId": target_user_id,
                 "shopKey": shop_key,
                 "shopName": shop_name,
+                "walletScope": bucket.scope,
                 "balance": balance,
                 "transaction": existing,
                 "replayed": true,
@@ -5073,6 +5625,7 @@ async fn top_up_wallet(
         "name": person.name,
         "shopKey": shop_key,
         "shopName": shop_name,
+        "walletScope": bucket.scope,
         "balance": balance,
         "transaction": transaction,
         "replayed": false,
@@ -5116,6 +5669,8 @@ async fn top_up_wallet(
 struct WalletDeductionRequest {
     amount: f64,
     shop_key: Option<String>,
+    /// Which bucket of a canteen with counters: `all` (default) or a counter.
+    scope: Option<String>,
     reason: Option<String>,
     idempotency_key: Option<String>,
 }
@@ -5228,8 +5783,14 @@ async fn deduct_from_wallet(
     .into_iter()
     .next()
     .ok_or_else(|| ApiError::NotFound("No active campus user with this wallet was found".into()))?;
-    let (shop_key, shop_name) =
-        resolve_top_up_store(db.pool(), tenant, Some(requested_shop)).await?;
+    let bucket = resolve_wallet_bucket(
+        db.pool(),
+        tenant,
+        Some(requested_shop),
+        input.scope.as_deref(),
+    )
+    .await?;
+    let (shop_key, shop_name) = (bucket.key.clone(), bucket.label.clone());
     let scope = caller_shop_scope(db.pool(), tenant, &principal, &access).await?;
     require_in_scope(scope.as_deref(), &shop_key)?;
     let target_user_id = person.user_id.to_lowercase();
@@ -5244,11 +5805,11 @@ async fn deduct_from_wallet(
     let transaction = sqlx::query_scalar::<_, Value>(
         r#"INSERT INTO campus_ops.canteen_wallet_transactions
              (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,
-              idempotency_key,actor_user_id)
-           VALUES($1,$2,$3,$4,'manual_debit',$5,NULL,$6,$7)
+              idempotency_key,actor_user_id,wallet_scope)
+           VALUES($1,$2,$3,$4,'manual_debit',$5,NULL,$6,$7,$8)
            ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
            RETURNING jsonb_build_object('id',id,'shopKey',shop_key,'amount',amount::float8,
-             'transactionType',transaction_type,'description',description,
+             'transactionType',transaction_type,'description',description,'walletScope',wallet_scope,
              'referenceId',reference_id,'actorUserId',actor_user_id,'createdAt',created_at)"#,
     )
     .bind(tenant)
@@ -5258,6 +5819,7 @@ async fn deduct_from_wallet(
     .bind(&reason)
     .bind(&idempotency_key)
     .bind(&principal.student.id)
+    .bind(&bucket.scope)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(transaction) = transaction else {
@@ -5301,6 +5863,7 @@ async fn deduct_from_wallet(
                 "name": person.name,
                 "shopKey": shop_key,
                 "shopName": shop_name,
+                "walletScope": bucket.scope,
                 "balance": balance,
                 "transaction": existing,
                 "replayed": true,
@@ -5327,6 +5890,7 @@ async fn deduct_from_wallet(
         "name": person.name,
         "shopKey": shop_key,
         "shopName": shop_name,
+        "walletScope": bucket.scope,
         "balance": balance,
         "previousBalance": ((balance + amount) * 100.0).round() / 100.0,
         "reason": reason,
@@ -9205,6 +9769,7 @@ pub(crate) async fn tenant_id(pool: &sqlx::PgPool, slug: &str) -> ApiResult<Uuid
     // one place that guarantees the shop display order column exists before
     // any shop listing (here, sales, reports, wallets) sorts by it.
     ensure_shop_order_schema(pool).await;
+    ensure_canteen_counter_schema(pool).await;
     sqlx::query_scalar("SELECT id FROM platform.tenants WHERE slug=$1")
         .bind(slug)
         .fetch_optional(pool)
@@ -9246,6 +9811,52 @@ pub(crate) async fn ensure_shop_order_schema(pool: &sqlx::PgPool) {
         .execute(pool)
         .await
         .map_err(|error| tracing::warn!(%error, "shop display order column unavailable"))
+        .is_ok(),
+        Err(_) => false,
+    };
+    if done && let Ok(mut set) = ready.lock() {
+        set.insert(key);
+    }
+}
+
+/// Mirrors migrations/runtime/0148_canteen_counters_wallet_scopes.sql for
+/// databases the migration runner has not reached: counters under a parent
+/// canteen and scoped wallet credit. Same once-per-database guard as
+/// [`ensure_shop_order_schema`]; the DDL only runs while a column is missing.
+pub(crate) async fn ensure_canteen_counter_schema(pool: &sqlx::PgPool) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static READY: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let ready = READY.get_or_init(|| Mutex::new(HashSet::new()));
+    let options = pool.connect_options();
+    let key = format!(
+        "{}:{}/{}",
+        options.get_host(),
+        options.get_port(),
+        options.get_database().unwrap_or_default()
+    );
+    if ready.lock().map(|set| set.contains(&key)).unwrap_or(false) {
+        return;
+    }
+    let present = sqlx::query_scalar::<_, bool>(
+        r#"SELECT to_regclass('campus_ops.shops') IS NULL OR (
+             SELECT count(*) FROM information_schema.columns
+             WHERE table_schema='campus_ops'
+               AND ((table_name='shops' AND column_name='parent_shop_key')
+                 OR (table_name='canteen_wallet_transactions'
+                     AND column_name IN ('wallet_scope','counter_shop_key'))
+                 OR (table_name='canteen_orders' AND column_name='wallet_split'))) = 4"#,
+    )
+    .fetch_one(pool)
+    .await;
+    let done = match present {
+        Ok(true) => true,
+        Ok(false) => sqlx::raw_sql(include_str!(
+            "../../../migrations/runtime/0148_canteen_counters_wallet_scopes.sql"
+        ))
+        .execute(pool)
+        .await
+        .map_err(|error| tracing::warn!(%error, "canteen counter columns unavailable"))
         .is_ok(),
         Err(_) => false,
     };
@@ -10325,5 +10936,178 @@ mod tests {
             let value = code.parse::<u32>().expect("numeric gate code");
             assert!((100_000..=499_999).contains(&value));
         }
+    }
+
+    fn charge(shop: &str, parent: Option<&str>, rupees: i64) -> BasketCharge {
+        BasketCharge {
+            shop: shop.into(),
+            parent: parent.map(str::to_owned),
+            total_paise: rupees * 100,
+        }
+    }
+
+    fn balances(entries: &[(&str, i64)]) -> std::collections::HashMap<String, i64> {
+        entries
+            .iter()
+            .map(|(key, rupees)| ((*key).to_owned(), rupees * 100))
+            .collect()
+    }
+
+    #[test]
+    fn counter_orders_spend_counter_only_credit_before_canteen_credit() {
+        // ₹100 Snacks only, ₹50 whole canteen; a ₹120 snacks order.
+        let plan = plan_wallet_debits(
+            &[charge("snacks", Some("canteen"), 120)],
+            &balances(&[("snacks", 100), ("canteen", 50)]),
+        )
+        .expect("covered");
+        assert_eq!(
+            plan,
+            vec![vec![("snacks".into(), 10_000), ("canteen".into(), 2_000)]]
+        );
+    }
+
+    #[test]
+    fn another_counter_cannot_spend_snacks_only_credit() {
+        let wallet = balances(&[("snacks", 100), ("canteen", 50)]);
+        assert_eq!(
+            plan_wallet_debits(&[charge("meals", Some("canteen"), 50)], &wallet),
+            Ok(vec![vec![("canteen".into(), 5_000)]])
+        );
+        assert_eq!(
+            plan_wallet_debits(&[charge("meals", Some("canteen"), 60)], &wallet),
+            Err(0)
+        );
+    }
+
+    #[test]
+    fn one_cart_never_spends_general_credit_twice() {
+        let wallet = balances(&[("canteen", 50)]);
+        assert_eq!(
+            plan_wallet_debits(
+                &[
+                    charge("meals", Some("canteen"), 30),
+                    charge("drinks", Some("canteen"), 30)
+                ],
+                &wallet
+            ),
+            Err(1)
+        );
+        assert_eq!(
+            plan_wallet_debits(
+                &[
+                    charge("meals", Some("canteen"), 30),
+                    charge("drinks", Some("canteen"), 20)
+                ],
+                &wallet
+            ),
+            Ok(vec![
+                vec![("canteen".into(), 3_000)],
+                vec![("canteen".into(), 2_000)]
+            ])
+        );
+    }
+
+    #[test]
+    fn shops_without_counters_spend_only_their_own_wallet() {
+        let wallet = balances(&[("mec-canteen", 40), ("qa-canteen-2", 100)]);
+        assert_eq!(
+            plan_wallet_debits(&[charge("mec-canteen", None, 40)], &wallet),
+            Ok(vec![vec![("mec-canteen".into(), 4_000)]])
+        );
+        assert_eq!(
+            plan_wallet_debits(&[charge("mec-canteen", None, 41)], &wallet),
+            Err(0)
+        );
+    }
+
+    #[test]
+    fn a_negative_bucket_counts_as_empty_and_free_baskets_charge_nothing() {
+        let wallet = balances(&[("snacks", -20), ("canteen", 30)]);
+        assert_eq!(
+            plan_wallet_debits(&[charge("snacks", Some("canteen"), 30)], &wallet),
+            Ok(vec![vec![("canteen".into(), 3_000)]])
+        );
+        assert_eq!(
+            plan_wallet_debits(&[charge("snacks", Some("canteen"), 0)], &wallet),
+            Ok(vec![vec![]])
+        );
+    }
+
+    #[test]
+    fn wallet_scope_names_restricted_counter_credit() {
+        assert_eq!(wallet_scope_of("snacks", "snacks", Some("canteen")), "snacks");
+        assert_eq!(wallet_scope_of("canteen", "snacks", Some("canteen")), "all");
+        assert_eq!(wallet_scope_of("mec-canteen", "mec-canteen", None), "all");
+    }
+
+    #[test]
+    fn refunds_return_to_the_buckets_that_paid() {
+        let split = json!([
+            {"shopKey": "snacks", "amount": 100.0, "scope": "snacks"},
+            {"shopKey": "canteen", "amount": 20.0, "scope": "all"}
+        ]);
+        assert_eq!(
+            refund_lines(Some(&split), "snacks", 120.0),
+            vec![
+                ("snacks".to_owned(), 100.0, "snacks".to_owned()),
+                ("canteen".to_owned(), 20.0, "all".to_owned())
+            ]
+        );
+        // Orders from before scoped credit refund their total to their shop.
+        assert_eq!(
+            refund_lines(None, "mec-canteen", 45.0),
+            vec![("mec-canteen".to_owned(), 45.0, "all".to_owned())]
+        );
+        assert_eq!(
+            refund_lines(Some(&json!([])), "mec-canteen", 45.0),
+            vec![("mec-canteen".to_owned(), 45.0, "all".to_owned())]
+        );
+    }
+
+    fn wallet_store_list() -> Vec<Value> {
+        vec![
+            json!({"shopKey": "canteen", "name": "Campus Canteen", "category": "canteen", "parentShopKey": null}),
+            json!({"shopKey": "snacks", "name": "Snacks", "category": "canteen", "parentShopKey": "canteen"}),
+            json!({"shopKey": "meals", "name": "Meals", "category": "canteen", "parentShopKey": "canteen"}),
+            json!({"shopKey": "laundry", "name": "Laundry", "category": "laundry"}),
+        ]
+    }
+
+    #[test]
+    fn accountant_credit_picks_general_or_counter_bucket() {
+        let stores = wallet_store_list();
+        let general = pick_wallet_bucket(&stores, "canteen", None).expect("general");
+        assert_eq!((general.key.as_str(), general.scope.as_str()), ("canteen", "all"));
+        assert_eq!(general.label, "Campus Canteen");
+        let snacks = pick_wallet_bucket(&stores, "canteen", Some("snacks")).expect("snacks");
+        assert_eq!((snacks.key.as_str(), snacks.scope.as_str()), ("snacks", "snacks"));
+        assert_eq!(snacks.label, "Campus Canteen · Snacks only");
+        // A counter named directly is its restricted credit; `all` is the canteen's.
+        assert_eq!(pick_wallet_bucket(&stores, "snacks", None).unwrap().key, "snacks");
+        assert_eq!(
+            pick_wallet_bucket(&stores, "snacks", Some("all")).unwrap().key,
+            "canteen"
+        );
+        assert!(pick_wallet_bucket(&stores, "canteen", Some("laundry")).is_err());
+        assert!(pick_wallet_bucket(&stores, "laundry", Some("snacks")).is_err());
+        assert_eq!(pick_wallet_bucket(&stores, "laundry", None).unwrap().scope, "all");
+    }
+
+    #[test]
+    fn shop_writes_tell_an_omitted_parent_from_a_cleared_one() {
+        let body = |extra: &str| {
+            serde_json::from_str::<ShopRequest>(&format!(
+                r#"{{"shopKey":"snacks","name":"Snacks"{extra}}}"#
+            ))
+            .expect("valid shop body")
+        };
+        assert_eq!(requested_parent(&body("")), None);
+        assert_eq!(requested_parent(&body(r#","parentShopKey":null"#)), Some(None));
+        assert_eq!(requested_parent(&body(r#","parentShopKey":"  ""#)), Some(None));
+        assert_eq!(
+            requested_parent(&body(r#","parentShopKey":"canteen""#)),
+            Some(Some("canteen".into()))
+        );
     }
 }

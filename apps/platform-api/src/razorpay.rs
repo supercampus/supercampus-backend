@@ -166,13 +166,16 @@ pub async fn create_order(
     let shop_key = if purpose == "wallet_top_up" {
         let tenant =
             crate::operations::tenant_id(database.pool(), &principal.student.tenant_id).await?;
-        crate::operations::resolve_top_up_store(
+        // Online top-ups are general credit: a counter named here stands for
+        // its canteen, and the money is spendable at every counter.
+        crate::operations::resolve_wallet_bucket(
             database.pool(),
             tenant,
             request.shop_key.as_deref(),
+            Some("all"),
         )
         .await?
-        .0
+        .key
     } else {
         request.shop_key.clone().unwrap_or_default()
     };
@@ -435,12 +438,8 @@ async fn credit_wallet(
 ) -> ApiResult<(f64, Value)> {
     let amount = order.amount as f64 / 100.0;
     let database = state.tenant_database(&owner.tenant_slug).await?;
-    let tenant_id =
-        sqlx::query_scalar::<_, Uuid>("SELECT id FROM platform.tenants WHERE slug = $1")
-            .bind(&owner.tenant_slug)
-            .fetch_optional(database.pool())
-            .await?
-            .ok_or_else(|| ApiError::NotFound("Tenant not found".into()))?;
+    // Resolving the tenant also makes sure the ledger's scope column exists.
+    let tenant_id = crate::operations::tenant_id(database.pool(), &owner.tenant_slug).await?;
     let mut transaction = database.pool().begin().await?;
     let idempotency_key = format!("razorpay:{payment_id}");
     let shop_key = order
@@ -451,8 +450,8 @@ async fn credit_wallet(
     let inserted = sqlx::query(
         r#"INSERT INTO campus_ops.canteen_wallet_transactions
            (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,
-            idempotency_key,actor_user_id)
-           VALUES($1,$2,$3,$4,'online_top_up','Razorpay wallet top-up',$5,$6,$2)
+            idempotency_key,actor_user_id,wallet_scope)
+           VALUES($1,$2,$3,$4,'online_top_up','Razorpay wallet top-up',$5,$6,$2,'all')
            ON CONFLICT(tenant_id,idempotency_key) DO NOTHING
            RETURNING id,created_at"#,
     )

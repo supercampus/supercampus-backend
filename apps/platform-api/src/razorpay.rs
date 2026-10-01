@@ -160,11 +160,22 @@ pub async fn create_order(
             "receipt must be 40 characters or fewer".into(),
         ));
     }
-    let shop_key = request
-        .shop_key
-        .as_deref()
-        .unwrap_or("mec-canteen")
-        .to_owned();
+    // A wallet top-up credits one real store's wallet: the one named, which
+    // must be an active wallet store, or for older clients that name none the
+    // first canteen. Never a hard-coded key a campus may not have.
+    let shop_key = if purpose == "wallet_top_up" {
+        let tenant =
+            crate::operations::tenant_id(database.pool(), &principal.student.tenant_id).await?;
+        crate::operations::resolve_top_up_store(
+            database.pool(),
+            tenant,
+            request.shop_key.as_deref(),
+        )
+        .await?
+        .0
+    } else {
+        request.shop_key.clone().unwrap_or_default()
+    };
     let mut notes = json!({
         "tenantId": principal.student.tenant_id,
         "studentId": principal.student.id,

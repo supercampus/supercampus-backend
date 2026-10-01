@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::{
     error::{ApiError, ApiResult},
     models::ApiResponse,
-    operations::{require_any, tenant_id},
+    operations::{caller_shop_scope, require_any, require_in_scope, tenant_id},
     state::{AppState, AuthPrincipal, EffectiveAccess},
 };
 
@@ -55,7 +55,7 @@ const TENANT_TIMEZONE: &str = "Asia/Kolkata";
 /// resolve to the shop of the matching category, exactly as ordering does.
 pub(crate) const SALES_CTE: &str = r#"
 WITH shop_list AS (
-  SELECT shop_key, name, category, created_at FROM campus_ops.shops WHERE tenant_id=$1
+  SELECT shop_key, name, category, created_at, is_active FROM campus_ops.shops WHERE tenant_id=$1
 ),
 bounds AS (
   SELECT (now() AT TIME ZONE $2) AS now_local,
@@ -80,7 +80,7 @@ sales AS (
       WHEN lower(o.store) LIKE '%laundry%' THEN 'laundry'
       WHEN lower(o.store) LIKE '%station%' THEN 'stationery'
       ELSE 'canteen' END
-    ORDER BY s.created_at, s.shop_key LIMIT 1
+    ORDER BY s.is_active DESC, s.created_at, s.shop_key LIMIT 1
   ) fallback ON true
   WHERE o.tenant_id=$1
   UNION ALL
@@ -96,6 +96,17 @@ sales AS (
   LEFT JOIN identity.users u ON u.id::text=c.claimed_by
   WHERE c.tenant_id=$1
 )"#;
+
+/// [`SALES_CTE`] narrowed to the shops in `$param` (a `text[]`; NULL keeps
+/// every shop), so a shop's own staff read only their own shops' sales. The
+/// narrowed set keeps the name `sales`, so every query reads it unchanged.
+fn scoped_sales_cte(param: usize) -> String {
+    let base = SALES_CTE.replacen("\nsales AS (", "\nsales_all AS (", 1);
+    format!(
+        "{},\nsales AS (SELECT * FROM sales_all WHERE ${param}::text[] IS NULL OR shop_key = ANY(${param}))",
+        base.trim_end()
+    )
+}
 
 /// SQL predicate: the sale falls inside period `$3`.
 const IN_PERIOD: &str = "(CASE $3 WHEN 'today' THEN x.local_at >= b.today_start \
@@ -380,10 +391,18 @@ async fn sales_dashboard(
     let pool = db.pool();
     let tenant = tenant_id(pool, &principal.student.tenant_id).await?;
 
-    let rows = sales_rows(pool, tenant, period).await?;
-    let shops = shop_register(pool, tenant).await?;
-    let trend = sales_trend(pool, tenant, period).await?;
-    let top_items = top_items(pool, tenant, period).await?;
+    // A shop's own staff see their own shops only: two canteens' owners
+    // never read each other's takings.
+    let scope = caller_shop_scope(pool, tenant, &principal, &access).await?;
+    let scope = scope.as_deref();
+    let rows = sales_rows(pool, tenant, period, scope).await?;
+    let shops: Vec<ShopInfo> = shop_register(pool, tenant)
+        .await?
+        .into_iter()
+        .filter(|shop| scope.is_none_or(|keys| keys.contains(&shop.shop_key)))
+        .collect();
+    let trend = sales_trend(pool, tenant, period, scope).await?;
+    let top_items = top_items(pool, tenant, period, scope).await?;
     let range = sqlx::query_as::<_, (String, String)>(
         r#"SELECT to_char(CASE $1 WHEN 'today' THEN date_trunc('day', now() AT TIME ZONE $2)
                  WHEN 'week' THEN date_trunc('week', now() AT TIME ZONE $2)
@@ -399,7 +418,7 @@ async fn sales_dashboard(
     .await?;
     // The newest sales regardless of period, for app builds that still read
     // `recentOrders` from here instead of the orders ledger.
-    let (_, recent) = orders_page(pool, tenant, SalesPeriod::All, None, None, 25).await?;
+    let (_, recent) = orders_page(pool, tenant, SalesPeriod::All, None, None, 25, scope).await?;
 
     let mut body = dashboard_json(period, &rows, &shops, trend, top_items, range);
     body["recentOrders"] = recent;
@@ -529,9 +548,11 @@ async fn sales_rows(
     pool: &sqlx::PgPool,
     tenant: Uuid,
     period: SalesPeriod,
+    scope: Option<&[String]>,
 ) -> ApiResult<Vec<SalesRow>> {
+    let sales = scoped_sales_cte(4);
     let sql = format!(
-        r#"{SALES_CTE}
+        r#"{sales}
         SELECT x.shop_key, x.bucket,
           count(*)::int8, COALESCE(sum(x.total), 0)::float8,
           count(*) FILTER (WHERE {IN_PERIOD})::int8,
@@ -547,6 +568,7 @@ async fn sales_rows(
         .bind(tenant)
         .bind(TENANT_TIMEZONE)
         .bind(period.key())
+        .bind(scope)
         .fetch_all(pool)
         .await?;
     Ok(rows
@@ -605,9 +627,15 @@ async fn shop_register(pool: &sqlx::PgPool, tenant: Uuid) -> ApiResult<Vec<ShopI
 
 /// Completed revenue and order counts per bar, zero-filled across the whole
 /// period so gaps show as empty days rather than disappearing.
-async fn sales_trend(pool: &sqlx::PgPool, tenant: Uuid, period: SalesPeriod) -> ApiResult<Value> {
+async fn sales_trend(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    period: SalesPeriod,
+    scope: Option<&[String]>,
+) -> ApiResult<Value> {
+    let sales = scoped_sales_cte(5);
     let sql = format!(
-        r#"{SALES_CTE},
+        r#"{sales},
         series AS (
           SELECT generate_series(
             CASE $3 WHEN 'today' THEN b.today_start
@@ -646,15 +674,22 @@ async fn sales_trend(pool: &sqlx::PgPool, tenant: Uuid, period: SalesPeriod) -> 
         .bind(TENANT_TIMEZONE)
         .bind(period.key())
         .bind(period.bucket_unit())
+        .bind(scope)
         .fetch_one(pool)
         .await?;
     Ok(json!({ "unit": period.bucket_unit(), "points": points }))
 }
 
 /// Best sellers by quantity from completed order lines in the period.
-async fn top_items(pool: &sqlx::PgPool, tenant: Uuid, period: SalesPeriod) -> ApiResult<Value> {
+async fn top_items(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    period: SalesPeriod,
+    scope: Option<&[String]>,
+) -> ApiResult<Value> {
+    let sales = scoped_sales_cte(4);
     let sql = format!(
-        r#"{SALES_CTE}
+        r#"{sales}
         SELECT COALESCE(jsonb_agg(item ORDER BY (item->>'quantity')::float8 DESC,
                                    (item->>'revenue')::float8 DESC), '[]'::jsonb)
         FROM (
@@ -676,6 +711,7 @@ async fn top_items(pool: &sqlx::PgPool, tenant: Uuid, period: SalesPeriod) -> Ap
         .bind(tenant)
         .bind(TENANT_TIMEZONE)
         .bind(period.key())
+        .bind(scope)
         .fetch_one(pool)
         .await?)
 }
@@ -709,7 +745,12 @@ async fn sales_orders(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let pool = db.pool();
     let tenant = tenant_id(pool, &principal.student.tenant_id).await?;
-    let (total, orders) = orders_page(pool, tenant, period, store, status, limit).await?;
+    let scope = caller_shop_scope(pool, tenant, &principal, &access).await?;
+    if let Some(store) = store.as_deref() {
+        require_in_scope(scope.as_deref(), store)?;
+    }
+    let (total, orders) =
+        orders_page(pool, tenant, period, store, status, limit, scope.as_deref()).await?;
     Ok(Json(ApiResponse::new(json!({
         "period": period.key(),
         "total": total,
@@ -724,9 +765,11 @@ async fn orders_page(
     store: Option<String>,
     status: Option<StatusBucket>,
     limit: i64,
+    scope: Option<&[String]>,
 ) -> ApiResult<(i64, Value)> {
+    let sales = scoped_sales_cte(7);
     let sql = format!(
-        r#"{SALES_CTE},
+        r#"{sales},
         matching AS (
           SELECT x.* FROM sales x CROSS JOIN bounds b
           WHERE {IN_PERIOD}
@@ -763,6 +806,7 @@ async fn orders_page(
         .bind(store)
         .bind(status.map(StatusBucket::key))
         .bind(limit)
+        .bind(scope)
         .fetch_one(pool)
         .await?)
 }
@@ -770,6 +814,17 @@ async fn orders_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_sales_keep_the_sales_name_and_filter_by_shop() {
+        let sql = scoped_sales_cte(7);
+        assert!(sql.contains("\nsales_all AS ("));
+        assert!(sql.trim_end().ends_with(
+            "sales AS (SELECT * FROM sales_all WHERE $7::text[] IS NULL OR shop_key = ANY($7))"
+        ));
+        // Only the one base CTE is renamed.
+        assert_eq!(sql.matches("sales_all AS (").count(), 1);
+    }
 
     fn row(shop: &str, bucket: StatusBucket, period: (i64, f64), all: (i64, f64)) -> SalesRow {
         SalesRow {

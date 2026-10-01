@@ -455,13 +455,17 @@ async fn report_options(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let pool = db.pool();
     let tenant = tenant_id(pool, &principal.student.tenant_id).await?;
+    // The shop picker offers a shop's own staff their own shops only.
+    let scope = crate::operations::caller_shop_scope(pool, tenant, &principal, &access).await?;
     let shops = sqlx::query_scalar::<_, Value>(
         r#"SELECT COALESCE(jsonb_agg(jsonb_build_object(
              'shopKey', shop_key, 'name', name, 'category', lower(category),
              'isActive', is_active) ORDER BY sort_order NULLS LAST, name, shop_key), '[]'::jsonb)
-           FROM campus_ops.shops WHERE tenant_id=$1"#,
+           FROM campus_ops.shops WHERE tenant_id=$1
+             AND ($2::text[] IS NULL OR shop_key = ANY($2))"#,
     )
     .bind(tenant)
+    .bind(scope.as_deref())
     .fetch_one(pool)
     .await?;
     let items = sqlx::query_scalar::<_, Value>(
@@ -471,9 +475,10 @@ async fn report_options(
              'price', item.price::float8) ORDER BY COALESCE(shop.name, item.store), item.name), '[]'::jsonb)
            FROM campus_ops.canteen_menu_items item
            LEFT JOIN campus_ops.shops shop ON shop.tenant_id=item.tenant_id AND shop.shop_key=item.store
-           WHERE item.tenant_id=$1"#,
+           WHERE item.tenant_id=$1 AND ($2::text[] IS NULL OR item.store = ANY($2))"#,
     )
     .bind(tenant)
+    .bind(scope.as_deref())
     .fetch_one(pool)
     .await?;
     let today = local_today(pool).await?;
@@ -489,6 +494,40 @@ async fn report_options(
             .map(|kind| kind.key())
             .collect::<Vec<_>>(),
     }))))
+}
+
+/// The shop a report covers for a caller limited to `scope` (their assigned
+/// shops; `None` is the whole campus). A scoped caller must name one of their
+/// shops, or has it chosen for them when they run exactly one; reports about
+/// something other than a shop are not theirs to read.
+fn scoped_report_shop<'a>(
+    kind: ReportKind,
+    scope: Option<&'a [String]>,
+    requested: Option<&'a str>,
+) -> ApiResult<Option<&'a str>> {
+    let Some(keys) = scope else {
+        return Ok(requested);
+    };
+    if !kind.uses_shop() {
+        return Err(ApiError::ForbiddenWithMessage(
+            "This report covers the whole campus. Ask the accounts office for it.".into(),
+        ));
+    }
+    match requested {
+        Some(key) => {
+            crate::operations::require_in_scope(Some(keys), key)?;
+            Ok(Some(key))
+        }
+        None => match keys {
+            [only] => Ok(Some(only.as_str())),
+            [] => Err(ApiError::ForbiddenWithMessage(
+                crate::operations::NOT_ASSIGNED_TO_SHOP_MESSAGE.into(),
+            )),
+            _ => Err(ApiError::BadRequest(
+                "Choose one of your shops for this report".into(),
+            )),
+        },
+    }
 }
 
 async fn local_today(pool: &sqlx::PgPool) -> ApiResult<NaiveDate> {
@@ -510,7 +549,7 @@ async fn generate_report(
     let kind =
         ReportKind::parse(&kind).ok_or_else(|| ApiError::NotFound("Unknown report kind".into()))?;
     require_kind_access(&access, kind)?;
-    let report = build_report(&state, &principal, kind, &query).await?;
+    let report = build_report(&state, &principal, &access, kind, &query).await?;
     Ok(Json(ApiResponse::new(report)))
 }
 
@@ -519,6 +558,7 @@ async fn generate_report(
 async fn build_report(
     state: &AppState,
     principal: &AuthPrincipal,
+    access: &EffectiveAccess,
     kind: ReportKind,
     query: &ReportQuery,
 ) -> ApiResult<Value> {
@@ -533,6 +573,10 @@ async fn build_report(
         .as_deref()
         .map(str::trim)
         .filter(|s| kind.uses_shop() && !s.is_empty() && !s.eq_ignore_ascii_case("all"));
+    // A shop's own staff report on their own shops only; with one shop that
+    // is the default, never "every shop".
+    let scope = crate::operations::caller_shop_scope(pool, tenant, principal, access).await?;
+    let requested_shop = scoped_report_shop(kind, scope.as_deref(), requested_shop)?;
     let shop = match requested_shop {
         None => None,
         Some(key) => Some(
@@ -1768,7 +1812,7 @@ async fn captain_performance_report(ctx: &Ctx<'_>) -> ApiResult<Report> {
               WHEN lower(o.store) LIKE '%laundry%' THEN 'laundry'
               WHEN lower(o.store) LIKE '%station%' THEN 'stationery'
               ELSE 'canteen' END
-            ORDER BY s.created_at, s.shop_key LIMIT 1
+            ORDER BY s.is_active DESC, s.created_at, s.shop_key LIMIT 1
           ) fallback ON true
           WHERE o.tenant_id=$1 AND (o.created_at AT TIME ZONE $2)::date BETWEEN $3 AND $4
         )
@@ -3533,7 +3577,7 @@ async fn email_report(
         )));
     }
 
-    let report = build_report(&state, &principal, kind, &body.query).await?;
+    let report = build_report(&state, &principal, &access, kind, &body.query).await?;
     let files: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
     let email = compose_email(
         &report,
@@ -3612,6 +3656,35 @@ async fn email_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shop_staff_report_on_their_own_shops_only() {
+        let one = ["qa-canteen-2".to_string()];
+        let two = ["qa-canteen-2".to_string(), "mec-canteen".to_string()];
+        // Campus readers keep whatever they asked for, including every shop.
+        assert_eq!(
+            scoped_report_shop(ReportKind::DailySales, None, None).unwrap(),
+            None
+        );
+        // A one-shop owner gets their shop by default ...
+        assert_eq!(
+            scoped_report_shop(ReportKind::DailySales, Some(&one), None).unwrap(),
+            Some("qa-canteen-2")
+        );
+        // ... may name it, but never another canteen.
+        assert!(
+            scoped_report_shop(ReportKind::ItemSales, Some(&one), Some("mec-canteen")).is_err()
+        );
+        assert_eq!(
+            scoped_report_shop(ReportKind::ItemSales, Some(&two), Some("mec-canteen")).unwrap(),
+            Some("mec-canteen")
+        );
+        // Several shops: choose one. No shop: nothing to report on.
+        assert!(scoped_report_shop(ReportKind::DailySales, Some(&two), None).is_err());
+        assert!(scoped_report_shop(ReportKind::DailySales, Some(&[]), None).is_err());
+        // Campus-wide kinds are not a shop's to read.
+        assert!(scoped_report_shop(ReportKind::OnlinePayments, Some(&one), None).is_err());
+    }
     use base64::Engine as _;
 
     #[test]

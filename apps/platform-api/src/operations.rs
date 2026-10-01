@@ -1320,25 +1320,72 @@ macro_rules! assignment_names_user_sql {
 pub(crate) const NOT_ASSIGNED_TO_SHOP_MESSAGE: &str =
     "You're not assigned to a counter yet. Ask the admin to add you to a shop.";
 
-/// The shop a `campus_ops.canteen_orders` row belongs to, by the same rule the
-/// menu payload uses to resolve an item's store: an exact `shop_key` match,
-/// otherwise the oldest active shop of the store's category. Orders placed
-/// before shops existed carry legacy keys (`classic`, `stationery`); this is
-/// what lets each shop's wallet list only its own orders. Falls back to the
-/// raw store when no shop matches.
+/// The configured shop a stored store key (a menu item's or an order's
+/// `store`, or a key a client sent) belongs to. This is the one rule every
+/// menu, order, wallet, permission and figure shares, so a campus can run any
+/// number of shops of one category — two canteens, say — without one
+/// swallowing the other's items or orders:
+///
+/// - a key that is some shop's own `shop_key` is that shop, whether or not
+///   the shop is active or open right now (a closed or retired shop keeps its
+///   own items and orders; they never drift to a sibling);
+/// - only a key that names no shop at all — a legacy key such as `classic`
+///   or `bites` from before shops existed — falls back to a shop of the
+///   category it implies: the oldest active one, else the oldest at all;
+/// - no shop of that category keeps the raw key.
+///
+/// `$tenant` and `$store` are SQL expressions (a column or a placeholder).
+/// The subquery aliases its table `rs` so it never shadows the caller's.
+macro_rules! resolved_shop_key_sql {
+    ($tenant:literal, $store:literal) => {
+        concat!(
+            "COALESCE((SELECT rs.shop_key FROM campus_ops.shops rs",
+            " WHERE rs.tenant_id=",
+            $tenant,
+            " AND (rs.shop_key=",
+            $store,
+            " OR lower(rs.category)=CASE",
+            " WHEN lower(",
+            $store,
+            ") LIKE '%laundry%' THEN 'laundry'",
+            " WHEN lower(",
+            $store,
+            ") LIKE '%station%' THEN 'stationery'",
+            " ELSE 'canteen' END)",
+            " ORDER BY CASE WHEN rs.shop_key=",
+            $store,
+            " THEN 0 ELSE 1 END,",
+            " rs.is_active DESC, rs.created_at, rs.shop_key LIMIT 1), ",
+            $store,
+            ")"
+        )
+    };
+}
+
+/// The shop a `campus_ops.canteen_orders` row belongs to, by
+/// [`resolved_shop_key_sql`]. Orders placed before shops existed carry legacy
+/// keys (`classic`, `stationery`); this is what lets each shop's queue and
+/// wallet list only its own orders.
 macro_rules! order_shop_key_sql {
     () => {
-        r#"COALESCE((SELECT shop.shop_key FROM campus_ops.shops shop
-            WHERE shop.tenant_id=canteen_orders.tenant_id AND shop.is_active
-              AND (shop.shop_key=canteen_orders.store
-                OR lower(shop.category)=CASE
-                  WHEN lower(canteen_orders.store) LIKE '%laundry%' THEN 'laundry'
-                  WHEN lower(canteen_orders.store) LIKE '%station%' THEN 'stationery'
-                  ELSE 'canteen'
-                END)
-            ORDER BY CASE WHEN shop.shop_key=canteen_orders.store THEN 0 ELSE 1 END,
-              shop.created_at, shop.shop_key
-            LIMIT 1), canteen_orders.store)"#
+        resolved_shop_key_sql!("canteen_orders.tenant_id", "canteen_orders.store")
+    };
+}
+
+/// Whether a `campus_ops.canteen_orders` row belongs to one of the shops in
+/// `$10` (a `text[]` of shop keys), by [`order_shop_key_sql`]. An order whose
+/// store is a shop's own key is decided by that key alone; only legacy keys
+/// pay for the category fallback, so a busy counter's queue stays cheap.
+macro_rules! order_in_shops_sql {
+    () => {
+        concat!(
+            "(CASE WHEN canteen_orders.store = ANY($10) THEN true",
+            " WHEN EXISTS(SELECT 1 FROM campus_ops.shops ks",
+            " WHERE ks.tenant_id=canteen_orders.tenant_id AND ks.shop_key=canteen_orders.store)",
+            " THEN false ELSE ",
+            order_shop_key_sql!(),
+            " = ANY($10) END)"
+        )
     };
 }
 
@@ -1357,41 +1404,16 @@ async fn canteen_store(
         &principal.student.email,
     )
     .await?;
-    // Older menu rows may still carry a legacy store key while the shop shown
-    // to operators uses the tenant-configured key. Expand only through the
-    // same deterministic resolver used by the menu payload so assigned
-    // operators receive those orders without widening access to other shops.
-    let mut order_shop_keys = assigned_shop_keys.clone();
-    if !assigned_shop_keys.is_empty() {
-        let aliases = sqlx::query_scalar::<_, String>(
-            r#"SELECT DISTINCT item.store
-               FROM campus_ops.canteen_menu_items item
-               JOIN LATERAL (
-                 SELECT shop.shop_key
-                 FROM campus_ops.shops shop
-                 WHERE shop.tenant_id=item.tenant_id AND shop.is_active
-                   AND (shop.shop_key=item.store
-                     OR lower(shop.category)=CASE
-                       WHEN lower(item.store) LIKE '%laundry%' THEN 'laundry'
-                       WHEN lower(item.store) LIKE '%station%' THEN 'stationery'
-                       ELSE 'canteen'
-                     END)
-                 ORDER BY CASE WHEN shop.shop_key=item.store THEN 0 ELSE 1 END,
-                   shop.created_at, shop.shop_key
-                 LIMIT 1
-               ) resolved_shop ON true
-               WHERE item.tenant_id=$1 AND resolved_shop.shop_key = ANY($2)"#,
-        )
-        .bind(tenant)
-        .bind(&assigned_shop_keys)
-        .fetch_all(db.pool())
-        .await?;
-        for alias in aliases {
-            if !order_shop_keys.contains(&alias) {
-                order_shop_keys.push(alias);
-            }
-        }
-    }
+    // Which shop each assigned counter is, and in what capacity: a person can
+    // own one canteen and captain another, and the app opens the matching
+    // workspace for the shop on screen.
+    let assigned_shops = assigned_shop_roles(
+        db.pool(),
+        tenant,
+        &principal.student.id,
+        &principal.student.email,
+    )
+    .await?;
     let configures_shops = access.allows("vendor_management.vendors.update");
     let is_vendor_operator = access.allows("canteen.orders.manage")
         || access.allows("canteen.menu.create")
@@ -1417,20 +1439,11 @@ async fn canteen_store(
           'isAvailable',item.is_available,'isInstant',item.is_instant,'imageUrl',item.image_url)
           ORDER BY resolved_shop.shop_key,item.category,item.name)
           FROM campus_ops.canteen_menu_items item
-          JOIN LATERAL (
-            SELECT shop.shop_key
-            FROM campus_ops.shops shop
-            WHERE shop.tenant_id=item.tenant_id AND shop.is_active
-              AND (shop.shop_key=item.store
-                OR lower(shop.category)=CASE
-                  WHEN lower(item.store) LIKE '%laundry%' THEN 'laundry'
-                  WHEN lower(item.store) LIKE '%station%' THEN 'stationery'
-                  ELSE 'canteen'
-                END)
-            ORDER BY CASE WHEN shop.shop_key=item.store THEN 0 ELSE 1 END,
-              shop.created_at, shop.shop_key
-            LIMIT 1
-          ) resolved_shop ON true
+          -- Each item is listed under its own shop, and only while that shop
+          -- is active: a retired canteen's items never surface under another.
+          JOIN campus_ops.shops resolved_shop ON resolved_shop.tenant_id=item.tenant_id
+            AND resolved_shop.is_active
+            AND resolved_shop.shop_key="#, resolved_shop_key_sql!("item.tenant_id", "item.store"), r#"
           -- The catalogue is the whole campus's: an operator in Shop mode buys
           -- from every store like anyone else. Their work surfaces narrow it to
           -- `assignedShopKeys`, and every menu write re-checks the assignment.
@@ -1441,7 +1454,7 @@ async fn canteen_store(
           'tokenNumber',token_number,'qrPayload',id::text,'createdAt',created_at,'updatedAt',updated_at,
           'store',store,'shopKey',"#, order_shop_key_sql!(), r#")
           ORDER BY created_at DESC) FROM campus_ops.canteen_orders
-          WHERE tenant_id=$1 AND (($7 AND (NOT $9 OR store = ANY($11))) OR customer_user_id=$2)), '[]'::jsonb),
+          WHERE tenant_id=$1 AND (($7 AND (NOT $9 OR "#, order_in_shops_sql!(), r#")) OR customer_user_id=$2)), '[]'::jsonb),
         'walletTransactions', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,
           'shopKey',shop_key,'amount',amount::float8,'transactionType',transaction_type,'description',description,
           'referenceId',reference_id,'createdAt',created_at) ORDER BY created_at DESC)
@@ -1453,15 +1466,14 @@ async fn canteen_store(
             FROM campus_ops.shops shop WHERE shop.tenant_id=$1 AND shop.shop_key = ANY($10)) ELSE null END),
         'canManage', $7::boolean,
         'analytics', CASE WHEN $8 THEN jsonb_build_object(
-          'ordersToday',(SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($11)) AND created_at::date=CURRENT_DATE),
-          'revenueToday',COALESCE((SELECT sum(total)::float8 FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($11)) AND status='completed' AND created_at::date=CURRENT_DATE),0),
-          'pending',(SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR store = ANY($11)) AND status IN ('pending','accepted','preparing','ready'))
+          'ordersToday',(SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR "#, order_in_shops_sql!(), r#") AND created_at::date=CURRENT_DATE),
+          'revenueToday',COALESCE((SELECT sum(total)::float8 FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR "#, order_in_shops_sql!(), r#") AND status='completed' AND created_at::date=CURRENT_DATE),0),
+          'pending',(SELECT count(*) FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (NOT $9 OR "#, order_in_shops_sql!(), r#") AND status IN ('pending','accepted','preparing','ready'))
         ) ELSE null END
       )"#))
       .bind(tenant).bind(&principal.student.id).bind(&principal.student.name)
       .bind(&principal.student.email).bind(&principal.student.roll).bind(&principal.student.dept)
       .bind(can_manage).bind(can_read_analytics).bind(restrict_to_assignments).bind(&assigned_shop_keys)
-      .bind(&order_shop_keys)
       .fetch_one(db.pool()).await?;
     // Every active shop, for the same reason as the catalogue above.
     let shops = shops_json(db.pool(), tenant, false, None).await?;
@@ -1513,6 +1525,7 @@ async fn canteen_store(
         object.insert("laundryPricePerKg".into(), json!(laundry_price_per_kg));
         object.insert("laundryCharges".into(), laundry_charges);
         object.insert("assignedShopKeys".into(), json!(assigned_shop_keys));
+        object.insert("assignedShops".into(), json!(assigned_shops));
         // Shop staff whose role is set but who work no counter yet: the app
         // says so instead of showing an empty queue that looks like a quiet day.
         let assignment_pending = shop_assignment_pending(
@@ -1687,6 +1700,31 @@ async fn update_shop(
         input.operators.as_deref(),
     )
     .await?;
+    // Menu items, orders and wallets name their shop by key. Re-keying a shop
+    // that already has any would orphan them, and orphaned keys fall back to
+    // the oldest shop of the category — another canteen's items and money
+    // would land in the original canteen. The app never offers it; refuse it.
+    let in_use = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+             SELECT 1 FROM campus_ops.shops shop
+             WHERE shop.tenant_id=$1 AND shop.id=$2 AND shop.shop_key<>$3
+               AND (EXISTS(SELECT 1 FROM campus_ops.canteen_menu_items i
+                      WHERE i.tenant_id=$1 AND i.store=shop.shop_key)
+                 OR EXISTS(SELECT 1 FROM campus_ops.canteen_orders o
+                      WHERE o.tenant_id=$1 AND o.store=shop.shop_key)
+                 OR EXISTS(SELECT 1 FROM campus_ops.canteen_wallet_transactions t
+                      WHERE t.tenant_id=$1 AND t.shop_key=shop.shop_key)))"#,
+    )
+    .bind(tenant)
+    .bind(shop_id)
+    .bind(input.shop_key.trim())
+    .fetch_one(db.pool())
+    .await?;
+    if in_use {
+        return Err(ApiError::BadRequest(
+            "A shop's key cannot change once it has menu items, orders or wallet activity".into(),
+        ));
+    }
     let mut tx = db.pool().begin().await?;
     let shop = sqlx::query_scalar::<_, Value>(
         r#"
@@ -1852,6 +1890,35 @@ async fn assigned_shop_keys(
     .await?)
 }
 
+/// The person's active shops with their capacity at each (`owner` or
+/// `captain`), in the administrator's shop order. Someone listed twice under
+/// different ids keeps the stronger role.
+async fn assigned_shop_roles(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    user_id: &str,
+    user_email: &str,
+) -> ApiResult<Vec<Value>> {
+    Ok(sqlx::query_scalar::<_, Value>(concat!(
+        r#"SELECT jsonb_build_object('shopKey', shop.shop_key, 'name', shop.name,
+             'category', lower(shop.category),
+             'assignmentRole', CASE WHEN bool_or(assignment.assignment_role='owner')
+                                    THEN 'owner' ELSE 'captain' END)
+           FROM campus_ops.shop_user_assignments assignment
+           JOIN campus_ops.shops shop ON shop.tenant_id=assignment.tenant_id AND shop.id=assignment.shop_id
+           WHERE assignment.tenant_id=$1 AND "#,
+        assignment_names_user_sql!("$2", "$3"),
+        r#" AND assignment.is_active AND shop.is_active
+           GROUP BY shop.shop_key, shop.name, shop.category, shop.sort_order
+           ORDER BY shop.sort_order NULLS LAST, shop.name, shop.shop_key"#
+    ))
+    .bind(tenant)
+    .bind(user_id)
+    .bind(user_email)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// A shop operator as stored: the control-plane account id (the id the
 /// signed-in principal carries), with the details mirrored into the tenant.
 #[derive(Debug, Clone, PartialEq)]
@@ -2005,29 +2072,52 @@ pub(crate) async fn require_assigned_shop(
     shop_key: &str,
     access: &EffectiveAccess,
 ) -> ApiResult<()> {
+    require_shop_assignment(pool, tenant, user_id, user_email, shop_key, access, false).await
+}
+
+/// [`require_assigned_shop`] for changes only a shop's owner makes — its
+/// menu. A person can own one canteen and captain another; holding menu
+/// grants for the first never opens the second's menu to them.
+async fn require_shop_owner(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    user_id: &str,
+    user_email: &str,
+    shop_key: &str,
+    access: &EffectiveAccess,
+) -> ApiResult<()> {
+    require_shop_assignment(pool, tenant, user_id, user_email, shop_key, access, true).await
+}
+
+async fn require_shop_assignment(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    user_id: &str,
+    user_email: &str,
+    shop_key: &str,
+    access: &EffectiveAccess,
+    owner_only: bool,
+) -> ApiResult<()> {
     if access.allows("vendor_management.vendors.update") {
         return Ok(());
     }
-    // A legacy store key (`classic`) belongs to the shop the menu and order
-    // payloads resolve it to, so the counter that sees an order can act on it.
-    let (here, anywhere) = sqlx::query_as::<_, (bool, bool)>(concat!(
+    // A key belongs to the shop the menu and order payloads resolve it to, so
+    // the counter that sees an order can act on it — and only that counter:
+    // another canteen's staff are refused even though it is a canteen too.
+    let (here, owner_here, anywhere) = sqlx::query_as::<_, (bool, bool, bool)>(concat!(
         r#"WITH mine AS (
-             SELECT shop.shop_key FROM campus_ops.shop_user_assignments assignment
+             SELECT shop.shop_key, assignment.assignment_role
+             FROM campus_ops.shop_user_assignments assignment
              JOIN campus_ops.shops shop ON shop.tenant_id=assignment.tenant_id AND shop.id=assignment.shop_id
              WHERE assignment.tenant_id=$1 AND "#,
         assignment_names_user_sql!("$2", "$4"),
         r#" AND assignment.is_active AND shop.is_active),
-           target AS (
-             SELECT COALESCE((SELECT shop.shop_key FROM campus_ops.shops shop
-               WHERE shop.tenant_id=$1 AND shop.is_active
-                 AND (shop.shop_key=$3 OR lower(shop.category)=CASE
-                   WHEN lower($3) LIKE '%laundry%' THEN 'laundry'
-                   WHEN lower($3) LIKE '%station%' THEN 'stationery'
-                   ELSE 'canteen' END)
-               ORDER BY CASE WHEN shop.shop_key=$3 THEN 0 ELSE 1 END, shop.created_at, shop.shop_key
-               LIMIT 1), $3) AS shop_key)
-           SELECT EXISTS(SELECT 1 FROM mine WHERE mine.shop_key=$3
-                           OR mine.shop_key=(SELECT shop_key FROM target)),
+           target AS (SELECT "#,
+        resolved_shop_key_sql!("$1", "$3"),
+        r#" AS shop_key)
+           SELECT EXISTS(SELECT 1 FROM mine WHERE mine.shop_key=(SELECT shop_key FROM target)),
+                  EXISTS(SELECT 1 FROM mine WHERE mine.shop_key=(SELECT shop_key FROM target)
+                           AND mine.assignment_role='owner'),
                   EXISTS(SELECT 1 FROM mine)"#
     ))
     .bind(tenant)
@@ -2036,7 +2126,66 @@ pub(crate) async fn require_assigned_shop(
     .bind(user_email)
     .fetch_one(pool)
     .await?;
+    if owner_only && here && !owner_here {
+        return Err(ApiError::ForbiddenWithMessage(
+            "Only this shop's owner can change its menu.".into(),
+        ));
+    }
     assignment_decision(here, anywhere)
+}
+
+/// Which shops' sales, figures and wallets a person may see.
+///
+/// Scope, never a role name, decides it: whoever oversees the campus's shops
+/// (the vendor-management grants) sees every shop; whoever runs a counter
+/// (order or menu grants) sees exactly the shops they are assigned to — two
+/// canteens' owners never see each other's takings; anyone else with a read
+/// grant (accounts, the principal) sees the campus. `None` means every shop.
+fn shop_scope(oversees: bool, operates: bool, assigned: Vec<String>) -> Option<Vec<String>> {
+    if oversees || !operates {
+        None
+    } else {
+        Some(assigned)
+    }
+}
+
+/// [`shop_scope`] for the signed-in person.
+pub(crate) async fn caller_shop_scope(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    principal: &AuthPrincipal,
+    access: &EffectiveAccess,
+) -> ApiResult<Option<Vec<String>>> {
+    let oversees = access.allows("vendor_management.vendors.read")
+        || access.allows("vendor_management.vendors.update");
+    let operates = access.allows("canteen.orders.manage")
+        || access.allows("canteen.menu.create")
+        || access.allows("canteen.menu.update")
+        || access.allows("canteen.menu.delete");
+    if oversees || !operates {
+        return Ok(None);
+    }
+    let assigned = assigned_shop_keys(
+        pool,
+        tenant,
+        &principal.student.id,
+        &principal.student.email,
+    )
+    .await?;
+    Ok(shop_scope(oversees, operates, assigned))
+}
+
+/// Refuses a shop outside the caller's [`caller_shop_scope`].
+pub(crate) fn require_in_scope(scope: Option<&[String]>, shop_key: &str) -> ApiResult<()> {
+    match scope {
+        Some(keys) if !keys.iter().any(|key| key == shop_key) => {
+            Err(ApiError::ForbiddenWithMessage(
+                "This belongs to a shop you're not assigned to. Ask the admin to add you to it."
+                    .into(),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Why a shop-staff action was refused, in words the counter can act on.
@@ -2348,7 +2497,7 @@ async fn create_menu_item(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     ensure_active_shop(db.pool(), tenant, input.store.trim()).await?;
-    require_assigned_shop(
+    require_shop_owner(
         db.pool(),
         tenant,
         &principal.student.id,
@@ -2399,15 +2548,28 @@ async fn update_menu_item(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     ensure_active_shop(db.pool(), tenant, input.store.trim()).await?;
-    require_assigned_shop(
-        db.pool(),
-        tenant,
-        &principal.student.id,
-        &principal.student.email,
-        input.store.trim(),
-        &access,
+    // The item's current shop is checked as well as the one it is saved
+    // into: otherwise one canteen's owner could move another canteen's item
+    // into their own menu by naming their shop.
+    let current_store = sqlx::query_scalar::<_, String>(
+        "SELECT store FROM campus_ops.canteen_menu_items WHERE tenant_id=$1 AND id=$2",
     )
-    .await?;
+    .bind(tenant)
+    .bind(item_id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Menu item not found".into()))?;
+    for store in [current_store.as_str(), input.store.trim()] {
+        require_shop_owner(
+            db.pool(),
+            tenant,
+            &principal.student.id,
+            &principal.student.email,
+            store,
+            &access,
+        )
+        .await?;
+    }
     let item=sqlx::query_scalar::<_,Value>(r#"UPDATE campus_ops.canteen_menu_items SET name=$3,
       description=$4,store=$5,category=$6,price=$7,actual_price=COALESCE($8,actual_price,$7),
       prep_minutes=$9,is_vegetarian=$10,is_popular=$11,
@@ -2454,7 +2616,7 @@ async fn delete_menu_item(
     .fetch_optional(db.pool())
     .await?
     .ok_or_else(|| ApiError::NotFound("Menu item not found".into()))?;
-    require_assigned_shop(
+    require_shop_owner(
         db.pool(),
         tenant,
         &principal.student.id,
@@ -2586,25 +2748,23 @@ async fn place_order(
         // The line is a snapshot, so it carries everything history needs to stay
         // readable after the item is edited or removed — including whether it was
         // vegetarian, which the streak screens count.
-        let item=sqlx::query_as::<_,(String,String,String,f64,bool,bool)>(r#"SELECT item.name,resolved_shop.shop_key,item.category,item.price::float8,item.is_vegetarian,item.is_instant
+        // The item's own shop takes the order — never a sibling of the same
+        // category because its own counter happens to be closed.
+        let item=sqlx::query_as::<_,(String,String,String,f64,bool,bool,bool,String)>(concat!(r#"SELECT item.name,resolved_shop.shop_key,item.category,item.price::float8,item.is_vegetarian,item.is_instant,
+            resolved_shop.shop_open,resolved_shop.name
           FROM campus_ops.canteen_menu_items item
-          JOIN LATERAL (
-            SELECT shop.shop_key
-            FROM campus_ops.shops shop
-            WHERE shop.tenant_id=item.tenant_id AND shop.is_active AND shop.shop_open
-              AND (shop.shop_key=item.store
-                OR lower(shop.category)=CASE
-                  WHEN lower(item.store) LIKE '%laundry%' THEN 'laundry'
-                  WHEN lower(item.store) LIKE '%station%' THEN 'stationery'
-                  ELSE 'canteen'
-                END)
-            ORDER BY CASE WHEN shop.shop_key=item.store THEN 0 ELSE 1 END,
-              shop.created_at,shop.shop_key
-            LIMIT 1
-          ) resolved_shop ON true
-          WHERE item.tenant_id=$1 AND item.id=$2 AND item.is_available FOR SHARE OF item"#)
+          JOIN campus_ops.shops resolved_shop ON resolved_shop.tenant_id=item.tenant_id
+            AND resolved_shop.is_active
+            AND resolved_shop.shop_key="#, resolved_shop_key_sql!("item.tenant_id", "item.store"), r#"
+          WHERE item.tenant_id=$1 AND item.id=$2 AND item.is_available FOR SHARE OF item"#))
         .bind(tenant).bind(requested.item_id).fetch_optional(&mut *tx).await?
         .ok_or_else(||ApiError::BadRequest("An item is unavailable".into()))?;
+        if !item.6 {
+            return Err(ApiError::Conflict(format!(
+                "{} is closed right now. Remove its items to order from the other shops.",
+                item.7
+            )));
+        }
         let line_total = item.3 * f64::from(requested.quantity);
         grand_total += line_total;
         let line = json!({"itemId":requested.item_id,"name":item.0,"store":item.1,"category":item.2,
@@ -3314,9 +3474,11 @@ async fn update_order_line_status(
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let mut tx = db.pool().begin().await?;
     let (current_status, customer, store, lines) =
-        sqlx::query_as::<_, (String, String, String, Value)>(
-            "SELECT status,customer_user_id,store,lines FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
-        )
+        sqlx::query_as::<_, (String, String, String, Value)>(concat!(
+            "SELECT status,customer_user_id,",
+            order_shop_key_sql!(),
+            ",lines FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND id=$2 FOR UPDATE"
+        ))
         .bind(tenant)
         .bind(order_id)
         .fetch_optional(&mut *tx)
@@ -3442,9 +3604,11 @@ async fn update_order_status(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     let mut tx = db.pool().begin().await?;
-    let current = sqlx::query_as::<_, (String, String, f64, String)>(
-        "SELECT status,customer_user_id,total::float8,store FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
-    )
+    let current = sqlx::query_as::<_, (String, String, f64, String)>(concat!(
+        "SELECT status,customer_user_id,total::float8,",
+        order_shop_key_sql!(),
+        " FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND id=$2 FOR UPDATE"
+    ))
     .bind(tenant)
     .bind(order_id)
     .fetch_optional(&mut *tx)
@@ -3539,7 +3703,7 @@ async fn scan_order(
     let mut tx = db.pool().begin().await?;
     let order_id = Uuid::parse_str(input.qr_payload.trim()).ok();
     let current = sqlx::query_as::<_, (Uuid, String, String, f64, String, Value, i64, Option<i32>)>(
-        "SELECT id,status,customer_user_id,total::float8,store,lines,order_number,token_number FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (qr_token_hash=$2 OR id=$3) FOR UPDATE",
+        concat!("SELECT id,status,customer_user_id,total::float8,", order_shop_key_sql!(), ",lines,order_number,token_number FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND (qr_token_hash=$2 OR id=$3) FOR UPDATE"),
     )
     .bind(tenant)
     .bind(token_hash(&input.qr_payload))
@@ -4243,7 +4407,19 @@ async fn wallet_directory(
         })
         .collect();
 
-    let stores = wallet_stores(db.pool(), tenant).await?;
+    // A shop's own staff recharge only their own shop's wallet.
+    let scope = caller_shop_scope(db.pool(), tenant, &principal, &access).await?;
+    let stores: Vec<Value> = wallet_stores(db.pool(), tenant)
+        .await?
+        .into_iter()
+        .filter(|store| {
+            scope.as_ref().is_none_or(|keys| {
+                store["shopKey"]
+                    .as_str()
+                    .is_some_and(|key| keys.iter().any(|known| known == key))
+            })
+        })
+        .collect();
     let summary = sqlx::query_as::<_, (Value, f64, i64)>(
         r#"SELECT COALESCE(jsonb_object_agg(shop_key, total), '{}'::jsonb),
                   COALESCE(SUM(total), 0)::float8,
@@ -4462,7 +4638,7 @@ async fn wallet_stores(pool: &sqlx::PgPool, tenant: Uuid) -> ApiResult<Vec<Value
 /// Resolves the store wallet a top-up credits. A given `shopKey` must be an
 /// active canteen, stationery or laundry store of this tenant. Clients that
 /// predate store wallets send none; they keep crediting the canteen wallet.
-async fn resolve_top_up_store(
+pub(crate) async fn resolve_top_up_store(
     pool: &sqlx::PgPool,
     tenant: Uuid,
     shop_key: Option<&str>,
@@ -4796,6 +4972,9 @@ async fn top_up_wallet(
     .ok_or_else(|| ApiError::NotFound("No active campus user with this wallet was found".into()))?;
     let (shop_key, shop_name) =
         resolve_top_up_store(db.pool(), tenant, input.shop_key.as_deref()).await?;
+    // A shop's own staff may credit only their own shop's wallet.
+    let scope = caller_shop_scope(db.pool(), tenant, &principal, &access).await?;
+    require_in_scope(scope.as_deref(), &shop_key)?;
     let target_user_id = person.user_id.to_lowercase();
     let idempotency_key = input
         .idempotency_key
@@ -5051,6 +5230,8 @@ async fn deduct_from_wallet(
     .ok_or_else(|| ApiError::NotFound("No active campus user with this wallet was found".into()))?;
     let (shop_key, shop_name) =
         resolve_top_up_store(db.pool(), tenant, Some(requested_shop)).await?;
+    let scope = caller_shop_scope(db.pool(), tenant, &principal, &access).await?;
+    require_in_scope(scope.as_deref(), &shop_key)?;
     let target_user_id = person.user_id.to_lowercase();
     let idempotency_key = input
         .idempotency_key
@@ -9864,24 +10045,89 @@ mod tests {
 
     #[test]
     fn wallet_orders_resolve_legacy_stores_like_the_menu_does() {
-        // Each shop's wallet lists only its own orders, so an order row must
-        // name its shop even when it was stored under a legacy key.
+        // Each shop's queue and wallet list only its own orders, so an order
+        // row must name its shop even when it was stored under a legacy key.
         let sql = order_shop_key_sql!();
         for fragment in [
-            "shop.tenant_id=canteen_orders.tenant_id AND shop.is_active",
-            "shop.shop_key=canteen_orders.store",
+            "rs.tenant_id=canteen_orders.tenant_id",
+            "rs.shop_key=canteen_orders.store",
             "WHEN lower(canteen_orders.store) LIKE '%laundry%' THEN 'laundry'",
             "WHEN lower(canteen_orders.store) LIKE '%station%' THEN 'stationery'",
             "ELSE 'canteen'",
-            // An exact key wins; otherwise the oldest shop of the category.
-            "ORDER BY CASE WHEN shop.shop_key=canteen_orders.store THEN 0 ELSE 1 END",
-            "shop.created_at, shop.shop_key",
+            "ORDER BY CASE WHEN rs.shop_key=canteen_orders.store THEN 0 ELSE 1 END",
             "LIMIT 1",
         ] {
             assert!(sql.contains(fragment), "missing `{fragment}`");
         }
         // No matching shop keeps the raw store rather than dropping the row.
         assert!(sql.trim_end().ends_with("LIMIT 1), canteen_orders.store)"));
+    }
+
+    #[test]
+    fn a_shop_key_always_resolves_to_its_own_shop() {
+        // Two canteens: an item or order stored under the second canteen's
+        // key must never resolve to the first, whatever state either is in.
+        let sql = resolved_shop_key_sql!("item.tenant_id", "item.store");
+        // The exact key is ranked first, ahead of any category fallback ...
+        let exact = sql
+            .find("ORDER BY CASE WHEN rs.shop_key=item.store THEN 0 ELSE 1 END")
+            .expect("exact key ranks first");
+        let category = sql.find("rs.created_at").expect("fallback ordering");
+        assert!(exact < category);
+        // ... and is not filtered by the shop's state: a closed or retired
+        // shop keeps its own items and orders instead of handing them to a
+        // sibling of the same category.
+        let filter = &sql[..exact];
+        assert!(!filter.contains("is_active"), "{filter}");
+        assert!(!filter.contains("shop_open"), "{filter}");
+    }
+
+    #[test]
+    fn legacy_store_keys_fall_back_to_the_oldest_active_shop_of_their_category() {
+        let sql = resolved_shop_key_sql!("$1", "$3");
+        // Only keys naming no shop fall back: the category match is the
+        // alternative to the exact key, ranked after it.
+        assert!(sql.contains("AND (rs.shop_key=$3 OR lower(rs.category)=CASE"));
+        assert!(sql.contains(" rs.is_active DESC, rs.created_at, rs.shop_key LIMIT 1), $3)"));
+        // The subquery never shadows the caller's own `shop` alias.
+        assert!(!sql.contains("campus_ops.shops shop"));
+    }
+
+    #[test]
+    fn a_counter_queue_matches_orders_by_their_shop() {
+        let sql = order_in_shops_sql!();
+        // A shop's own key decides at once, in or out ...
+        assert!(sql.starts_with("(CASE WHEN canteen_orders.store = ANY($10) THEN true"));
+        assert!(sql.contains("ks.shop_key=canteen_orders.store) THEN false ELSE "));
+        // ... and only a legacy key is resolved to the shop it belongs to.
+        assert!(sql.ends_with(" = ANY($10) END)"));
+        assert!(sql.contains(order_shop_key_sql!()));
+    }
+
+    #[test]
+    fn shop_staff_see_only_their_own_shops_figures() {
+        let mine = vec!["qa-canteen-2".to_string()];
+        // Overseeing the campus's shops covers every shop.
+        assert_eq!(shop_scope(true, true, mine.clone()), None);
+        assert_eq!(shop_scope(true, false, vec![]), None);
+        // Accounts and the principal read campus figures without a counter.
+        assert_eq!(shop_scope(false, false, vec![]), None);
+        // A counter's owner or captain sees exactly their assigned shops ...
+        assert_eq!(shop_scope(false, true, mine.clone()), Some(mine.clone()));
+        // ... and with no counter yet, nothing rather than everything.
+        assert_eq!(shop_scope(false, true, vec![]), Some(vec![]));
+    }
+
+    #[test]
+    fn a_shop_outside_the_callers_scope_is_refused() {
+        let mine = ["qa-canteen-2".to_string()];
+        assert!(require_in_scope(None, "mec-canteen").is_ok());
+        assert!(require_in_scope(Some(&mine), "qa-canteen-2").is_ok());
+        assert!(matches!(
+            require_in_scope(Some(&mine), "mec-canteen"),
+            Err(ApiError::ForbiddenWithMessage(_))
+        ));
+        assert!(require_in_scope(Some(&[]), "mec-canteen").is_err());
     }
 
     #[test]

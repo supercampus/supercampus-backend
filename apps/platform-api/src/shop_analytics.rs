@@ -668,7 +668,7 @@ async fn shop_orders(
               WHEN lower(o.store) LIKE '%laundry%' THEN 'laundry'
               WHEN lower(o.store) LIKE '%station%' THEN 'stationery'
               ELSE 'canteen' END
-            ORDER BY s.created_at, s.shop_key LIMIT 1
+            ORDER BY s.is_active DESC, s.created_at, s.shop_key LIMIT 1
           ) fallback ON true
           WHERE o.tenant_id=$1
             AND COALESCE(exact.shop_key, fallback.shop_key, o.store)=$2

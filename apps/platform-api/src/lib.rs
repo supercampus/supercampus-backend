@@ -13,6 +13,7 @@ pub mod media;
 pub mod models;
 pub mod notification;
 pub mod operations;
+pub mod order_events;
 pub mod passes;
 pub mod payment_requests;
 pub mod platform_admin;

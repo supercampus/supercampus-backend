@@ -3,25 +3,49 @@
 //!
 //! `GET /canteen/shop-analytics?shop=<key>&from=YYYY-MM-DD&to=YYYY-MM-DD`
 //!
+//! Every figure is derived from what was recorded; nothing is estimated. A
+//! figure that cannot be derived is `null` (the app shows "not recorded").
+//!
 //! * `from`/`to` are inclusive calendar days in the tenant's local time
 //!   (Asia/Kolkata). Both default to today; one alone is a single day.
-//! * Revenue is completed orders only, exactly as the campus sales dashboard
-//!   counts it: rejected orders are refunded and cancelled ones never charged.
-//! * Cost is each line's quantity times the menu item's configured cost price
-//!   (`actual_price`, which itself defaults to the selling price). A line whose
-//!   item has since been deleted is costed at its selling price, so it never
-//!   reports profit that cannot be traced to a configured cost.
-//! * Staff performance is attributed by `canteen_orders.handled_by` — the
-//!   account that last moved the order. Every active account the admin has
-//!   assigned to the shop as a captain (Vendors & shops → Counter staff) is
-//!   listed, including those with no orders in the range; anyone else who
-//!   handled an order (an owner, or a captain since unassigned) follows.
-//!   Deactivated and deleted accounts are never listed; the orders they moved
-//!   still count in the shop's totals.
+//!
+//! **Shop summary** (`summary`) — the orders *placed* in the range:
+//! * Revenue is completed orders only: rejected orders are refunded and
+//!   cancelled ones never charged.
+//! * Cost is each delivered line's quantity times its menu item's cost price
+//!   (`actual_price`). A line whose item no longer exists has no recorded
+//!   cost: `uncostedItems` counts them and cost, profit and margin are `null`
+//!   rather than a guess.
+//! * `averageHandlingMinutes` is placement to the last item's recorded
+//!   hand-over, over completed orders whose every item has a recorded
+//!   hand-over (`timedOrders`); `null` without any.
+//!
+//! **Staff** (`captains`, `staffSummary`) — what each person *did* in the
+//! range, from the per-item action log (`campus_ops.canteen_order_events`,
+//! see `order_events`), by when they did it:
+//! * `itemsDelivered` / `revenue`: the items they handed over and those
+//!   items' line totals. Items of orders since rejected or cancelled are not
+//!   revenue. `ordersDelivered`: orders they handed over at least one item of;
+//!   `ordersTouched`: orders they moved at all.
+//! * `itemsPrepared`: items they moved to preparing or ready.
+//! * `rejectedOrders` / `refunded`: orders they rejected and the refunds.
+//! * `averagePrepSeconds`: preparing → ready, credited to whoever marked the
+//!   item ready, only where both steps were recorded. `averageHandoverSeconds`:
+//!   ready → delivered (placed → delivered for instant items), credited to
+//!   whoever handed it over, only where the earlier step was recorded.
+//! * `revenueShare`: their delivered revenue over everything delivered in the
+//!   range (`staffSummary.totalRevenue`).
+//! * Every active account the admin assigned to the shop as a captain is
+//!   listed, idle or not; anyone else who acted (an owner, an administrator, a
+//!   captain since unassigned) follows. Deactivated and deleted accounts are
+//!   not listed; what they did still counts in the totals.
+//! * Orders completed before the log existed have no record of who handled
+//!   which item. They are not credited to anyone: `staffSummary.unattributed`
+//!   reports them ("before tracking"), dated by when the order completed.
 //!
 //! Adding `captain=<userId>` (with optional `page` and `pageSize`) returns
 //! that person's detail for the same range under `captainDetail`: their
-//! figures, a per-day series and every order they handled, paginated.
+//! figures, a per-day series and every action they took, paginated.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -38,6 +62,7 @@ use crate::{
     error::{ApiError, ApiResult},
     models::ApiResponse,
     operations::{require_any, require_assigned_shop, tenant_id},
+    order_events::{line_amount, line_item_id, line_quantity},
     state::{AppState, AuthPrincipal, EffectiveAccess},
 };
 
@@ -59,10 +84,7 @@ const TENANT_TIMEZONE: &str = "Asia/Kolkata";
 /// The longest range one request may cover (two years, leap day included).
 const MAX_RANGE_DAYS: i64 = 731;
 
-/// Most recent orders listed under each staff member in the overview.
-const RECENT_PER_STAFF: usize = 10;
-
-/// Orders per page of a captain's detail, by default and at most.
+/// Actions per page of a captain's detail, by default and at most.
 const DEFAULT_PAGE_SIZE: usize = 20;
 const MAX_PAGE_SIZE: usize = 100;
 
@@ -130,47 +152,57 @@ pub(crate) async fn shop_analytics(
     .await?
     .ok_or_else(|| ApiError::NotFound("Shop not found".into()))?;
 
-    let orders = shop_orders(pool, tenant, &shop_key, range).await?;
-    let staff = shop_staff(pool, tenant, &shop_key).await?;
-    let unknown: Vec<String> = orders
+    let placed = shop_orders(pool, tenant, &shop_key, range, OrderScope::Placed).await?;
+    let completed = shop_orders(pool, tenant, &shop_key, range, OrderScope::Completed).await?;
+    let events = range_events(pool, tenant, &shop_key, range).await?;
+
+    // Every order the range's figures touch, and everything recorded on them
+    // (an item made ready in the range may have been started before it).
+    let mut orders: HashMap<Uuid, OrderFact> = HashMap::new();
+    for order in placed.iter().chain(&completed) {
+        orders.entry(order.id).or_insert_with(|| order.clone());
+    }
+    let missing: Vec<Uuid> = events
         .iter()
-        .filter_map(|order| order.handled_by.clone())
+        .map(|event| event.order_id)
+        .filter(|id| !orders.contains_key(id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for order in orders_by_id(pool, tenant, &missing).await? {
+        orders.insert(order.id, order);
+    }
+    let order_ids: Vec<Uuid> = orders.keys().copied().collect();
+    let history = order_history(pool, tenant, &order_ids).await?;
+
+    let mut item_ids: BTreeSet<String> = events.iter().filter_map(|e| e.item_id.clone()).collect();
+    for order in orders.values() {
+        for line in order.lines() {
+            item_ids.extend(line_item_id(line));
+        }
+    }
+    let costs = item_costs(pool, tenant, &item_ids.into_iter().collect::<Vec<_>>()).await?;
+
+    let staff = shop_staff(pool, tenant, &shop_key).await?;
+    let unknown: Vec<String> = events
+        .iter()
+        .map(|event| event.actor.clone())
         .filter(|id| !staff.iter().any(|member| member.matches(id)))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let mut hidden = HashSet::new();
-    let mut others = HashMap::new();
-    if !unknown.is_empty() {
-        let rows = sqlx::query_as::<_, (String, String, Option<String>, bool, Option<DateTime<Utc>>)>(
-            &format!(
-                "SELECT u.id::text, COALESCE(NULLIF(trim(u.display_name), ''), u.email, u.id::text), \
-                        u.email, ({LIVE_ACCOUNT_SQL}) AS live, u.last_login_at \
-                 FROM identity.users u WHERE u.id::text = ANY($1)"
-            ),
-        )
-        .bind(&unknown)
-        .fetch_all(pool)
-        .await?;
-        for (id, name, email, live, last_login) in rows {
-            if live {
-                others.insert(
-                    id,
-                    OtherHandler {
-                        name,
-                        email,
-                        last_login,
-                    },
-                );
-            } else {
-                // Deactivated or deleted: not listed, still in the totals.
-                hidden.insert(id);
-            }
-        }
-    }
+    let (others, hidden) = other_actors(pool, &unknown).await?;
 
-    let rows = staff_rows(&orders, &staff, &others, &hidden);
-    let mut body = build_report(&orders, &rows);
+    let facts = Facts {
+        placed: &placed,
+        completed: &completed,
+        events: &events,
+        history: &history,
+        orders: &orders,
+        costs: &costs,
+    };
+    let rows = staff_rows(&facts, &staff, &others, &hidden);
+    let mut body = build_report(&facts, &rows);
     if let Some(captain) = query
         .captain
         .as_deref()
@@ -183,10 +215,13 @@ pub(crate) async fn shop_analytics(
             .ok_or_else(|| {
                 ApiError::NotFound("That staff member has no record at this shop".into())
             })?;
+        let names = actor_names(&rows, &others, &history);
         body["captainDetail"] = captain_detail(
+            &facts,
             row,
             range,
-            total_revenue(&orders),
+            &body,
+            &names,
             query.page.unwrap_or(1),
             query.page_size.unwrap_or(DEFAULT_PAGE_SIZE),
             &shop.0,
@@ -243,9 +278,16 @@ impl DateRange {
     fn days(self) -> i64 {
         (self.to - self.from).num_days() + 1
     }
+
+    fn day_list(self) -> Vec<NaiveDate> {
+        self.from
+            .iter_days()
+            .take_while(|day| *day <= self.to)
+            .collect()
+    }
 }
 
-/// One order of the shop inside the range, costed.
+/// One order of the shop.
 #[derive(Debug, Clone, PartialEq)]
 struct OrderFact {
     id: Uuid,
@@ -254,10 +296,6 @@ struct OrderFact {
     status: String,
     handled_by: Option<String>,
     total: f64,
-    cost: f64,
-    items: i64,
-    /// The calendar day it was placed, in the tenant's time zone.
-    day: NaiveDate,
     fulfilment_mode: String,
     token_number: Option<i32>,
     lines: Value,
@@ -266,6 +304,9 @@ struct OrderFact {
 }
 
 impl OrderFact {
+    fn lines(&self) -> &[Value] {
+        self.lines.as_array().map(Vec::as_slice).unwrap_or_default()
+    }
     fn is_completed(&self) -> bool {
         self.status == "completed"
     }
@@ -275,16 +316,89 @@ impl OrderFact {
             "pending" | "accepted" | "preparing" | "ready"
         )
     }
-    fn is_rejected(&self) -> bool {
-        self.status == "rejected"
+    /// Refunded or never charged: nothing it delivered is revenue.
+    fn is_void(&self) -> bool {
+        matches!(self.status.as_str(), "rejected" | "cancelled")
     }
-    fn is_cancelled(&self) -> bool {
-        self.status == "cancelled"
+}
+
+/// One recorded action (see `order_events`).
+#[derive(Debug, Clone, PartialEq)]
+struct EventFact {
+    id: i64,
+    order_id: Uuid,
+    line_index: Option<i32>,
+    item_id: Option<String>,
+    item_name: Option<String>,
+    action: String,
+    source: String,
+    actor: String,
+    actor_name: Option<String>,
+    quantity: i64,
+    amount: f64,
+    instant: bool,
+    occurred_at: DateTime<Utc>,
+    /// The calendar day it happened, in the tenant's time zone.
+    day: NaiveDate,
+}
+
+/// What a report is computed from.
+struct Facts<'a> {
+    /// Orders placed in the range.
+    placed: &'a [OrderFact],
+    /// Orders completed (last moved) in the range.
+    completed: &'a [OrderFact],
+    /// The shop's actions in the range, newest first.
+    events: &'a [EventFact],
+    /// Every action ever recorded on the orders above, oldest first.
+    history: &'a [EventFact],
+    orders: &'a HashMap<Uuid, OrderFact>,
+    /// Menu item id → its cost price.
+    costs: &'a HashMap<String, f64>,
+}
+
+impl Facts<'_> {
+    /// When an item first reached `action`, if that was recorded.
+    fn first(&self, order: Uuid, line: i32, action: &str) -> Option<DateTime<Utc>> {
+        self.history
+            .iter()
+            .filter(|e| e.order_id == order && e.line_index == Some(line) && e.action == action)
+            .map(|e| e.occurred_at)
+            .min()
     }
-    /// Placement to hand-over, for completed orders.
-    fn handling_minutes(&self) -> Option<f64> {
-        self.is_completed()
-            .then(|| ((self.updated_at - self.created_at).num_seconds().max(0) as f64) / 60.0)
+
+    /// The order's items with a recorded hand-over, and the last one's time.
+    fn deliveries(&self, order: Uuid) -> (HashSet<i32>, Option<DateTime<Utc>>) {
+        let mut lines = HashSet::new();
+        let mut last = None;
+        for event in self
+            .history
+            .iter()
+            .filter(|e| e.order_id == order && e.action == "delivered")
+        {
+            if let Some(line) = event.line_index {
+                lines.insert(line);
+                last = last.max(Some(event.occurred_at));
+            }
+        }
+        (lines, last)
+    }
+
+    /// A delivered item's cost, when its menu item still records one.
+    fn line_cost(&self, item_id: Option<&str>, quantity: i64) -> Option<f64> {
+        item_id
+            .and_then(|id| self.costs.get(id))
+            .map(|cost| cost * quantity as f64)
+    }
+
+    /// Whether a delivered action still counts as a sale.
+    fn counts_as_sale(&self, event: &EventFact) -> bool {
+        event.action == "delivered"
+            && event.line_index.is_some()
+            && !self
+                .orders
+                .get(&event.order_id)
+                .is_some_and(OrderFact::is_void)
     }
 }
 
@@ -302,91 +416,17 @@ struct StaffMember {
 }
 
 impl StaffMember {
-    fn matches(&self, handler: &str) -> bool {
-        self.assignment_user_id == handler || self.identity_id == handler
+    fn matches(&self, actor: &str) -> bool {
+        self.assignment_user_id == actor || self.identity_id == actor
     }
 }
 
-/// Someone who handled an order without being assigned to the shop.
+/// Someone who acted without being assigned to the shop.
 #[derive(Debug, Clone, PartialEq)]
-struct OtherHandler {
+struct OtherActor {
     name: String,
     email: Option<String>,
     last_login: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-struct Totals {
-    orders: i64,
-    completed: i64,
-    active: i64,
-    rejected: i64,
-    cancelled: i64,
-    items: i64,
-    revenue: f64,
-    cost: f64,
-    active_value: f64,
-    refunded: f64,
-    handling_minutes: f64,
-    handled_completed: i64,
-}
-
-impl Totals {
-    fn add(&mut self, order: &OrderFact) {
-        self.orders += 1;
-        if order.is_completed() {
-            self.completed += 1;
-            self.items += order.items;
-            self.revenue += order.total;
-            self.cost += order.cost;
-        } else if order.is_active() {
-            self.active += 1;
-            self.active_value += order.total;
-        } else if order.is_rejected() {
-            self.rejected += 1;
-            self.refunded += order.total;
-        } else if order.is_cancelled() {
-            self.cancelled += 1;
-        }
-        if let Some(minutes) = order.handling_minutes() {
-            self.handling_minutes += minutes;
-            self.handled_completed += 1;
-        }
-    }
-
-    fn profit(&self) -> f64 {
-        self.revenue - self.cost
-    }
-
-    fn json(&self, total_revenue: f64) -> Value {
-        let revenue = round_money(self.revenue);
-        let cost = round_money(self.cost);
-        json!({
-            "orders": self.orders,
-            "completedOrders": self.completed,
-            "activeOrders": self.active,
-            "rejectedOrders": self.rejected,
-            "cancelledOrders": self.cancelled,
-            "itemsSold": self.items,
-            "revenue": revenue,
-            "cost": cost,
-            "profit": round_money(self.profit()),
-            "marginPercent": if self.revenue > 0.0 {
-                round_one(self.profit() / self.revenue * 100.0)
-            } else { 0.0 },
-            "averageOrderValue": if self.completed > 0 {
-                round_money(self.revenue / self.completed as f64)
-            } else { 0.0 },
-            "activeValue": round_money(self.active_value),
-            "refunded": round_money(self.refunded),
-            "revenueShare": if total_revenue > 0.0 {
-                round_one(self.revenue / total_revenue * 100.0)
-            } else { 0.0 },
-            "averageHandlingMinutes": if self.handled_completed > 0 {
-                Value::from(round_one(self.handling_minutes / self.handled_completed as f64))
-            } else { Value::Null },
-        })
-    }
 }
 
 fn round_money(value: f64) -> f64 {
@@ -397,64 +437,274 @@ fn round_one(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
 
-fn total_revenue(orders: &[OrderFact]) -> f64 {
-    orders
-        .iter()
-        .filter(|order| order.is_completed())
-        .map(|order| order.total)
-        .sum()
+fn share(part: f64, whole: f64) -> f64 {
+    if whole > 0.0 {
+        round_one(part / whole * 100.0)
+    } else {
+        0.0
+    }
 }
 
-fn order_json(order: &OrderFact) -> Value {
-    json!({
-        "id": order.id,
-        "orderNumber": order.order_number,
-        "customerName": order.customer_name,
-        "status": order.status,
-        "total": round_money(order.total),
-        "cost": round_money(order.cost),
-        "profit": round_money(order.total - order.cost),
-        "itemCount": order.items,
-        "createdAt": order.created_at,
-        "updatedAt": order.updated_at,
-    })
+fn average(sum: f64, count: i64) -> Value {
+    if count > 0 {
+        json!(round_one(sum / count as f64))
+    } else {
+        Value::Null
+    }
 }
 
-/// Everything the order detail page shows, in the shape the canteen order
-/// endpoints use, plus the analytics figures.
-fn detailed_order_json(order: &OrderFact, handler_name: &str, shop_key: &str) -> Value {
-    let mut value = order_json(order);
-    value["lines"] = order.lines.clone();
-    value["fulfilmentMode"] = json!(order.fulfilment_mode);
-    value["tokenNumber"] = json!(order.token_number);
-    value["captainName"] = json!(handler_name);
-    value["shopKey"] = json!(shop_key);
-    value
+fn seconds_between(from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
+    ((to - from).num_milliseconds().max(0) as f64) / 1000.0
 }
 
-/// One person's share of the range.
+/// The shop's orders placed in the range.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Summary {
+    orders: i64,
+    completed: i64,
+    active: i64,
+    rejected: i64,
+    cancelled: i64,
+    items: i64,
+    revenue: f64,
+    cost: f64,
+    uncosted_items: i64,
+    active_value: f64,
+    refunded: f64,
+    handling_seconds: f64,
+    timed_orders: i64,
+    waiting: i64,
+}
+
+fn summarise(facts: &Facts) -> Summary {
+    let mut s = Summary::default();
+    for order in facts.placed {
+        s.orders += 1;
+        if order.is_completed() {
+            s.completed += 1;
+            s.revenue += order.total;
+            for line in order.lines() {
+                let quantity = line_quantity(line);
+                s.items += quantity;
+                match facts.line_cost(line_item_id(line).as_deref(), quantity) {
+                    Some(cost) => s.cost += cost,
+                    None => s.uncosted_items += quantity,
+                }
+            }
+            let (delivered, last) = facts.deliveries(order.id);
+            let every_item = (0..order.lines().len() as i32).all(|i| delivered.contains(&i));
+            if let (true, Some(last)) = (every_item && !order.lines().is_empty(), last) {
+                s.handling_seconds += seconds_between(order.created_at, last);
+                s.timed_orders += 1;
+            }
+        } else if order.is_active() {
+            s.active += 1;
+            s.active_value += order.total;
+            if order.handled_by.is_none() {
+                s.waiting += 1;
+            }
+        } else if order.status == "rejected" {
+            s.rejected += 1;
+            s.refunded += order.total;
+        } else if order.status == "cancelled" {
+            s.cancelled += 1;
+        }
+    }
+    s
+}
+
+impl Summary {
+    fn json(&self) -> Value {
+        let costed = self.uncosted_items == 0;
+        let profit = self.revenue - self.cost;
+        json!({
+            "orders": self.orders,
+            "completedOrders": self.completed,
+            "activeOrders": self.active,
+            "rejectedOrders": self.rejected,
+            "cancelledOrders": self.cancelled,
+            "itemsSold": self.items,
+            "revenue": round_money(self.revenue),
+            "cost": costed.then(|| round_money(self.cost)),
+            "profit": costed.then(|| round_money(profit)),
+            "marginPercent": (costed && self.revenue > 0.0)
+                .then(|| round_one(profit / self.revenue * 100.0)),
+            "uncostedItems": self.uncosted_items,
+            "averageOrderValue": if self.completed > 0 {
+                round_money(self.revenue / self.completed as f64)
+            } else { 0.0 },
+            "activeValue": round_money(self.active_value),
+            "refunded": round_money(self.refunded),
+            "averageHandlingMinutes": average(self.handling_seconds / 60.0, self.timed_orders),
+            "timedOrders": self.timed_orders,
+            "waitingOrders": self.waiting,
+            // Older apps read this name for orders nobody has picked up.
+            "unattributedOrders": self.waiting,
+        })
+    }
+}
+
+/// Completed orders in the range with items nobody is recorded handing over:
+/// they predate the action log, so they are credited to no one.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Unattributed {
+    orders: i64,
+    items: i64,
+    revenue: f64,
+}
+
+fn unattributed(facts: &Facts) -> Unattributed {
+    let mut u = Unattributed::default();
+    for order in facts.completed {
+        let (delivered, _) = facts.deliveries(order.id);
+        let mut counted = false;
+        for (index, line) in order.lines().iter().enumerate() {
+            if !delivered.contains(&(index as i32)) {
+                u.items += line_quantity(line);
+                u.revenue += line_amount(line);
+                counted = true;
+            }
+        }
+        if counted {
+            u.orders += 1;
+        }
+    }
+    u
+}
+
+/// One person's actions in the range.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Work {
+    items_delivered: i64,
+    delivered_orders: BTreeSet<Uuid>,
+    touched_orders: BTreeSet<Uuid>,
+    revenue: f64,
+    cost: f64,
+    uncosted_items: i64,
+    /// (order, line) → quantity, for items they moved to preparing or ready.
+    prepared: HashMap<(Uuid, i32), i64>,
+    rejected_orders: BTreeSet<Uuid>,
+    refunded: f64,
+    prep_seconds: f64,
+    prep_timed: i64,
+    handover_seconds: f64,
+    handover_timed: i64,
+    first: Option<DateTime<Utc>>,
+    last: Option<DateTime<Utc>>,
+    days: BTreeSet<NaiveDate>,
+    actions: i64,
+}
+
+impl Work {
+    fn add(&mut self, facts: &Facts, event: &EventFact) {
+        self.actions += 1;
+        self.touched_orders.insert(event.order_id);
+        self.first = Some(
+            self.first
+                .map_or(event.occurred_at, |t| t.min(event.occurred_at)),
+        );
+        self.last = self.last.max(Some(event.occurred_at));
+        self.days.insert(event.day);
+        match (event.action.as_str(), event.line_index) {
+            ("delivered", Some(line)) if facts.counts_as_sale(event) => {
+                self.items_delivered += event.quantity;
+                self.delivered_orders.insert(event.order_id);
+                self.revenue += event.amount;
+                match facts.line_cost(event.item_id.as_deref(), event.quantity) {
+                    Some(cost) => self.cost += cost,
+                    None => self.uncosted_items += event.quantity,
+                }
+                let ready = facts.first(event.order_id, line, "ready");
+                let started = match ready {
+                    Some(ready) => Some(ready),
+                    None if event.instant => {
+                        facts.orders.get(&event.order_id).map(|o| o.created_at)
+                    }
+                    None => None,
+                };
+                if let Some(started) = started {
+                    self.handover_seconds += seconds_between(started, event.occurred_at);
+                    self.handover_timed += 1;
+                }
+            }
+            ("preparing", Some(line)) => {
+                self.prepared.insert((event.order_id, line), event.quantity);
+            }
+            ("ready", Some(line)) => {
+                self.prepared.insert((event.order_id, line), event.quantity);
+                if let Some(started) = facts.first(event.order_id, line, "preparing") {
+                    self.prep_seconds += seconds_between(started, event.occurred_at);
+                    self.prep_timed += 1;
+                }
+            }
+            ("rejected", _) => {
+                if self.rejected_orders.insert(event.order_id) {
+                    self.refunded += event.amount;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn items_prepared(&self) -> i64 {
+        self.prepared.values().sum()
+    }
+
+    fn json(&self, total_revenue: f64) -> Value {
+        let costed = self.uncosted_items == 0;
+        json!({
+            "itemsDelivered": self.items_delivered,
+            "ordersDelivered": self.delivered_orders.len(),
+            "ordersTouched": self.touched_orders.len(),
+            "revenue": round_money(self.revenue),
+            "cost": costed.then(|| round_money(self.cost)),
+            "profit": costed.then(|| round_money(self.revenue - self.cost)),
+            "uncostedItems": self.uncosted_items,
+            "revenueShare": share(self.revenue, total_revenue),
+            "itemsPrepared": self.items_prepared(),
+            "rejectedOrders": self.rejected_orders.len(),
+            "refunded": round_money(self.refunded),
+            "averagePrepSeconds": average(self.prep_seconds, self.prep_timed),
+            "prepTimedItems": self.prep_timed,
+            "averageHandoverSeconds": average(self.handover_seconds, self.handover_timed),
+            "handoverTimedItems": self.handover_timed,
+            "firstActivityAt": self.first,
+            "lastActivityAt": self.last,
+            "lastHandledAt": self.last,
+            "activeDays": self.days.len(),
+            "actions": self.actions,
+        })
+    }
+}
+
+/// One person's row.
 struct StaffRow<'a> {
     user_id: String,
-    /// Other ids the same person's orders may carry (a legacy assignment id).
+    /// Other ids the same person's actions may carry (a legacy assignment id).
     aliases: Vec<String>,
     name: String,
     email: Option<String>,
     role: Option<String>,
     assigned: bool,
     last_login: Option<DateTime<Utc>>,
-    totals: Totals,
-    /// Newest first.
-    orders: Vec<&'a OrderFact>,
-    last_handled: Option<DateTime<Utc>>,
+    work: Work,
+    /// Their actions in the range, newest first.
+    events: Vec<&'a EventFact>,
 }
 
-/// Credits the range's orders (newest first) to the shop's staff. Every
-/// assigned captain is kept, idle or not; anyone else only when they handled
-/// an order. Hidden (deactivated or deleted) handlers are left out.
+impl StaffRow<'_> {
+    fn is(&self, actor: &str) -> bool {
+        self.user_id == actor || self.aliases.iter().any(|alias| alias == actor)
+    }
+}
+
+/// Credits the range's actions to whoever took them. Every assigned captain
+/// is kept, idle or not; anyone else only when they acted. Hidden
+/// (deactivated or deleted) accounts are left out.
 fn staff_rows<'a>(
-    orders: &'a [OrderFact],
+    facts: &Facts<'a>,
     staff: &[StaffMember],
-    others: &HashMap<String, OtherHandler>,
+    others: &HashMap<String, OtherActor>,
     hidden: &HashSet<String>,
 ) -> Vec<StaffRow<'a>> {
     let mut rows: Vec<StaffRow> = staff
@@ -471,159 +721,270 @@ fn staff_rows<'a>(
             role: Some(member.role.clone()),
             assigned: true,
             last_login: member.last_login,
-            totals: Totals::default(),
-            orders: Vec::new(),
-            last_handled: None,
+            work: Work::default(),
+            events: Vec::new(),
         })
         .collect();
 
-    for order in orders {
-        let Some(handler) = order.handled_by.as_deref() else {
-            continue;
-        };
-        if hidden.contains(handler) {
+    for event in facts.events {
+        if hidden.contains(&event.actor) {
             continue;
         }
-        let index = match staff.iter().position(|member| member.matches(handler)) {
+        let index = match rows.iter().position(|row| row.is(&event.actor)) {
             Some(index) => index,
-            None => match rows
-                .iter()
-                .position(|row| !row.assigned && row.user_id == handler)
-            {
-                Some(index) => index,
-                None => {
-                    let other = others.get(handler);
-                    rows.push(StaffRow {
-                        user_id: handler.to_owned(),
-                        aliases: Vec::new(),
-                        name: other
-                            .map(|o| o.name.clone())
-                            .unwrap_or_else(|| "Former staff".into()),
-                        email: other.and_then(|o| o.email.clone()),
-                        role: None,
-                        assigned: false,
-                        last_login: other.and_then(|o| o.last_login),
-                        totals: Totals::default(),
-                        orders: Vec::new(),
-                        last_handled: None,
-                    });
-                    rows.len() - 1
-                }
-            },
+            None => {
+                let other = others.get(&event.actor);
+                rows.push(StaffRow {
+                    user_id: event.actor.clone(),
+                    aliases: Vec::new(),
+                    name: other
+                        .map(|o| o.name.clone())
+                        .or_else(|| event.actor_name.clone())
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| "Former staff".into()),
+                    email: other.and_then(|o| o.email.clone()),
+                    role: None,
+                    assigned: false,
+                    last_login: other.and_then(|o| o.last_login),
+                    work: Work::default(),
+                    events: Vec::new(),
+                });
+                rows.len() - 1
+            }
         };
-        let row = &mut rows[index];
-        row.totals.add(order);
-        row.orders.push(order);
-        row.last_handled = row.last_handled.max(Some(order.updated_at));
+        rows[index].work.add(facts, event);
+        rows[index].events.push(event);
     }
 
     // Captains first — every one of them, even idle — then owners and anyone
-    // else who handled orders; busiest first within each group.
+    // else who acted; most delivered revenue first within each group.
     let rank = |row: &StaffRow| match row.role.as_deref() {
         Some("captain") => 0,
         Some(_) => 1,
         None => 2,
     };
-    rows.retain(|row| row.role.as_deref() == Some("captain") || row.totals.orders > 0);
+    rows.retain(|row| row.role.as_deref() == Some("captain") || row.work.actions > 0);
     rows.sort_by(|a, b| {
         rank(a)
             .cmp(&rank(b))
-            .then(b.totals.revenue.total_cmp(&a.totals.revenue))
-            .then(b.totals.orders.cmp(&a.totals.orders))
+            .then(b.work.revenue.total_cmp(&a.work.revenue))
+            .then(b.work.items_delivered.cmp(&a.work.items_delivered))
+            .then(b.work.actions.cmp(&a.work.actions))
             .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     rows
 }
 
 fn row_json(row: &StaffRow, total_revenue: f64) -> Value {
-    let mut value = row.totals.json(total_revenue);
+    let mut value = row.work.json(total_revenue);
     value["userId"] = json!(row.user_id);
     value["name"] = json!(row.name);
     value["email"] = json!(row.email);
     value["role"] = json!(row.role);
     value["assigned"] = json!(row.assigned);
-    value["lastHandledAt"] = json!(row.last_handled);
     value["lastSeenAt"] = json!(row.last_login);
-    value["recentOrders"] = Value::Array(
-        row.orders
-            .iter()
-            .take(RECENT_PER_STAFF)
-            .map(|o| order_json(o))
-            .collect(),
-    );
     value
 }
 
-/// Rolls the range's orders up for the shop and per staff member.
-fn build_report(orders: &[OrderFact], rows: &[StaffRow]) -> Value {
-    let mut summary = Totals::default();
-    for order in orders {
-        summary.add(order);
+/// Everything delivered in the range: what the log credits to someone (all
+/// actors, listed or not) plus what predates it.
+fn delivered_totals(facts: &Facts, unattributed: &Unattributed) -> (f64, i64, f64) {
+    let mut revenue = 0.0;
+    let mut items = 0;
+    for event in facts.events.iter().filter(|e| facts.counts_as_sale(e)) {
+        revenue += event.amount;
+        items += event.quantity;
     }
-    let unattributed = orders.iter().filter(|o| o.handled_by.is_none()).count();
+    (revenue, items, revenue + unattributed.revenue)
+}
+
+/// Rolls the range up for the shop and per staff member.
+fn build_report(facts: &Facts, rows: &[StaffRow]) -> Value {
+    let summary = summarise(facts);
+    let before = unattributed(facts);
+    let (tracked_revenue, tracked_items, total_revenue) = delivered_totals(facts, &before);
     let captains: Vec<Value> = rows
         .iter()
-        .map(|row| row_json(row, summary.revenue))
+        .map(|row| row_json(row, total_revenue))
         .collect();
-    let mut summary_json = summary.json(summary.revenue);
-    summary_json["unattributedOrders"] = json!(unattributed);
-    json!({ "summary": summary_json, "captains": captains })
+    json!({
+        "summary": summary.json(),
+        "staffSummary": {
+            "trackedRevenue": round_money(tracked_revenue),
+            "trackedItems": tracked_items,
+            "totalRevenue": round_money(total_revenue),
+            "totalItems": tracked_items + before.items,
+            "unattributed": {
+                "orders": before.orders,
+                "items": before.items,
+                "revenue": round_money(before.revenue),
+                "revenueShare": share(before.revenue, total_revenue),
+            },
+        },
+        "captains": captains,
+    })
+}
+
+/// Who is recorded acting on each order, by display name, in order.
+fn actor_names(
+    rows: &[StaffRow],
+    others: &HashMap<String, OtherActor>,
+    history: &[EventFact],
+) -> HashMap<Uuid, Vec<String>> {
+    let mut names: HashMap<Uuid, Vec<String>> = HashMap::new();
+    for event in history {
+        let name = rows
+            .iter()
+            .find(|row| row.is(&event.actor))
+            .map(|row| row.name.clone())
+            .or_else(|| others.get(&event.actor).map(|o| o.name.clone()))
+            .or_else(|| event.actor_name.clone())
+            .unwrap_or_else(|| "Former staff".into());
+        let list = names.entry(event.order_id).or_default();
+        if !list.contains(&name) {
+            list.push(name);
+        }
+    }
+    names
+}
+
+/// Everything the order detail page shows, in the shape the canteen order
+/// endpoints use. `captainName` names everyone recorded acting on it.
+fn order_json(order: &OrderFact, handlers: Option<&Vec<String>>, shop_key: &str) -> Value {
+    json!({
+        "id": order.id,
+        "orderNumber": order.order_number,
+        "customerName": order.customer_name,
+        "status": order.status,
+        "total": round_money(order.total),
+        "itemCount": order.lines().iter().map(line_quantity).sum::<i64>(),
+        "createdAt": order.created_at,
+        "updatedAt": order.updated_at,
+        "lines": order.lines,
+        "fulfilmentMode": order.fulfilment_mode,
+        "tokenNumber": order.token_number,
+        "captainName": handlers.filter(|names| !names.is_empty()).map(|names| names.join(", ")),
+        "shopKey": shop_key,
+    })
 }
 
 /// One person's figures, a day-by-day series across the whole range (idle
-/// days included) and one page of every order they handled, newest first.
+/// days included, nothing smoothed) and one page of their actions, newest
+/// first.
+#[allow(clippy::too_many_arguments)]
 fn captain_detail(
+    facts: &Facts,
     row: &StaffRow,
     range: DateRange,
-    total_revenue: f64,
+    report: &Value,
+    names: &HashMap<Uuid, Vec<String>>,
     page: usize,
     page_size: usize,
     shop_key: &str,
 ) -> Value {
-    let mut days: Vec<(NaiveDate, Totals)> = range
-        .from
-        .iter_days()
-        .take_while(|day| *day <= range.to)
-        .map(|day| (day, Totals::default()))
-        .collect();
-    for order in &row.orders {
-        if let Ok(index) = days.binary_search_by(|(day, _)| day.cmp(&order.day)) {
-            days[index].1.add(order);
-        }
-    }
-    let daily: Vec<Value> = days
-        .iter()
-        .map(|(day, totals)| {
+    let total_revenue = report["staffSummary"]["totalRevenue"]
+        .as_f64()
+        .unwrap_or(0.0);
+    let daily: Vec<Value> = range
+        .day_list()
+        .into_iter()
+        .map(|day| {
+            let mut work = Work::default();
+            for event in row.events.iter().filter(|e| e.day == day) {
+                work.add(facts, event);
+            }
             json!({
                 "date": day.to_string(),
-                "orders": totals.orders,
-                "completedOrders": totals.completed,
-                "revenue": round_money(totals.revenue),
-                "profit": round_money(totals.profit()),
+                "itemsDelivered": work.items_delivered,
+                "ordersDelivered": work.delivered_orders.len(),
+                "revenue": round_money(work.revenue),
+                "itemsPrepared": work.items_prepared(),
+                "actions": work.actions,
             })
         })
         .collect();
 
     let page_size = page_size.clamp(1, MAX_PAGE_SIZE);
-    let total = row.orders.len();
+    let total = row.events.len();
     let total_pages = total.div_ceil(page_size).max(1);
     let page = page.clamp(1, total_pages);
-    let orders: Vec<Value> = row
-        .orders
+    let activity: Vec<Value> = row
+        .events
         .iter()
         .skip((page - 1) * page_size)
         .take(page_size)
-        .map(|order| detailed_order_json(order, &row.name, shop_key))
+        .map(|event| {
+            let order = facts.orders.get(&event.order_id);
+            json!({
+                "id": event.id,
+                "occurredAt": event.occurred_at,
+                "action": event.action,
+                "source": event.source,
+                "orderId": event.order_id,
+                "orderNumber": order.map(|o| o.order_number),
+                "lineIndex": event.line_index,
+                "itemName": event.item_name,
+                "quantity": event.quantity,
+                "amount": round_money(event.amount),
+                // A hand-over on an order since refunded is not a sale.
+                "countsAsSale": facts.counts_as_sale(event),
+                "order": order.map(|o| order_json(o, names.get(&o.id), shop_key)),
+            })
+        })
         .collect();
 
     let mut value = row_json(row, total_revenue);
     value["daily"] = Value::Array(daily);
-    value["orders"] = Value::Array(orders);
+    value["activity"] = Value::Array(activity);
     value["page"] = json!(page);
     value["pageSize"] = json!(page_size);
-    value["totalOrders"] = json!(total);
+    value["totalActivity"] = json!(total);
     value["totalPages"] = json!(total_pages);
     value
+}
+
+/// Which of the shop's orders to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderScope {
+    /// Placed in the range.
+    Placed,
+    /// Completed, and last moved in the range.
+    Completed,
+}
+
+type OrderRow = (
+    Uuid,
+    i64,
+    String,
+    String,
+    Option<String>,
+    f64,
+    String,
+    Option<i32>,
+    Value,
+    DateTime<Utc>,
+    DateTime<Utc>,
+);
+
+const ORDER_COLUMNS: &str = "o.id, o.order_number, o.customer_name, o.status, o.handled_by, \
+     o.total::float8, o.fulfilment_mode, o.token_number, \
+     CASE WHEN jsonb_typeof(o.lines)='array' THEN o.lines ELSE '[]'::jsonb END, \
+     o.created_at, o.updated_at";
+
+fn order_fact(r: OrderRow) -> OrderFact {
+    OrderFact {
+        id: r.0,
+        order_number: r.1,
+        customer_name: r.2,
+        status: r.3,
+        handled_by: r.4.filter(|id| !id.trim().is_empty()),
+        total: r.5,
+        fulfilment_mode: r.6,
+        token_number: r.7,
+        lines: r.8,
+        created_at: r.9,
+        updated_at: r.10,
+    }
 }
 
 async fn shop_orders(
@@ -631,35 +992,23 @@ async fn shop_orders(
     tenant: Uuid,
     shop_key: &str,
     range: DateRange,
+    scope: OrderScope,
 ) -> ApiResult<Vec<OrderFact>> {
+    let window = match scope {
+        OrderScope::Placed => {
+            "o.created_at >= ($4::date::timestamp AT TIME ZONE $3) \
+             AND o.created_at < (($5::date + 1)::timestamp AT TIME ZONE $3)"
+        }
+        OrderScope::Completed => {
+            "o.status = 'completed' \
+             AND o.updated_at >= ($4::date::timestamp AT TIME ZONE $3) \
+             AND o.updated_at < (($5::date + 1)::timestamp AT TIME ZONE $3)"
+        }
+    };
     // Orders whose `store` predates the shop register resolve to the shop of
     // the matching category, exactly as ordering and the sales dashboard do.
-    #[allow(clippy::type_complexity)]
-    let rows = sqlx::query_as::<
-        _,
-        (
-            Uuid,
-            i64,
-            String,
-            String,
-            Option<String>,
-            f64,
-            f64,
-            i64,
-            NaiveDate,
-            String,
-            Option<i32>,
-            Value,
-            DateTime<Utc>,
-            DateTime<Utc>,
-        ),
-    >(
-        r#"WITH scoped AS (
-          SELECT o.id, o.order_number, o.customer_name, o.status, o.handled_by,
-                 o.total::float8 AS total,
-                 CASE WHEN jsonb_typeof(o.lines)='array' THEN o.lines ELSE '[]'::jsonb END AS lines,
-                 o.fulfilment_mode, o.token_number,
-                 o.created_at, o.updated_at
+    let rows = sqlx::query_as::<_, OrderRow>(&format!(
+        r#"SELECT {ORDER_COLUMNS}
           FROM campus_ops.canteen_orders o
           LEFT JOIN campus_ops.shops exact ON exact.tenant_id=o.tenant_id AND exact.shop_key=o.store
           LEFT JOIN LATERAL (
@@ -672,25 +1021,9 @@ async fn shop_orders(
           ) fallback ON true
           WHERE o.tenant_id=$1
             AND COALESCE(exact.shop_key, fallback.shop_key, o.store)=$2
-            AND o.created_at >= ($4::date::timestamp AT TIME ZONE $3)
-            AND o.created_at < (($5::date + 1)::timestamp AT TIME ZONE $3)
-        )
-        SELECT x.id, x.order_number, x.customer_name, x.status, x.handled_by, x.total,
-          COALESCE((SELECT sum(
-              COALESCE(NULLIF(l.value->>'quantity','')::float8, 1)
-              * COALESCE(mi.actual_price::float8, mi.price::float8,
-                         NULLIF(l.value->>'price','')::float8, 0))
-            FROM jsonb_array_elements(x.lines) l
-            LEFT JOIN campus_ops.canteen_menu_items mi
-              ON mi.tenant_id=$1 AND mi.id::text = l.value->>'itemId'), 0)::float8 AS cost,
-          COALESCE((SELECT sum(COALESCE(NULLIF(l.value->>'quantity','')::float8, 1))
-            FROM jsonb_array_elements(x.lines) l), 0)::int8 AS items,
-          (x.created_at AT TIME ZONE $3)::date AS day,
-          x.fulfilment_mode, x.token_number, x.lines,
-          x.created_at, x.updated_at
-        FROM scoped x
-        ORDER BY x.created_at DESC"#,
-    )
+            AND {window}
+          ORDER BY o.created_at DESC"#
+    ))
     .bind(tenant)
     .bind(shop_key)
     .bind(TENANT_TIMEZONE)
@@ -698,25 +1031,172 @@ async fn shop_orders(
     .bind(range.to)
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| OrderFact {
-            id: r.0,
-            order_number: r.1,
-            customer_name: r.2,
-            status: r.3,
-            handled_by: r.4.filter(|id| !id.trim().is_empty()),
-            total: r.5,
-            cost: r.6,
-            items: r.7,
-            day: r.8,
-            fulfilment_mode: r.9,
-            token_number: r.10,
-            lines: r.11,
-            created_at: r.12,
-            updated_at: r.13,
-        })
-        .collect())
+    Ok(rows.into_iter().map(order_fact).collect())
+}
+
+async fn orders_by_id(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    ids: &[Uuid],
+) -> ApiResult<Vec<OrderFact>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_as::<_, OrderRow>(&format!(
+        "SELECT {ORDER_COLUMNS} FROM campus_ops.canteen_orders o \
+         WHERE o.tenant_id=$1 AND o.id = ANY($2)"
+    ))
+    .bind(tenant)
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(order_fact).collect())
+}
+
+type EventRow = (
+    i64,
+    Uuid,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    f64,
+    bool,
+    DateTime<Utc>,
+    NaiveDate,
+);
+
+const EVENT_COLUMNS: &str = "e.id, e.order_id, e.line_index, e.item_id, e.item_name, e.action, \
+     e.source, e.actor_user_id, e.actor_name, e.quantity::int8, e.amount::float8, e.instant, \
+     e.occurred_at, (e.occurred_at AT TIME ZONE $3)::date";
+
+fn event_fact(r: EventRow) -> EventFact {
+    EventFact {
+        id: r.0,
+        order_id: r.1,
+        line_index: r.2,
+        item_id: r.3,
+        item_name: r.4,
+        action: r.5,
+        source: r.6,
+        actor: r.7,
+        actor_name: r.8,
+        quantity: r.9,
+        amount: r.10,
+        instant: r.11,
+        occurred_at: r.12,
+        day: r.13,
+    }
+}
+
+/// The shop's recorded actions in the range, newest first.
+async fn range_events(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    shop_key: &str,
+    range: DateRange,
+) -> ApiResult<Vec<EventFact>> {
+    let rows = sqlx::query_as::<_, EventRow>(&format!(
+        "SELECT {EVENT_COLUMNS} FROM campus_ops.canteen_order_events e \
+         WHERE e.tenant_id=$1 AND e.shop_key=$2 \
+           AND e.occurred_at >= ($4::date::timestamp AT TIME ZONE $3) \
+           AND e.occurred_at < (($5::date + 1)::timestamp AT TIME ZONE $3) \
+         ORDER BY e.occurred_at DESC, e.id DESC"
+    ))
+    .bind(tenant)
+    .bind(shop_key)
+    .bind(TENANT_TIMEZONE)
+    .bind(range.from)
+    .bind(range.to)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(event_fact).collect())
+}
+
+/// Every action recorded on `orders`, oldest first.
+async fn order_history(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    orders: &[Uuid],
+) -> ApiResult<Vec<EventFact>> {
+    if orders.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_as::<_, EventRow>(&format!(
+        "SELECT {EVENT_COLUMNS} FROM campus_ops.canteen_order_events e \
+         WHERE e.tenant_id=$1 AND e.order_id = ANY($2) \
+         ORDER BY e.occurred_at, e.id"
+    ))
+    .bind(tenant)
+    .bind(orders)
+    .bind(TENANT_TIMEZONE)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(event_fact).collect())
+}
+
+/// Each menu item's cost price, for the items that still exist.
+async fn item_costs(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    item_ids: &[String],
+) -> ApiResult<HashMap<String, f64>> {
+    if item_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(sqlx::query_as::<_, (String, f64)>(
+        "SELECT id::text, actual_price::float8 FROM campus_ops.canteen_menu_items \
+         WHERE tenant_id=$1 AND id::text = ANY($2) AND actual_price IS NOT NULL",
+    )
+    .bind(tenant)
+    .bind(item_ids)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect())
+}
+
+/// Accounts that acted without being assigned: the live ones by name, and
+/// the deactivated or deleted ones to leave out of the list.
+async fn other_actors(
+    pool: &sqlx::PgPool,
+    ids: &[String],
+) -> ApiResult<(HashMap<String, OtherActor>, HashSet<String>)> {
+    let mut others = HashMap::new();
+    let mut hidden = HashSet::new();
+    if ids.is_empty() {
+        return Ok((others, hidden));
+    }
+    let rows = sqlx::query_as::<_, (String, String, Option<String>, bool, Option<DateTime<Utc>>)>(
+        &format!(
+            "SELECT u.id::text, COALESCE(NULLIF(trim(u.display_name), ''), u.email, u.id::text), \
+                    u.email, ({LIVE_ACCOUNT_SQL}) AS live, u.last_login_at \
+             FROM identity.users u WHERE u.id::text = ANY($1)"
+        ),
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    for (id, name, email, live, last_login) in rows {
+        if live {
+            others.insert(
+                id,
+                OtherActor {
+                    name,
+                    email,
+                    last_login,
+                },
+            );
+        } else {
+            // Deactivated or deleted: not listed, still in the totals.
+            hidden.insert(id);
+        }
+    }
+    Ok((others, hidden))
 }
 
 /// Exactly the live accounts the admin has actively assigned to the shop.
@@ -776,47 +1256,76 @@ async fn shop_staff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{Duration, TimeZone};
 
     fn day(raw: &str) -> NaiveDate {
         NaiveDate::parse_from_str(raw, "%Y-%m-%d").unwrap()
     }
 
-    fn order(
-        handler: Option<&str>,
-        status: &str,
-        total: f64,
-        cost: f64,
-        minutes: i64,
-    ) -> OrderFact {
-        order_on("2026-09-01", handler, status, total, cost, minutes)
+    /// 2026-09-01 10:00 IST plus `minutes`.
+    fn at(minutes: i64) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 1, 4, 30, 0).unwrap() + Duration::minutes(minutes)
     }
 
-    fn order_on(
-        on: &str,
-        handler: Option<&str>,
-        status: &str,
-        total: f64,
-        cost: f64,
-        minutes: i64,
-    ) -> OrderFact {
-        let placed = day(on);
-        let created = Utc.from_utc_datetime(&placed.and_hms_opt(5, 0, 0).unwrap());
+    fn uuid(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    /// Order `n`: a prepared Dosa (₹40 × 2, cost 25 each) and an instant
+    /// Chips (₹10 × 1, cost 6), placed at minute 0.
+    fn order(n: u128, status: &str) -> OrderFact {
         OrderFact {
-            id: Uuid::new_v4(),
-            order_number: 1,
+            id: uuid(n),
+            order_number: n as i64,
             customer_name: "Student".into(),
             status: status.into(),
-            handled_by: handler.map(str::to_owned),
-            total,
-            cost,
-            items: 2,
-            day: placed,
+            handled_by: Some("someone".into()),
+            total: 90.0,
             fulfilment_mode: "pickup".into(),
             token_number: None,
-            lines: json!([{ "itemId": "dosa", "name": "Dosa", "price": total, "quantity": 2 }]),
-            created_at: created,
-            updated_at: created + chrono::Duration::minutes(minutes),
+            lines: json!([
+                { "itemId": "dosa", "name": "Dosa", "price": 40, "quantity": 2 },
+                { "itemId": "chips", "name": "Chips", "price": 10, "quantity": 1, "isInstant": true }
+            ]),
+            created_at: at(0),
+            updated_at: at(30),
+        }
+    }
+
+    fn event(
+        id: i64,
+        order: u128,
+        line: Option<i32>,
+        action: &str,
+        actor: &str,
+        minute: i64,
+    ) -> EventFact {
+        let (item, quantity, amount, instant) = match line {
+            Some(0) => (Some("dosa"), 2, 80.0, false),
+            Some(_) => (Some("chips"), 1, 10.0, true),
+            None => (
+                None,
+                3,
+                if action == "rejected" { 90.0 } else { 0.0 },
+                false,
+            ),
+        };
+        let occurred_at = at(minute);
+        EventFact {
+            id,
+            order_id: uuid(order),
+            line_index: line,
+            item_id: item.map(str::to_owned),
+            item_name: item.map(str::to_owned),
+            action: action.into(),
+            source: "item".into(),
+            actor: actor.into(),
+            actor_name: Some(actor.to_uppercase()),
+            quantity,
+            amount,
+            instant,
+            occurred_at,
+            day: (occurred_at + Duration::minutes(330)).date_naive(),
         }
     }
 
@@ -831,13 +1340,87 @@ mod tests {
         }
     }
 
-    fn report(
-        orders: &[OrderFact],
-        staff: &[StaffMember],
-        others: &HashMap<String, OtherHandler>,
-        hidden: &HashSet<String>,
-    ) -> Value {
-        build_report(orders, &staff_rows(orders, staff, others, hidden))
+    fn costs() -> HashMap<String, f64> {
+        [("dosa".to_string(), 25.0), ("chips".to_string(), 6.0)].into()
+    }
+
+    struct World {
+        placed: Vec<OrderFact>,
+        completed: Vec<OrderFact>,
+        events: Vec<EventFact>,
+        orders: HashMap<Uuid, OrderFact>,
+        costs: HashMap<String, f64>,
+    }
+
+    impl World {
+        fn new(orders: Vec<OrderFact>, mut events: Vec<EventFact>) -> Self {
+            events.sort_by_key(|e| e.occurred_at);
+            Self {
+                completed: orders
+                    .iter()
+                    .filter(|o| o.is_completed())
+                    .cloned()
+                    .collect(),
+                orders: orders.iter().map(|o| (o.id, o.clone())).collect(),
+                placed: orders,
+                events,
+                costs: costs(),
+            }
+        }
+
+        fn report(&self, staff: &[StaffMember], hidden: &HashSet<String>) -> Value {
+            let mut newest = self.events.clone();
+            newest.reverse();
+            let facts = Facts {
+                placed: &self.placed,
+                completed: &self.completed,
+                events: &newest,
+                history: &self.events,
+                orders: &self.orders,
+                costs: &self.costs,
+            };
+            let rows = staff_rows(&facts, staff, &HashMap::new(), hidden);
+            let mut report = build_report(&facts, &rows);
+            let names = actor_names(&rows, &HashMap::new(), &self.events);
+            report["details"] = Value::Array(
+                rows.iter()
+                    .map(|row| {
+                        captain_detail(
+                            &facts,
+                            row,
+                            DateRange {
+                                from: day("2026-08-31"),
+                                to: day("2026-09-02"),
+                            },
+                            &report,
+                            &names,
+                            1,
+                            3,
+                            "mec-canteen",
+                        )
+                    })
+                    .collect(),
+            );
+            report
+        }
+    }
+
+    fn staff() -> Vec<StaffMember> {
+        vec![
+            member("anu", "captain", "Anu"),
+            member("bala", "captain", "Bala"),
+            member("idle", "captain", "Idle"),
+            member("own", "owner", "Owner"),
+        ]
+    }
+
+    fn captain<'a>(report: &'a Value, name: &str) -> &'a Value {
+        report["captains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap()
     }
 
     #[test]
@@ -852,6 +1435,7 @@ mod tests {
         );
         let range = DateRange::parse(Some("2026-09-01"), Some("2026-09-30"), today).unwrap();
         assert_eq!(range.days(), 30);
+        assert_eq!(range.day_list().len(), 30);
         assert_eq!(
             DateRange::parse(Some("2026-09-05"), None, today)
                 .unwrap()
@@ -864,107 +1448,201 @@ mod tests {
     }
 
     #[test]
-    fn assigned_mec_local_captains_are_listed_like_anyone_else() {
-        // The admin's Counter staff list is the membership: an address on the
-        // campus's own `.local` domain is a real captain, not a demo.
-        let staff = vec![
-            member("kesava", "captain", "Kesava"),
-            member("purusoth", "captain", "Purusoth"),
-            member("shashi", "captain", "Shashi"),
-            member("yuvaraj", "captain", "Yuvaraj"),
-        ];
-        let orders = vec![order(Some("shashi"), "completed", 80.0, 50.0, 12)];
-        let report = report(&orders, &staff, &HashMap::new(), &HashSet::new());
-        let captains = report["captains"].as_array().unwrap();
-        let names: Vec<&str> = captains
+    fn each_person_is_credited_with_exactly_the_items_they_moved() {
+        // Order 1: Anu prepares and readies the dosa, Bala hands it over;
+        // the owner scans the chips out first.
+        // Order 2: Bala hands the chips over; the dosa is still cooking.
+        // Order 3: Anu rejects it.
+        let world = World::new(
+            vec![
+                order(1, "completed"),
+                order(2, "preparing"),
+                order(3, "rejected"),
+            ],
+            vec![
+                event(1, 1, Some(1), "delivered", "own", 2),
+                event(2, 1, Some(0), "preparing", "anu", 3),
+                event(3, 1, Some(0), "ready", "anu", 11),
+                event(4, 1, Some(0), "delivered", "bala", 14),
+                event(5, 2, Some(1), "delivered", "bala", 5),
+                event(6, 2, Some(0), "preparing", "anu", 6),
+                event(7, 3, None, "rejected", "anu", 7),
+            ],
+        );
+        let report = world.report(&staff(), &HashSet::new());
+        let names: Vec<&str> = report["captains"]
+            .as_array()
+            .unwrap()
             .iter()
             .map(|c| c["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["Shashi", "Kesava", "Purusoth", "Yuvaraj"]);
-        assert_eq!(captains[0]["email"], "shashi@mec.local");
-        assert!(captains.iter().all(|c| c["assigned"] == true));
-    }
+        // Captains first (busiest first, idle kept), then the owner.
+        assert_eq!(names, ["Bala", "Anu", "Idle", "Owner"]);
 
-    #[test]
-    fn deactivated_handlers_are_not_ranked_but_stay_in_the_totals() {
-        let staff = vec![member("cap-a", "captain", "Anu")];
-        let orders = vec![
-            order(Some("cap-a"), "completed", 100.0, 60.0, 10),
-            order(Some("deleted-one"), "completed", 40.0, 20.0, 10),
-        ];
-        let hidden: HashSet<String> = ["deleted-one".to_string()].into();
-        let report = report(&orders, &staff, &HashMap::new(), &hidden);
-        assert_eq!(report["summary"]["revenue"], 140.0);
-        let captains = report["captains"].as_array().unwrap();
-        assert_eq!(captains.len(), 1);
-        assert_eq!(captains[0]["name"], "Anu");
-    }
+        let bala = captain(&report, "Bala");
+        assert_eq!(bala["itemsDelivered"], 3);
+        assert_eq!(bala["ordersDelivered"], 2);
+        assert_eq!(bala["revenue"], 90.0);
+        assert_eq!(bala["cost"], 56.0);
+        assert_eq!(bala["profit"], 34.0);
+        // Total delivered = 80 + 10 (Bala) + 10 (owner) = 100.
+        assert_eq!(bala["revenueShare"], 90.0);
+        // Dosa: ready at 11, delivered at 14. Chips: placed 0, delivered 5.
+        assert_eq!(bala["averageHandoverSeconds"], 240.0);
+        assert_eq!(bala["handoverTimedItems"], 2);
+        assert_eq!(bala["itemsPrepared"], 0);
+        assert!(bala["averagePrepSeconds"].is_null());
 
-    #[test]
-    fn no_assignments_means_no_captains() {
-        let report = report(&[], &[], &HashMap::new(), &HashSet::new());
-        assert!(report["captains"].as_array().unwrap().is_empty());
-        assert_eq!(report["summary"]["orders"], 0);
-    }
+        let anu = captain(&report, "Anu");
+        assert_eq!(anu["itemsDelivered"], 0);
+        assert_eq!(anu["revenue"], 0.0);
+        assert_eq!(anu["itemsPrepared"], 4);
+        assert_eq!(anu["averagePrepSeconds"], 480.0);
+        assert_eq!(anu["prepTimedItems"], 1);
+        assert_eq!(anu["rejectedOrders"], 1);
+        assert_eq!(anu["refunded"], 90.0);
+        assert_eq!(anu["ordersTouched"], 3);
+        assert_eq!(anu["actions"], 4);
+        assert_eq!(anu["activeDays"], 1);
 
-    #[test]
-    fn every_captain_is_listed_and_credited_with_their_own_orders() {
-        let staff = vec![
-            member("cap-a", "captain", "Anu"),
-            member("cap-b", "captain", "Bala"),
-            member("own", "owner", "Owner"),
-        ];
-        let orders = vec![
-            order(Some("cap-a"), "completed", 100.0, 60.0, 10),
-            order(Some("cap-a"), "completed", 50.0, 30.0, 20),
-            order(Some("cap-a"), "rejected", 40.0, 20.0, 1),
-            order(Some("gone"), "completed", 30.0, 10.0, 5),
-            order(None, "pending", 25.0, 10.0, 0),
-        ];
-        let mut others = HashMap::new();
-        others.insert(
-            "gone".to_string(),
-            OtherHandler {
-                name: "Chitra".into(),
-                email: None,
-                last_login: None,
-            },
-        );
-        let report = report(&orders, &staff, &others, &HashSet::new());
+        let owner = captain(&report, "Owner");
+        assert_eq!(owner["role"], "owner");
+        assert_eq!(owner["itemsDelivered"], 1);
+        assert_eq!(owner["revenue"], 10.0);
+        assert_eq!(owner["revenueShare"], 10.0);
+        assert_eq!(owner["averageHandoverSeconds"], 120.0);
+
+        let idle = captain(&report, "Idle");
+        assert_eq!(idle["actions"], 0);
+        assert!(idle["averageHandoverSeconds"].is_null());
+        assert!(idle["lastActivityAt"].is_null());
+
+        let staff = &report["staffSummary"];
+        assert_eq!(staff["trackedRevenue"], 100.0);
+        assert_eq!(staff["totalRevenue"], 100.0);
+        assert_eq!(staff["unattributed"]["orders"], 0);
 
         let summary = &report["summary"];
-        assert_eq!(summary["orders"], 5);
-        assert_eq!(summary["completedOrders"], 3);
-        assert_eq!(summary["revenue"], 180.0);
-        assert_eq!(summary["cost"], 100.0);
-        assert_eq!(summary["profit"], 80.0);
-        assert_eq!(summary["refunded"], 40.0);
-        assert_eq!(summary["activeValue"], 25.0);
-        assert_eq!(summary["unattributedOrders"], 1);
+        assert_eq!(summary["orders"], 3);
+        assert_eq!(summary["revenue"], 90.0);
+        assert_eq!(summary["cost"], 56.0);
+        assert_eq!(summary["profit"], 34.0);
+        assert_eq!(summary["refunded"], 90.0);
+        // Order 1: placed 0, last item handed over at 14.
+        assert_eq!(summary["averageHandlingMinutes"], 14.0);
+        assert_eq!(summary["timedOrders"], 1);
+    }
 
+    #[test]
+    fn orders_from_before_tracking_are_credited_to_no_one() {
+        let mut legacy = order(9, "completed");
+        legacy.handled_by = Some("anu".into());
+        let world = World::new(
+            vec![legacy, order(1, "completed")],
+            vec![
+                event(1, 1, Some(0), "delivered", "bala", 10),
+                event(2, 1, Some(1), "delivered", "bala", 10),
+            ],
+        );
+        let report = world.report(&staff(), &HashSet::new());
+        // handled_by is not trusted: Anu gets nothing for the legacy order.
+        assert_eq!(captain(&report, "Anu")["revenue"], 0.0);
+        let bala = captain(&report, "Bala");
+        assert_eq!(bala["revenue"], 90.0);
+        assert_eq!(bala["revenueShare"], 50.0);
+        // Delivered from pending: no ready step was recorded for the dosa, so
+        // only the instant chips have a hand-over time.
+        assert_eq!(bala["handoverTimedItems"], 1);
+        assert_eq!(bala["averageHandoverSeconds"], 600.0);
+        let unattributed = &report["staffSummary"]["unattributed"];
+        assert_eq!(unattributed["orders"], 1);
+        assert_eq!(unattributed["items"], 3);
+        assert_eq!(unattributed["revenue"], 90.0);
+        assert_eq!(unattributed["revenueShare"], 50.0);
+        assert_eq!(report["staffSummary"]["totalRevenue"], 180.0);
+        // The legacy order has no recorded hand-over, so it is not timed.
+        assert_eq!(report["summary"]["timedOrders"], 1);
+        assert_eq!(report["summary"]["averageHandlingMinutes"], 10.0);
+    }
+
+    #[test]
+    fn missing_costs_are_not_recorded_rather_than_guessed() {
+        let mut world = World::new(
+            vec![order(1, "completed")],
+            vec![
+                event(1, 1, Some(0), "delivered", "anu", 10),
+                event(2, 1, Some(1), "delivered", "anu", 10),
+            ],
+        );
+        world.costs.remove("chips");
+        let report = world.report(&staff(), &HashSet::new());
+        let anu = captain(&report, "Anu");
+        assert_eq!(anu["revenue"], 90.0);
+        assert!(anu["cost"].is_null());
+        assert!(anu["profit"].is_null());
+        assert_eq!(anu["uncostedItems"], 1);
+        assert!(report["summary"]["cost"].is_null());
+        assert!(report["summary"]["profit"].is_null());
+        assert!(report["summary"]["marginPercent"].is_null());
+        assert_eq!(report["summary"]["uncostedItems"], 1);
+    }
+
+    #[test]
+    fn hand_overs_on_refunded_orders_are_not_sales() {
+        let world = World::new(
+            vec![order(1, "rejected")],
+            vec![
+                event(1, 1, Some(1), "delivered", "anu", 2),
+                event(2, 1, None, "rejected", "bala", 5),
+            ],
+        );
+        let report = world.report(&staff(), &HashSet::new());
+        assert_eq!(captain(&report, "Anu")["itemsDelivered"], 0);
+        assert_eq!(captain(&report, "Anu")["revenue"], 0.0);
+        assert_eq!(captain(&report, "Bala")["refunded"], 90.0);
+        assert_eq!(report["staffSummary"]["totalRevenue"], 0.0);
+    }
+
+    #[test]
+    fn deactivated_actors_are_not_listed_but_stay_in_the_totals() {
+        let world = World::new(
+            vec![order(1, "completed")],
+            vec![
+                event(1, 1, Some(0), "delivered", "anu", 10),
+                event(2, 1, Some(1), "delivered", "gone", 10),
+            ],
+        );
+        let hidden: HashSet<String> = ["gone".to_string()].into();
+        let report = world.report(&[member("anu", "captain", "Anu")], &hidden);
         let captains = report["captains"].as_array().unwrap();
-        let names: Vec<&str> = captains
-            .iter()
-            .map(|c| c["name"].as_str().unwrap())
-            .collect();
-        // Idle Bala is still listed; the idle owner is not; the unassigned
-        // handler follows the captains.
-        assert_eq!(names, ["Anu", "Bala", "Chitra"]);
-        let anu = &captains[0];
-        assert_eq!(anu["orders"], 3);
-        assert_eq!(anu["completedOrders"], 2);
-        assert_eq!(anu["rejectedOrders"], 1);
-        assert_eq!(anu["itemsSold"], 4);
-        assert_eq!(anu["revenue"], 150.0);
-        assert_eq!(anu["profit"], 60.0);
-        assert_eq!(anu["averageHandlingMinutes"], 15.0);
-        assert_eq!(anu["revenueShare"], 83.3);
-        assert_eq!(anu["recentOrders"].as_array().unwrap().len(), 3);
-        let bala = &captains[1];
-        assert_eq!(bala["orders"], 0);
-        assert_eq!(bala["revenue"], 0.0);
-        assert!(bala["averageHandlingMinutes"].is_null());
-        assert_eq!(captains[2]["assigned"], false);
+        assert_eq!(captains.len(), 1);
+        assert_eq!(captains[0]["revenueShare"], 88.9);
+        assert_eq!(report["staffSummary"]["trackedRevenue"], 90.0);
+    }
+
+    #[test]
+    fn unassigned_actors_follow_by_their_recorded_name() {
+        let world = World::new(
+            vec![order(1, "completed")],
+            vec![event(1, 1, Some(1), "delivered", "admin-1", 10)],
+        );
+        let report = world.report(&[], &HashSet::new());
+        let captains = report["captains"].as_array().unwrap();
+        assert_eq!(captains.len(), 1);
+        assert_eq!(captains[0]["name"], "ADMIN-1");
+        assert!(captains[0]["role"].is_null());
+        assert_eq!(captains[0]["assigned"], false);
+    }
+
+    #[test]
+    fn no_assignments_and_no_actions_means_no_captains() {
+        let world = World::new(vec![], vec![]);
+        let report = world.report(&[], &HashSet::new());
+        assert!(report["captains"].as_array().unwrap().is_empty());
+        assert_eq!(report["summary"]["orders"], 0);
+        assert!(report["summary"]["averageHandlingMinutes"].is_null());
+        // Nothing sold: cost is recorded (zero), not unknown.
+        assert_eq!(report["summary"]["cost"], 0.0);
     }
 
     #[test]
@@ -977,61 +1655,62 @@ mod tests {
             email: Some("dev@mec.local".into()),
             last_login: None,
         }];
-        let orders = vec![
-            order(Some("uuid-1"), "completed", 10.0, 5.0, 3),
-            order(Some("dev@mec.local"), "completed", 20.0, 5.0, 3),
-        ];
-        let report = report(&orders, &staff, &HashMap::new(), &HashSet::new());
+        let world = World::new(
+            vec![order(1, "completed")],
+            vec![
+                event(1, 1, Some(0), "delivered", "uuid-1", 3),
+                event(2, 1, Some(1), "delivered", "dev@mec.local", 3),
+            ],
+        );
+        let report = world.report(&staff, &HashSet::new());
         let captains = report["captains"].as_array().unwrap();
         assert_eq!(captains.len(), 1);
-        assert_eq!(captains[0]["orders"], 2);
+        assert_eq!(captains[0]["itemsDelivered"], 3);
         assert_eq!(captains[0]["userId"], "uuid-1");
     }
 
     #[test]
-    fn captain_detail_has_a_daily_series_and_paginated_orders() {
-        let staff = vec![member("cap-a", "captain", "Anu")];
-        let mut orders = vec![
-            order_on("2026-09-03", Some("cap-a"), "completed", 100.0, 60.0, 10),
-            order_on("2026-09-03", Some("cap-a"), "rejected", 30.0, 10.0, 2),
-            order_on("2026-09-01", Some("cap-a"), "completed", 50.0, 20.0, 10),
-            order_on("2026-09-01", Some("other"), "completed", 50.0, 20.0, 10),
-        ];
-        // Newest first, as the query returns them.
-        orders.sort_by(|a, b| b.day.cmp(&a.day));
-        let rows = staff_rows(&orders, &staff, &HashMap::new(), &HashSet::new());
-        let anu = rows.iter().find(|row| row.user_id == "cap-a").unwrap();
-        let range = DateRange {
-            from: day("2026-09-01"),
-            to: day("2026-09-04"),
-        };
-
-        let detail = captain_detail(anu, range, total_revenue(&orders), 1, 2, "mec-canteen");
-        let daily = detail["daily"].as_array().unwrap();
-        assert_eq!(daily.len(), 4);
-        assert_eq!(daily[0]["date"], "2026-09-01");
-        assert_eq!(daily[0]["orders"], 1);
-        assert_eq!(daily[0]["revenue"], 50.0);
-        assert_eq!(daily[1]["orders"], 0);
-        assert_eq!(daily[2]["orders"], 2);
-        assert_eq!(daily[2]["completedOrders"], 1);
-        assert_eq!(daily[2]["revenue"], 100.0);
-        assert_eq!(daily[2]["profit"], 40.0);
-        assert_eq!(detail["totalOrders"], 3);
-        assert_eq!(detail["totalPages"], 2);
-        assert_eq!(detail["revenueShare"], 75.0);
-        let first = detail["orders"].as_array().unwrap();
-        assert_eq!(first.len(), 2);
-        assert_eq!(first[0]["captainName"], "Anu");
-        assert_eq!(first[0]["shopKey"], "mec-canteen");
-        assert_eq!(first[0]["fulfilmentMode"], "pickup");
-        assert_eq!(first[0]["lines"][0]["name"], "Dosa");
-
-        let second = captain_detail(anu, range, total_revenue(&orders), 2, 2, "mec-canteen");
-        assert_eq!(second["page"], 2);
-        assert_eq!(second["orders"].as_array().unwrap().len(), 1);
-        // Out-of-range pages clamp to the last one.
-        let clamped = captain_detail(anu, range, total_revenue(&orders), 9, 2, "mec-canteen");
-        assert_eq!(clamped["page"], 2);
+    fn captain_detail_has_a_daily_series_and_paginated_actions() {
+        let mut late = event(5, 2, Some(1), "delivered", "anu", 0);
+        // 2026-09-02 00:30 IST: the next local day.
+        late.occurred_at = Utc.with_ymd_and_hms(2026, 9, 1, 19, 0, 0).unwrap();
+        late.day = day("2026-09-02");
+        let world = World::new(
+            vec![order(1, "completed"), order(2, "completed")],
+            vec![
+                event(1, 1, Some(0), "preparing", "anu", 1),
+                event(2, 1, Some(0), "ready", "anu", 4),
+                event(3, 1, Some(0), "delivered", "anu", 6),
+                event(4, 1, Some(1), "delivered", "bala", 7),
+                late,
+            ],
+        );
+        let report = world.report(&staff(), &HashSet::new());
+        let details = report["details"].as_array().unwrap();
+        let anu = details.iter().find(|d| d["name"] == "Anu").unwrap();
+        let daily = anu["daily"].as_array().unwrap();
+        assert_eq!(daily.len(), 3);
+        assert_eq!(daily[0]["date"], "2026-08-31");
+        assert_eq!(daily[0]["actions"], 0);
+        assert_eq!(daily[1]["itemsDelivered"], 2);
+        assert_eq!(daily[1]["revenue"], 80.0);
+        assert_eq!(daily[1]["itemsPrepared"], 2);
+        assert_eq!(daily[1]["actions"], 3);
+        assert_eq!(daily[2]["revenue"], 10.0);
+        assert_eq!(anu["activeDays"], 2);
+        assert_eq!(anu["totalActivity"], 4);
+        assert_eq!(anu["totalPages"], 2);
+        let activity = anu["activity"].as_array().unwrap();
+        assert_eq!(activity.len(), 3);
+        // Newest first, each with its order for the detail page.
+        assert_eq!(activity[0]["action"], "delivered");
+        assert_eq!(activity[0]["itemName"], "chips");
+        assert_eq!(activity[0]["orderNumber"], 2);
+        assert_eq!(activity[1]["order"]["captainName"], "Anu, Bala");
+        assert_eq!(activity[1]["order"]["shopKey"], "mec-canteen");
+        assert_eq!(activity[1]["order"]["lines"][0]["name"], "Dosa");
+        // Order 2's dosa has no recorded hand-over: ₹80 before tracking, so
+        // Anu's ₹90 is half of the ₹180 delivered.
+        assert_eq!(anu["revenueShare"], 50.0);
     }
 }

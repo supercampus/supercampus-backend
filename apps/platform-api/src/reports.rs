@@ -1819,140 +1819,186 @@ fn margin(revenue: f64, cost: f64) -> f64 {
     }
 }
 
-/// Orders by the account that last moved them — the captain or owner at the
-/// counter — exactly as the shop's own "Sales & Profit" tab attributes them.
+/// What each captain or owner actually did at the counter, from the per-item
+/// action log (`campus_ops.canteen_order_events`) — the same record the
+/// shop's own "Sales & Profit" tab uses. An item's revenue is credited to the
+/// person who handed it over; orders completed before the log existed are
+/// shown as unattributed rather than guessed.
 async fn captain_performance_report(ctx: &Ctx<'_>) -> ApiResult<Report> {
+    let tracked: bool = sqlx::query_scalar(
+        "SELECT to_regclass('campus_ops.canteen_order_events') IS NOT NULL",
+    )
+    .fetch_one(ctx.pool)
+    .await?;
     type Row = (
+        String,
         String,
         Option<String>,
         Option<String>,
         i64,
         i64,
-        i64,
+        f64,
         i64,
         i64,
         f64,
-        Option<f64>,
+        i64,
     );
-    let rows = sqlx::query_as::<_, Row>(
-        r#"WITH scoped AS (
-          SELECT o.status, NULLIF(trim(o.handled_by), '') AS handled_by,
-            o.total::float8 AS total, o.created_at, o.updated_at,
-            COALESCE(exact.shop_key, fallback.shop_key, o.store) AS shop_key
-          FROM campus_ops.canteen_orders o
-          LEFT JOIN campus_ops.shops exact ON exact.tenant_id=o.tenant_id AND exact.shop_key=o.store
-          LEFT JOIN LATERAL (
-            SELECT s.shop_key FROM campus_ops.shops s
-            WHERE exact.shop_key IS NULL AND s.tenant_id=o.tenant_id AND lower(s.category)=CASE
-              WHEN lower(o.store) LIKE '%laundry%' THEN 'laundry'
-              WHEN lower(o.store) LIKE '%station%' THEN 'stationery'
-              ELSE 'canteen' END
-            ORDER BY s.is_active DESC, s.created_at, s.shop_key LIMIT 1
-          ) fallback ON true
-          WHERE o.tenant_id=$1 AND (o.created_at AT TIME ZONE $2)::date BETWEEN $3 AND $4
+    let rows: Vec<Row> = if tracked {
+        sqlx::query_as::<_, Row>(
+            r#"SELECT COALESCE(s.name, e.shop_key), e.actor_user_id,
+                 (array_agg(e.actor_name ORDER BY e.occurred_at DESC)
+                    FILTER (WHERE e.actor_name IS NOT NULL))[1],
+                 (SELECT a.assignment_role FROM campus_ops.shop_user_assignments a
+                   WHERE a.tenant_id=$1 AND a.shop_id=s.id AND a.user_id=e.actor_user_id
+                     AND a.is_active LIMIT 1),
+                 COALESCE(sum(e.quantity) FILTER (WHERE e.action='delivered'
+                   AND e.line_index IS NOT NULL AND o.status NOT IN ('rejected','cancelled')), 0)::int8,
+                 count(DISTINCT e.order_id) FILTER (WHERE e.action='delivered'
+                   AND e.line_index IS NOT NULL AND o.status NOT IN ('rejected','cancelled'))::int8,
+                 COALESCE(sum(e.amount) FILTER (WHERE e.action='delivered'
+                   AND e.line_index IS NOT NULL AND o.status NOT IN ('rejected','cancelled')), 0)::float8,
+                 COALESCE(sum(e.quantity) FILTER (WHERE e.action IN ('preparing','ready')
+                   AND e.line_index IS NOT NULL), 0)::int8,
+                 count(DISTINCT e.order_id) FILTER (WHERE e.action='rejected')::int8,
+                 COALESCE(sum(e.amount) FILTER (WHERE e.action='rejected'), 0)::float8,
+                 count(*)::int8
+               FROM campus_ops.canteen_order_events e
+               JOIN campus_ops.canteen_orders o ON o.tenant_id=e.tenant_id AND o.id=e.order_id
+               LEFT JOIN campus_ops.shops s ON s.tenant_id=e.tenant_id AND s.shop_key=e.shop_key
+               WHERE e.tenant_id=$1
+                 AND (e.occurred_at AT TIME ZONE $2)::date BETWEEN $3 AND $4
+                 AND ($5::text IS NULL OR e.shop_key=$5)
+               GROUP BY s.id, 1, 2
+               ORDER BY 1, 7 DESC, 5 DESC"#,
         )
-        SELECT COALESCE(s.name, x.shop_key), x.handled_by,
-          (SELECT a.assignment_role FROM campus_ops.shop_user_assignments a
-            WHERE a.tenant_id=$1 AND a.shop_id=s.id AND a.user_id=x.handled_by AND a.is_active
-            LIMIT 1),
-          count(*)::int8,
-          count(*) FILTER (WHERE x.status='completed')::int8,
-          count(*) FILTER (WHERE x.status IN ('pending','accepted','preparing','ready'))::int8,
-          count(*) FILTER (WHERE x.status='rejected')::int8,
-          count(*) FILTER (WHERE x.status='cancelled')::int8,
-          COALESCE(sum(x.total) FILTER (WHERE x.status='completed'), 0)::float8,
-          (avg(extract(epoch FROM (x.updated_at - x.created_at)) / 60.0)
-            FILTER (WHERE x.status='completed'))::float8
-        FROM scoped x
-        LEFT JOIN campus_ops.shops s ON s.tenant_id=$1 AND s.shop_key=x.shop_key
-        WHERE ($5::text IS NULL OR x.shop_key=$5)
-        GROUP BY s.id, 1, 2
-        ORDER BY 1, (x.handled_by IS NULL), 9 DESC, 4 DESC"#,
-    )
+        .bind(ctx.tenant)
+        .bind(TENANT_TIMEZONE)
+        .bind(ctx.range.from)
+        .bind(ctx.range.to)
+        .bind(ctx.shop_key)
+        .fetch_all(ctx.pool)
+        .await?
+    } else {
+        Vec::new()
+    };
+    // Completed orders nobody is recorded as handing over: before tracking.
+    let (unattributed_orders, unattributed_revenue): (i64, f64) = sqlx::query_as(&format!(
+        r#"WITH scoped AS (
+             SELECT o.id, o.total::float8 AS total, o.updated_at,
+               COALESCE(exact.shop_key, fallback.shop_key, o.store) AS shop_key
+             FROM campus_ops.canteen_orders o
+             LEFT JOIN campus_ops.shops exact ON exact.tenant_id=o.tenant_id AND exact.shop_key=o.store
+             LEFT JOIN LATERAL (
+               SELECT s.shop_key FROM campus_ops.shops s
+               WHERE exact.shop_key IS NULL AND s.tenant_id=o.tenant_id AND lower(s.category)=CASE
+                 WHEN lower(o.store) LIKE '%laundry%' THEN 'laundry'
+                 WHEN lower(o.store) LIKE '%station%' THEN 'stationery'
+                 ELSE 'canteen' END
+               ORDER BY s.is_active DESC, s.created_at, s.shop_key LIMIT 1
+             ) fallback ON true
+             WHERE o.tenant_id=$1 AND o.status='completed'
+               AND (o.updated_at AT TIME ZONE $2)::date BETWEEN $3 AND $4
+           )
+           SELECT count(*)::int8, COALESCE(sum(x.total), 0)::float8 FROM scoped x
+           WHERE ($5::text IS NULL OR x.shop_key=$5) {}"#,
+        if tracked {
+            "AND NOT EXISTS (SELECT 1 FROM campus_ops.canteen_order_events e
+               WHERE e.tenant_id=$1 AND e.order_id=x.id AND e.action='delivered')"
+        } else {
+            ""
+        }
+    ))
     .bind(ctx.tenant)
     .bind(TENANT_TIMEZONE)
     .bind(ctx.range.from)
     .bind(ctx.range.to)
     .bind(ctx.shop_key)
-    .fetch_all(ctx.pool)
+    .fetch_one(ctx.pool)
     .await?;
-    let names = account_names(ctx, rows.iter().filter_map(|r| r.1.clone())).await?;
+    let names = account_names(ctx, rows.iter().map(|r| r.1.clone())).await?;
     let mut table = Table::new(
-        "Orders by staff member",
+        "What each person did",
         vec![
             col("shop", "Shop", "text"),
-            col("name", "Handled by", "text"),
+            col("name", "Name", "text"),
             col("role", "Role", "text"),
-            col("orders", "Orders", "number"),
-            col("completed", "Completed", "number"),
-            col("active", "In progress", "number"),
-            col("rejected", "Rejected", "number"),
-            col("cancelled", "Cancelled", "number"),
-            col("revenue", "Revenue", "money"),
-            col("minutes", "Avg. minutes", "number"),
+            col("itemsDelivered", "Items delivered", "number"),
+            col("ordersDelivered", "Orders delivered", "number"),
+            col("revenue", "Revenue delivered", "money"),
+            col("itemsPrepared", "Items prepared", "number"),
+            col("rejected", "Orders rejected", "number"),
+            col("refunded", "Refunded", "money"),
+            col("actions", "Actions", "number"),
         ],
     );
-    let (mut orders, mut completed, mut revenue) = (0, 0, 0.0);
-    let (mut minutes_sum, mut minutes_orders) = (0.0, 0);
-    let mut unattributed = 0;
-    for (shop, handler, role, n, done, open, rejected, cancelled, amount, minutes) in &rows {
-        orders += n;
-        completed += done;
+    let (mut items, mut revenue, mut rejected, mut refunded) = (0, 0.0, 0, 0.0);
+    for (shop, actor, actor_name, role, delivered, orders, amount, prepared, rej, refund, actions) in
+        &rows
+    {
+        items += delivered;
         revenue += amount;
-        if let Some(minutes) = minutes {
-            minutes_sum += minutes * *done as f64;
-            minutes_orders += done;
-        }
-        let name = match handler {
-            None => {
-                unattributed += n;
-                "Not yet handled".to_owned()
-            }
-            Some(id) => names
-                .get(&id.to_lowercase())
-                .cloned()
-                .unwrap_or_else(|| "Former staff".into()),
-        };
+        rejected += rej;
+        refunded += refund;
+        let name = names
+            .get(&actor.to_lowercase())
+            .cloned()
+            .or_else(|| actor_name.clone())
+            .unwrap_or_else(|| "Former staff".into());
         table.rows.push(json!({
             "shop": shop,
             "name": name,
-            "role": role.as_deref().map(words).unwrap_or_default(),
-            "orders": n,
-            "completed": done,
-            "active": open,
-            "rejected": rejected,
-            "cancelled": cancelled,
+            "role": role.as_deref().map(words).unwrap_or_else(|| "Not assigned here".into()),
+            "itemsDelivered": delivered,
+            "ordersDelivered": orders,
             "revenue": round_money(*amount),
-            "minutes": minutes.map(round_one),
+            "itemsPrepared": prepared,
+            "rejected": rej,
+            "refunded": round_money(*refund),
+            "actions": actions,
         }));
     }
-    let average = (minutes_orders > 0).then(|| round_one(minutes_sum / minutes_orders as f64));
+    if unattributed_orders > 0 {
+        table.rows.push(json!({
+            "shop": "—",
+            "name": "Unattributed (before tracking)",
+            "role": "",
+            "itemsDelivered": null,
+            "ordersDelivered": unattributed_orders,
+            "revenue": round_money(unattributed_revenue),
+            "itemsPrepared": null,
+            "rejected": null,
+            "refunded": null,
+            "actions": null,
+        }));
+    }
     table.totals = Some(json!({
         "shop": "Total",
-        "orders": orders,
-        "completed": completed,
-        "revenue": round_money(revenue),
-        "minutes": average,
+        "itemsDelivered": items,
+        "revenue": round_money(revenue + unattributed_revenue),
+        "rejected": rejected,
+        "refunded": round_money(refunded),
     }));
     let mut notes = vec![
-        "Each order is credited to the account that last moved it (accepted, prepared, \
-         handed over or rejected it). Avg. minutes is order placed to completed."
+        "Built from the counter's action log: each item's revenue goes to the person who \
+         handed it over; preparing and rejecting are credited to whoever did them. Dates \
+         are when each action happened."
             .to_owned(),
         "Laundry charges are raised at the counter, not ordered, so they are not listed here."
             .to_owned(),
     ];
-    if unattributed > 0 {
+    if unattributed_orders > 0 {
         notes.push(format!(
-            "{unattributed} order(s) had not been picked up by anyone yet."
+            "{unattributed_orders} completed order(s) were handed over before per-item tracking \
+             began, so they are shown as unattributed rather than credited to anyone."
         ));
     }
     Ok(Report {
         notes,
         summary: vec![
-            stat("Orders", orders as f64, "number"),
-            stat("Completed", completed as f64, "number"),
-            stat("Revenue", round_money(revenue), "money"),
-            stat("Avg. minutes", average.unwrap_or(0.0), "number"),
+            stat("Items delivered", items as f64, "number"),
+            stat("Revenue delivered", round_money(revenue), "money"),
+            stat("Unattributed revenue", round_money(unattributed_revenue), "money"),
+            stat("Orders rejected", rejected as f64, "number"),
         ],
         tables: vec![table],
     })

@@ -52,6 +52,8 @@ pub fn router() -> Router<AppState> {
             "/canteen/shops/{shop_id}",
             put(update_shop).delete(delete_shop),
         )
+        .route("/canteen/shops/{shop_id}/menu", get(shop_menu_items))
+        .route("/canteen/shops/{shop_id}/menu/move", post(move_menu_items))
         .route("/canteen/menu", post(create_menu_item))
         .route(
             "/canteen/menu/{item_id}",
@@ -1315,6 +1317,40 @@ macro_rules! assignment_names_user_sql {
     };
 }
 
+/// Whether the `campus_ops.shops` row aliased `$shop` is a canteen split into
+/// categories (Bites, Mess …): it has at least one active category under it.
+/// Such a canteen is only the storefront and the general wallet; it has no
+/// staff, menu or queue of its own — its categories do.
+macro_rules! shop_has_categories_sql {
+    ($shop:literal) => {
+        concat!(
+            "EXISTS(SELECT 1 FROM campus_ops.shops category_of",
+            " WHERE category_of.tenant_id=",
+            $shop,
+            ".tenant_id AND category_of.parent_shop_key=",
+            $shop,
+            ".shop_key AND category_of.is_active)"
+        )
+    };
+}
+
+/// Refused when someone asks a canteen split into categories to take staff.
+const STAFF_PER_CATEGORY_MESSAGE: &str = "Assign staff to its categories instead";
+
+/// Whether `shop_key` is a canteen with at least one active category.
+async fn shop_has_categories<'e, E>(executor: E, tenant: Uuid, shop_key: &str) -> ApiResult<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM campus_ops.shops WHERE tenant_id=$1 AND parent_shop_key=$2 AND is_active)",
+    )
+    .bind(tenant)
+    .bind(shop_key)
+    .fetch_one(executor)
+    .await?)
+}
+
 /// Shown to shop staff whose role is set but who have no counter yet: an
 /// empty queue would look like a quiet day rather than missing setup.
 pub(crate) const NOT_ASSIGNED_TO_SHOP_MESSAGE: &str =
@@ -1447,7 +1483,9 @@ async fn canteen_store(
           -- The catalogue is the whole campus's: an operator in Shop mode buys
           -- from every store like anyone else. Their work surfaces narrow it to
           -- `assignedShopKeys`, and every menu write re-checks the assignment.
-          WHERE item.tenant_id=$1), '[]'::jsonb),
+          -- Items still on a canteen split into categories wait to be moved
+          -- into one; checkout refuses them, so they are not listed.
+          WHERE item.tenant_id=$1 AND NOT "#, shop_has_categories_sql!("resolved_shop"), r#"), '[]'::jsonb),
         'orders', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,'orderNumber',order_number,
           'customerUserId',customer_user_id,'customerName',customer_name,'lines',lines,
           'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,
@@ -1639,7 +1677,7 @@ async fn validate_counter_parent(
 ) -> ApiResult<String> {
     if parent_key == shop_key {
         return Err(ApiError::BadRequest(
-            "A counter cannot be its own canteen".into(),
+            "A category cannot be its own canteen".into(),
         ));
     }
     let parent = sqlx::query_as::<_, (String, bool, Option<String>)>(
@@ -1652,12 +1690,12 @@ async fn validate_counter_parent(
     .ok_or_else(|| ApiError::BadRequest(format!("Unknown canteen {parent_key}")))?;
     if !parent.1 {
         return Err(ApiError::BadRequest(
-            "Counters can only be added to an active canteen".into(),
+            "Categories can only be added to an active canteen".into(),
         ));
     }
     if parent.2.is_some() {
         return Err(ApiError::BadRequest(
-            "A counter cannot have counters of its own".into(),
+            "A category cannot have categories of its own".into(),
         ));
     }
     if let Some(shop_id) = shop_id {
@@ -1672,7 +1710,7 @@ async fn validate_counter_parent(
         .await?;
         if has_counters {
             return Err(ApiError::BadRequest(
-                "This canteen has counters, so it cannot become a counter itself".into(),
+                "This canteen has categories, so it cannot become a category itself".into(),
             ));
         }
     }
@@ -1737,7 +1775,7 @@ async fn create_shop(
         }
         None => input.category.trim().to_owned(),
     };
-    let shop = sqlx::query_scalar::<_, Value>(r#"
+    let mut shop = sqlx::query_scalar::<_, Value>(r#"
       INSERT INTO campus_ops.shops
         (id,tenant_id,shop_key,name,category,description,is_active,meal_compliance,qr_payments,created_by,sort_order,parent_shop_key)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
@@ -1752,6 +1790,10 @@ async fn create_shop(
       .bind(input.meal_compliance).bind(input.qr_payments).bind(&principal.student.id)
       .bind(input.sort_order).bind(&parent)
       .fetch_one(&mut *tx).await?;
+    if let Some(parent_key) = parent.as_deref().filter(|_| input.is_active) {
+        let removed = retire_parent_staff(&mut tx, tenant, parent_key).await?;
+        shop["parentStaffRemoved"] = removed;
+    }
     sync_shop_operators(
         &mut tx,
         tenant,
@@ -1819,7 +1861,7 @@ async fn update_shop(
     .await?;
     if in_use {
         return Err(ApiError::BadRequest(
-            "A shop's key cannot change once it has counters, menu items, orders or wallet activity"
+            "A shop's key cannot change once it has categories, menu items, orders or wallet activity"
                 .into(),
         ));
     }
@@ -1849,7 +1891,7 @@ async fn update_shop(
     if !input.is_active {
         refuse_closing_canteen_with_counters(&mut tx, tenant, shop_id).await?;
     }
-    let shop = sqlx::query_scalar::<_, Value>(
+    let mut shop = sqlx::query_scalar::<_, Value>(
         r#"
       UPDATE campus_ops.shops SET shop_key=$3,name=$4,category=$5,description=$6,
         is_active=$7,meal_compliance=$8,qr_payments=$9,parent_shop_key=$10,
@@ -1883,6 +1925,10 @@ async fn update_shop(
     .bind(&category)
     .execute(&mut *tx)
     .await?;
+    if let Some(parent_key) = parent.as_deref().filter(|_| input.is_active) {
+        let removed = retire_parent_staff(&mut tx, tenant, parent_key).await?;
+        shop["parentStaffRemoved"] = removed;
+    }
     sync_shop_operators(
         &mut tx,
         tenant,
@@ -1943,6 +1989,38 @@ async fn delete_shop(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Retires a canteen's own owners and captains once it has an active
+/// category: from then on staff work its categories, and the canteen is only
+/// the storefront and the general wallet. Returns who was removed (name,
+/// role) so the administrator is told; already-retired staff are not listed.
+async fn retire_parent_staff(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: Uuid,
+    parent_key: &str,
+) -> ApiResult<Value> {
+    Ok(sqlx::query_scalar::<_, Value>(
+        r#"WITH removed AS (
+             UPDATE campus_ops.shop_user_assignments assignment
+             SET is_active=false, updated_at=now()
+             FROM campus_ops.shops parent
+             WHERE parent.tenant_id=$1 AND parent.shop_key=$2 AND parent.parent_shop_key IS NULL
+               AND assignment.tenant_id=$1 AND assignment.shop_id=parent.id AND assignment.is_active
+             RETURNING assignment.user_id, assignment.assignment_role)
+           SELECT COALESCE(jsonb_agg(jsonb_build_object(
+               'userId', removed.user_id,
+               'assignmentRole', removed.assignment_role,
+               'name', COALESCE((SELECT u.display_name FROM identity.users u
+                   WHERE u.id::text=removed.user_id OR lower(u.email)=lower(removed.user_id)
+                   ORDER BY (u.id::text=removed.user_id) DESC LIMIT 1), removed.user_id))
+             ORDER BY removed.assignment_role DESC, removed.user_id), '[]'::jsonb)
+           FROM removed"#,
+    )
+    .bind(tenant)
+    .bind(parent_key)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 /// A canteen holds its counters' general wallet credit and is what students
 /// see them under, so it stays open while any counter does.
 async fn refuse_closing_canteen_with_counters(
@@ -1961,7 +2039,7 @@ async fn refuse_closing_canteen_with_counters(
     .await?;
     if open_counters {
         return Err(ApiError::BadRequest(
-            "Deactivate or move this canteen's counters first".into(),
+            "Deactivate or move this canteen's categories first".into(),
         ));
     }
     Ok(())
@@ -2005,12 +2083,20 @@ async fn shops_json(
 ) -> ApiResult<Value> {
     let restrict = keys.is_some();
     let keys = keys.cloned().unwrap_or_default();
-    Ok(sqlx::query_scalar::<_, Value>(
+    Ok(sqlx::query_scalar::<_, Value>(concat!(
         r#"
       SELECT COALESCE(jsonb_agg(jsonb_build_object('id',shop.id,'shopKey',shop.shop_key,'name',shop.name,
         'category',shop.category,'description',shop.description,'isActive',shop.is_active,'shopOpen',shop.shop_open,
         'mealCompliance',shop.meal_compliance,'qrPayments',shop.qr_payments,'createdAt',shop.created_at,
         'updatedAt',shop.updated_at,'sortOrder',shop.sort_order,'parentShopKey',shop.parent_shop_key,
+        'hasCategories',"#, shop_has_categories_sql!("shop"), r#",
+        -- The administrator's register counts the items still on a canteen
+        -- split into categories, so it can ask for them to be moved.
+        'uncategorizedItemCount',CASE WHEN $2 AND "#, shop_has_categories_sql!("shop"), r#"
+          THEN (SELECT count(*) FROM campus_ops.canteen_menu_items item
+                WHERE item.tenant_id=shop.tenant_id
+                  AND "#, resolved_shop_key_sql!("item.tenant_id", "item.store"), r#"=shop.shop_key)
+          ELSE 0 END,
         'operators',COALESCE((SELECT jsonb_agg(jsonb_build_object(
           'userId',assignment.user_id,'assignmentRole',assignment.assignment_role,
           -- Staff names only in the administrator's register ($2), never in
@@ -2019,11 +2105,13 @@ async fn shops_json(
           FROM campus_ops.shop_user_assignments assignment
           LEFT JOIN identity.users operator_user ON operator_user.id::text=assignment.user_id
           WHERE assignment.tenant_id=shop.tenant_id
-            AND assignment.shop_id=shop.id AND assignment.is_active),'[]'::jsonb))
+            AND assignment.shop_id=shop.id AND assignment.is_active
+            -- A canteen split into categories has no staff of its own.
+            AND NOT "#, shop_has_categories_sql!("shop"), r#"),'[]'::jsonb))
           ORDER BY shop.sort_order NULLS LAST, shop.name, shop.shop_key), '[]'::jsonb)
       FROM campus_ops.shops shop WHERE shop.tenant_id=$1 AND ($2 OR shop.is_active)
         AND (NOT $3 OR shop.shop_key = ANY($4))"#,
-    )
+    ))
     .bind(tenant)
     .bind(include_inactive)
     .bind(restrict)
@@ -2043,7 +2131,9 @@ async fn assigned_shop_keys(
            JOIN campus_ops.shops shop ON shop.tenant_id=assignment.tenant_id AND shop.id=assignment.shop_id
            WHERE assignment.tenant_id=$1 AND "#,
         assignment_names_user_sql!("$2", "$3"),
-        r#" AND assignment.is_active AND shop.is_active
+        r#" AND assignment.is_active AND shop.is_active AND NOT "#,
+        shop_has_categories_sql!("shop"),
+        r#"
            GROUP BY shop.shop_key, shop.sort_order, shop.name
            ORDER BY shop.sort_order NULLS LAST, shop.name, shop.shop_key"#
     ))
@@ -2072,7 +2162,9 @@ async fn assigned_shop_roles(
            JOIN campus_ops.shops shop ON shop.tenant_id=assignment.tenant_id AND shop.id=assignment.shop_id
            WHERE assignment.tenant_id=$1 AND "#,
         assignment_names_user_sql!("$2", "$3"),
-        r#" AND assignment.is_active AND shop.is_active
+        r#" AND assignment.is_active AND shop.is_active AND NOT "#,
+        shop_has_categories_sql!("shop"),
+        r#"
            GROUP BY shop.shop_key, shop.name, shop.category, shop.sort_order, shop.parent_shop_key
            ORDER BY shop.sort_order NULLS LAST, shop.name, shop.shop_key"#
     ))
@@ -2212,6 +2304,23 @@ async fn sync_shop_operators(
     let Some(operators) = operators else {
         return Ok(());
     };
+    if !operators.is_empty() {
+        let split = sqlx::query_scalar::<_, bool>(concat!(
+            "SELECT ",
+            shop_has_categories_sql!("shop"),
+            " FROM campus_ops.shops shop WHERE shop.tenant_id=$1 AND shop.id=$2"
+        ))
+        .bind(tenant)
+        .bind(shop_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or(false);
+        if split {
+            return Err(ApiError::BadRequest(format!(
+                "This canteen is split into categories. {STAFF_PER_CATEGORY_MESSAGE}."
+            )));
+        }
+    }
     sqlx::query("UPDATE campus_ops.shop_user_assignments SET is_active=false,updated_at=now() WHERE tenant_id=$1 AND shop_id=$2")
         .bind(tenant).bind(shop_id).execute(&mut **tx).await?;
     for (user, role) in operators {
@@ -2275,7 +2384,10 @@ async fn require_shop_assignment(
              JOIN campus_ops.shops shop ON shop.tenant_id=assignment.tenant_id AND shop.id=assignment.shop_id
              WHERE assignment.tenant_id=$1 AND "#,
         assignment_names_user_sql!("$2", "$4"),
-        r#" AND assignment.is_active AND shop.is_active),
+        // A canteen split into categories routes nothing to its own staff.
+        r#" AND assignment.is_active AND shop.is_active AND NOT "#,
+        shop_has_categories_sql!("shop"),
+        r#"),
            target AS (SELECT "#,
         resolved_shop_key_sql!("$1", "$3"),
         r#" AS shop_key)
@@ -2482,10 +2594,17 @@ async fn user_shop_assignments_json(
              'shopId', shop.id, 'shopKey', shop.shop_key, 'name', shop.name,
              'category', shop.category, 'sortOrder', shop.sort_order,
              'parentShopKey', shop.parent_shop_key,
+             -- A canteen split into categories takes no staff; the user
+             -- editor offers its categories instead.
+             'hasCategories', "#,
+        shop_has_categories_sql!("shop"),
+        r#",
              'assignmentRole', (SELECT assignment.assignment_role
                FROM campus_ops.shop_user_assignments assignment
                WHERE assignment.tenant_id=shop.tenant_id AND assignment.shop_id=shop.id
-                 AND assignment.is_active AND "#,
+                 AND assignment.is_active AND NOT "#,
+        shop_has_categories_sql!("shop"),
+        r#" AND "#,
         assignment_names_user_sql!("$2", "$3"),
         r#" ORDER BY (assignment.assignment_role='owner') DESC LIMIT 1))
              ORDER BY shop.sort_order NULLS LAST, shop.name, shop.shop_key), '[]'::jsonb)
@@ -2547,9 +2666,11 @@ async fn set_user_shop_assignments(
     let mut tx = db.pool().begin().await?;
     let mut shop_roles: Vec<(Uuid, String)> = Vec::with_capacity(input.assignments.len());
     for assignment in &input.assignments {
-        let shop_id = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM campus_ops.shops WHERE tenant_id=$1 AND shop_key=$2 AND is_active",
-        )
+        let (shop_id, shop_name, split) = sqlx::query_as::<_, (Uuid, String, bool)>(concat!(
+            "SELECT shop.id, shop.name, ",
+            shop_has_categories_sql!("shop"),
+            " FROM campus_ops.shops shop WHERE shop.tenant_id=$1 AND shop.shop_key=$2 AND shop.is_active"
+        ))
         .bind(tenant)
         .bind(assignment.shop_key.trim())
         .fetch_optional(&mut *tx)
@@ -2557,6 +2678,13 @@ async fn set_user_shop_assignments(
         .ok_or_else(|| {
             ApiError::BadRequest(format!("Unknown shop {}", assignment.shop_key.trim()))
         })?;
+        // Owners and captains belong to a canteen's categories, never to the
+        // canteen itself once it has them.
+        if split {
+            return Err(ApiError::BadRequest(format!(
+                "{shop_name} is split into categories. {STAFF_PER_CATEGORY_MESSAGE}."
+            )));
+        }
         match shop_roles.iter_mut().find(|(id, _)| *id == shop_id) {
             Some((_, role)) if assignment.assignment_role == "owner" => *role = "owner".into(),
             Some(_) => {}
@@ -2662,6 +2790,7 @@ async fn create_menu_item(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     ensure_active_shop(db.pool(), tenant, input.store.trim()).await?;
+    refuse_split_canteen_menu(db.pool(), tenant, input.store.trim()).await?;
     require_shop_owner(
         db.pool(),
         tenant,
@@ -2713,6 +2842,7 @@ async fn update_menu_item(
     let db = state.tenant_database(&principal.student.tenant_id).await?;
     let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
     ensure_active_shop(db.pool(), tenant, input.store.trim()).await?;
+    refuse_split_canteen_menu(db.pool(), tenant, input.store.trim()).await?;
     // The item's current shop is checked as well as the one it is saved
     // into: otherwise one canteen's owner could move another canteen's item
     // into their own menu by naming their shop.
@@ -2845,6 +2975,164 @@ async fn ensure_active_shop(pool: &sqlx::PgPool, tenant: Uuid, shop_key: &str) -
     }
 }
 
+/// A canteen split into categories keeps no menu of its own: every item is
+/// saved to one of its categories.
+async fn refuse_split_canteen_menu(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    shop_key: &str,
+) -> ApiResult<()> {
+    if shop_has_categories(pool, tenant, shop_key).await? {
+        return Err(ApiError::BadRequest(
+            "Choose a category: this canteen's menu lives in its categories".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MoveMenuItemsRequest {
+    item_ids: Vec<Uuid>,
+    target_shop_key: String,
+}
+
+/// `GET /canteen/shops/{key}/menu` — the items a shop holds itself (legacy
+/// keys included), for the administrator moving a canteen's items into its
+/// categories.
+async fn shop_menu_items(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(shop_key): Path<String>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "vendor_management.vendors.read")?;
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let shop = sqlx::query_scalar::<_, Value>(concat!(
+        r#"SELECT jsonb_build_object('shopKey', shop.shop_key, 'name', shop.name,
+             'hasCategories', "#,
+        shop_has_categories_sql!("shop"),
+        r#",
+             'items', COALESCE((SELECT jsonb_agg(jsonb_build_object('id', item.id,
+                 'name', item.name, 'category', item.category, 'price', item.price::float8,
+                 'isAvailable', item.is_available, 'store', item.store)
+                 ORDER BY item.category, item.name)
+               FROM campus_ops.canteen_menu_items item
+               WHERE item.tenant_id=shop.tenant_id AND "#,
+        resolved_shop_key_sql!("item.tenant_id", "item.store"),
+        r#"=shop.shop_key), '[]'::jsonb))
+           FROM campus_ops.shops shop WHERE shop.tenant_id=$1 AND shop.shop_key=$2"#
+    ))
+    .bind(tenant)
+    .bind(shop_key.trim())
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Shop not found".into()))?;
+    Ok(Json(ApiResponse::new(shop)))
+}
+
+/// `POST /canteen/shops/{key}/menu/move` — moves items a canteen still holds
+/// itself into one of its categories. Only items on that canteen move, and
+/// only into an active category of it; all or none.
+async fn move_menu_items(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(parent_key): Path<String>,
+    Json(input): Json<MoveMenuItemsRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require(&access, "vendor_management.vendors.update")?;
+    let item_ids = distinct_item_ids(&input.item_ids)?;
+    let parent_key = parent_key.trim().to_owned();
+    let target_key = input.target_shop_key.trim().to_owned();
+    let db = state.tenant_database(&principal.student.tenant_id).await?;
+    let tenant = tenant_id(db.pool(), &principal.student.tenant_id).await?;
+    let mut tx = db.pool().begin().await?;
+    let parent_name = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM campus_ops.shops WHERE tenant_id=$1 AND shop_key=$2 AND parent_shop_key IS NULL",
+    )
+    .bind(tenant)
+    .bind(&parent_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Canteen not found".into()))?;
+    let target_name = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM campus_ops.shops WHERE tenant_id=$1 AND shop_key=$2 AND parent_shop_key=$3 AND is_active",
+    )
+    .bind(tenant)
+    .bind(&target_key)
+    .bind(&parent_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest(format!("Choose an active category of {parent_name}")))?;
+    let moved = sqlx::query_scalar::<_, Value>(concat!(
+        r#"UPDATE campus_ops.canteen_menu_items item SET store=$3, updated_at=now()
+           WHERE item.tenant_id=$1 AND item.id = ANY($2) AND "#,
+        resolved_shop_key_sql!("item.tenant_id", "item.store"),
+        r#"=$4
+           RETURNING jsonb_build_object('id', item.id, 'name', item.name, 'store', item.store)"#
+    ))
+    .bind(tenant)
+    .bind(&item_ids)
+    .bind(&target_key)
+    .bind(&parent_key)
+    .fetch_all(&mut *tx)
+    .await?;
+    if moved.len() != item_ids.len() {
+        // Dropping the transaction rolls back: a stale screen never moves
+        // part of a selection.
+        return Err(ApiError::BadRequest(format!(
+            "Some of these items are no longer on {parent_name}. Refresh and try again."
+        )));
+    }
+    let remaining = sqlx::query_scalar::<_, i64>(concat!(
+        r#"SELECT count(*) FROM campus_ops.canteen_menu_items item
+           WHERE item.tenant_id=$1 AND "#,
+        resolved_shop_key_sql!("item.tenant_id", "item.store"),
+        r#"=$2"#
+    ))
+    .bind(tenant)
+    .bind(&parent_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let payload = json!({
+        "parentShopKey": parent_key,
+        "targetShopKey": target_key,
+        "targetName": target_name,
+        "moved": moved.len(),
+        "items": moved,
+        "remaining": remaining,
+    });
+    emit(
+        &state,
+        &principal.student.tenant_id,
+        db.pool(),
+        tenant,
+        "canteen",
+        "menu_item",
+        &parent_key,
+        "menu.moved_to_category",
+        &principal.student.id,
+        &payload,
+    )
+    .await?;
+    Ok(Json(ApiResponse::new(payload)))
+}
+
+/// The items a move names, each once. At least one and at most 500, so one
+/// request never rewrites a whole campus's menu by accident.
+fn distinct_item_ids(requested: &[Uuid]) -> ApiResult<Vec<Uuid>> {
+    let mut ids = requested.to_vec();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() || ids.len() > 500 {
+        return Err(ApiError::BadRequest("Choose the items to move".into()));
+    }
+    Ok(ids)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OrderLineInput {
@@ -2916,8 +3204,11 @@ async fn place_order(
         // category because its own counter happens to be closed. A counter's
         // item is that counter's order, never its canteen's or another
         // counter's.
-        let item=sqlx::query_as::<_,(String,String,String,f64,bool,bool,bool,String,Option<String>)>(concat!(r#"SELECT item.name,resolved_shop.shop_key,item.category,item.price::float8,item.is_vegetarian,item.is_instant,
-            resolved_shop.shop_open,resolved_shop.name,resolved_shop.parent_shop_key
+        let item=sqlx::query_as::<_,(String,String,String,f64,bool,bool,bool,String,Option<String>,Option<String>,bool)>(concat!(r#"SELECT item.name,resolved_shop.shop_key,item.category,item.price::float8,item.is_vegetarian,item.is_instant,
+            resolved_shop.shop_open,resolved_shop.name,resolved_shop.parent_shop_key,
+            (SELECT parent.name FROM campus_ops.shops parent
+              WHERE parent.tenant_id=resolved_shop.tenant_id AND parent.shop_key=resolved_shop.parent_shop_key),
+            "#, shop_has_categories_sql!("resolved_shop"), r#"
           FROM campus_ops.canteen_menu_items item
           JOIN campus_ops.shops resolved_shop ON resolved_shop.tenant_id=item.tenant_id
             AND resolved_shop.is_active
@@ -2925,6 +3216,14 @@ async fn place_order(
           WHERE item.tenant_id=$1 AND item.id=$2 AND item.is_available FOR SHARE OF item"#))
         .bind(tenant).bind(requested.item_id).fetch_optional(&mut *tx).await?
         .ok_or_else(||ApiError::BadRequest("An item is unavailable".into()))?;
+        // An item still on a canteen split into categories has no staff to
+        // make it until the administrator moves it into a category.
+        if item.10 {
+            return Err(ApiError::Conflict(format!(
+                "{} is being moved — try again soon.",
+                item.0
+            )));
+        }
         if !item.6 {
             return Err(ApiError::Conflict(format!(
                 "{} is closed right now. Remove its items to order from the other shops.",
@@ -2941,6 +3240,11 @@ async fn place_order(
             }
             None => baskets.push(Basket {
                 shop: item.1.clone(),
+                parent_name: item
+                    .9
+                    .clone()
+                    .or_else(|| item.8.clone())
+                    .unwrap_or_default(),
                 parent: item.8.clone(),
                 name: item.7.clone(),
                 lines: vec![line],
@@ -2984,8 +3288,9 @@ async fn place_order(
         let basket = &baskets[index];
         ApiError::Conflict(match &basket.parent {
             Some(_) => format!(
-                "Insufficient wallet balance for {}: credit for it plus your canteen credit doesn't cover ₹{}",
+                "Insufficient wallet balance for {}: credit for it plus your {} credit doesn't cover ₹{}",
                 basket.name,
+                basket.parent_name,
                 format_wallet_amount(basket.total)
             ),
             None => format!("Insufficient wallet balance for {}", basket.shop),
@@ -3000,9 +3305,10 @@ async fn place_order(
         let Basket {
             shop: store,
             parent,
+            parent_name,
+            name: shop_name,
             lines: store_lines,
             total: store_total,
-            ..
         } = basket;
         let raw_qr = Uuid::new_v4().to_string();
         let hash = token_hash(&raw_qr);
@@ -3058,10 +3364,11 @@ async fn place_order(
                 }
             });
             let scope = wallet_scope_of(bucket, &store, parent.as_deref());
+            // The shops' own names, so a renamed canteen reads right.
             let description = if *bucket == store {
-                format!("{} order", shop_label(&store))
+                format!("{shop_name} order")
             } else {
-                format!("{} order · canteen credit", shop_label(&store))
+                format!("{shop_name} order · {parent_name} credit")
             };
             let transaction=sqlx::query_scalar::<_,Value>(r#"INSERT INTO campus_ops.canteen_wallet_transactions
               (tenant_id,user_id,shop_key,amount,transaction_type,description,reference_id,idempotency_key,actor_user_id,
@@ -3110,9 +3417,8 @@ async fn place_order(
                     event_type: "canteen.order.created".into(),
                     title: "New canteen order".into(),
                     body: format!(
-                        "{} placed a {} order for ₹{store_total:.0}.",
+                        "{} placed a {shop_name} order for ₹{store_total:.0}.",
                         principal.student.name,
-                        shop_label(&store)
                     ),
                     data: order.clone(),
                     priority: "high".into(),
@@ -3148,8 +3454,10 @@ async fn place_order(
 /// One shop's part of a cart: the order that shop will take.
 struct Basket {
     shop: String,
-    /// The canteen the shop is a counter of.
+    /// The canteen the shop is a category of.
     parent: Option<String>,
+    /// That canteen's name, for wallet lines ("Bites order · Let's eat! credit").
+    parent_name: String,
     name: String,
     lines: Vec<Value>,
     total: f64,
@@ -3218,26 +3526,6 @@ fn wallet_scope_of(bucket: &str, store: &str, parent: Option<&str>) -> String {
         store.to_owned()
     } else {
         "all".into()
-    }
-}
-
-/// How a shop names itself on a wallet line.
-fn shop_label(store: &str) -> String {
-    match store {
-        "classic" => "Campus Classic".into(),
-        "bites" => "Quick Bites".into(),
-        "stationery" => "Stationery Store".into(),
-        _ => store
-            .split(['_', '-'])
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                let mut chars = part.chars();
-                chars.next().map_or_else(String::new, |first| {
-                    first.to_uppercase().collect::<String>() + chars.as_str()
-                })
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
     }
 }
 
@@ -3682,7 +3970,7 @@ struct OrderStatusRequest {
 }
 
 /// Service rank of a status on the counter's one-way flow.
-fn line_status_rank(status: &str) -> u8 {
+pub(crate) fn line_status_rank(status: &str) -> u8 {
     match status {
         "pending" | "accepted" => 0,
         "preparing" => 1,
@@ -3694,7 +3982,7 @@ fn line_status_rank(status: &str) -> u8 {
 
 /// The status a food item is at, falling back to its order's status for
 /// items that have never been moved on their own.
-fn effective_line_status(line: &Value, order_status: &str, is_instant: bool) -> String {
+pub(crate) fn effective_line_status(line: &Value, order_status: &str, is_instant: bool) -> String {
     if let Some(status) = line.get("status").and_then(Value::as_str) {
         return status.to_string();
     }
@@ -3747,7 +4035,7 @@ fn line_item_id(line: &Value) -> Option<Uuid> {
 }
 
 /// Menu items among `lines` that are handed over without kitchen preparation.
-async fn instant_item_ids(
+pub(crate) async fn instant_item_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: Uuid,
     lines: &[Value],
@@ -3765,7 +4053,7 @@ async fn instant_item_ids(
     .await?)
 }
 
-fn line_is_instant(line: &Value, instant_ids: &[Uuid]) -> bool {
+pub(crate) fn line_is_instant(line: &Value, instant_ids: &[Uuid]) -> bool {
     line.get("isInstant").and_then(Value::as_bool).unwrap_or(false)
         || line_item_id(line).is_some_and(|id| instant_ids.contains(&id))
 }
@@ -3865,6 +4153,25 @@ async fn update_order_line_status(
     .bind(&principal.student.id)
     .fetch_one(&mut *tx)
     .await?;
+    // Who moved which item, for the owner's per-captain figures.
+    crate::order_events::insert_events(
+        &mut tx,
+        &crate::order_events::EventContext {
+            tenant,
+            order_id,
+            shop_key: &store,
+            actor_id: &principal.student.id,
+            actor_name: &principal.student.name,
+            source: "item",
+        },
+        &[crate::order_events::item_event(
+            line_index,
+            &order["lines"][line_index],
+            &desired,
+            target_instant,
+        )],
+    )
+    .await?;
     let (title, body) = match (order_status.as_str(), desired.as_str()) {
         ("completed", _) => (
             "Your order is delivered".to_string(),
@@ -3953,6 +4260,32 @@ async fn update_order_status(
    WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'customerUserId',customer_user_id,'status',status,
    'tokenNumber',token_number,'updatedAt',updated_at)"#).bind(tenant).bind(order_id).bind(&input.status).bind(&principal.student.id).bind(input.reason)
    .fetch_one(&mut *tx).await?;
+    // Who moved which item, for the owner's per-captain figures. A whole-order
+    // move leaves the lines as they were, so they are read back unchanged.
+    let order_lines = sqlx::query_scalar::<_, Value>(
+        "SELECT lines FROM campus_ops.canteen_orders WHERE tenant_id=$1 AND id=$2",
+    )
+    .bind(tenant)
+    .bind(order_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    crate::order_events::record_transition(
+        &mut tx,
+        &crate::order_events::EventContext {
+            tenant,
+            order_id,
+            shop_key: &current.3,
+            actor_id: &principal.student.id,
+            actor_name: &principal.student.name,
+            source: "order",
+        },
+        &current.0,
+        &order_lines,
+        &input.status,
+        None,
+        current.2,
+    )
+    .await?;
     if input.status == "rejected" && current.0 != "rejected" {
         refund_order_to_wallets(
             &mut tx,
@@ -4168,6 +4501,25 @@ async fn scan_order(
     };
     let value=sqlx::query_scalar::<_,Value>("UPDATE campus_ops.canteen_orders SET status=$3,handled_by=$4,lines=COALESCE($5,lines),token_number=CASE WHEN $3<>'pending' AND token_number IS NULL THEN (order_number % 1000)::int ELSE token_number END,updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING jsonb_build_object('id',id,'orderNumber',order_number,'tokenNumber',token_number,'status',status,'customerUserId',customer_user_id,'lines',lines,'total',total::float8,'isInstant',true,'updatedAt',updated_at)")
  .bind(tenant).bind(current.0).bind(&next_status).bind(&principal.student.id).bind(next_lines).fetch_one(&mut *tx).await?;
+    // Who moved which item, for the owner's per-captain figures: each item a
+    // pickup scan advanced records the step it reached.
+    crate::order_events::record_transition(
+        &mut tx,
+        &crate::order_events::EventContext {
+            tenant,
+            order_id: current.0,
+            shop_key: &current.4,
+            actor_id: &principal.student.id,
+            actor_name: &principal.student.name,
+            source: "scan",
+        },
+        &current.1,
+        &current.5,
+        &next_status,
+        value.get("lines"),
+        current.3,
+    )
+    .await?;
     if desired == "rejected" && current.1 != "rejected" {
         refund_order_to_wallets(
             &mut tx,
@@ -5174,7 +5526,7 @@ fn pick_wallet_bucket(
         .filter(|counter| parent_of(counter).as_deref() == Some(wallet.as_str()))
         .ok_or_else(|| {
             format!(
-                "'{scope}' is not an active counter of {}",
+                "'{scope}' is not an active category of {}",
                 name_of(wallet_store)
             )
         })?;
@@ -9770,6 +10122,7 @@ pub(crate) async fn tenant_id(pool: &sqlx::PgPool, slug: &str) -> ApiResult<Uuid
     // any shop listing (here, sales, reports, wallets) sorts by it.
     ensure_shop_order_schema(pool).await;
     ensure_canteen_counter_schema(pool).await;
+    crate::order_events::ensure_order_event_schema(pool).await;
     sqlx::query_scalar("SELECT id FROM platform.tenants WHERE slug=$1")
         .bind(slug)
         .fetch_optional(pool)
@@ -11108,6 +11461,54 @@ mod tests {
         assert_eq!(
             requested_parent(&body(r#","parentShopKey":"canteen""#)),
             Some(Some("canteen".into()))
+        );
+    }
+
+    #[test]
+    fn a_canteen_can_be_named_with_punctuation_while_its_key_stays_a_slug() {
+        let body = |name: &str, key: &str| {
+            serde_json::from_str::<ShopRequest>(
+                &json!({"shopKey": key, "name": name, "category": "canteen"}).to_string(),
+            )
+            .expect("valid shop body")
+        };
+        assert!(validate_shop(&body("Let's eat!", "mec-canteen")).is_ok());
+        assert_eq!(body("Let's eat!", "mec-canteen").name, "Let's eat!");
+        // The name never becomes the key: a key with punctuation is refused.
+        assert!(validate_shop(&body("Let's eat!", "let's-eat!")).is_err());
+    }
+
+    #[test]
+    fn a_split_canteen_is_recognised_by_an_active_category_under_it() {
+        let sql = shop_has_categories_sql!("shop");
+        assert!(sql.contains("category_of.parent_shop_key=shop.shop_key"));
+        assert!(sql.contains("category_of.tenant_id=shop.tenant_id"));
+        // A retired category leaves the canteen whole again.
+        assert!(sql.contains("category_of.is_active"));
+        assert_eq!(
+            STAFF_PER_CATEGORY_MESSAGE,
+            "Assign staff to its categories instead"
+        );
+    }
+
+    #[test]
+    fn a_move_names_each_item_once_and_at_least_one() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        assert_eq!(distinct_item_ids(&[b, a, b]).unwrap(), vec![a, b]);
+        assert!(distinct_item_ids(&[]).is_err());
+        let too_many: Vec<Uuid> = (0..501u128).map(Uuid::from_u128).collect();
+        assert!(distinct_item_ids(&too_many).is_err());
+        let body = serde_json::from_str::<MoveMenuItemsRequest>(&format!(
+            r#"{{"itemIds":["{a}"],"targetShopKey":"mec-canteen-bites"}}"#
+        ))
+        .expect("valid move body");
+        assert_eq!(body.target_shop_key, "mec-canteen-bites");
+        assert!(
+            serde_json::from_str::<MoveMenuItemsRequest>(
+                r#"{"itemIds":[],"targetShopKey":"x","store":"y"}"#
+            )
+            .is_err()
         );
     }
 }

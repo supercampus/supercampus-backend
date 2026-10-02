@@ -41,11 +41,50 @@ pub fn router() -> Router<AppState> {
         )
 }
 
+/// What the log queries read, applied on its own so nothing else in 0130 can
+/// hold it back: the events table and the session device columns from 0076,
+/// which databases stuck behind the duplicate 0076 never received (sessions
+/// there keep the device only in `profile`).
+const LOG_TABLES_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS identity.auth_login_events (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id uuid REFERENCES platform.tenants(id) ON DELETE CASCADE,
+    user_id text,
+    email text,
+    outcome text NOT NULL
+        CHECK (outcome IN ('success', 'failure', 'blocked', 'signed_out', 'revoked')),
+    reason text,
+    session_id uuid,
+    device_id text,
+    device_name text,
+    platform text,
+    app_version text,
+    ip_address text,
+    user_agent text,
+    actor_user_id text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS auth_login_events_tenant_created_idx
+    ON identity.auth_login_events (tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS auth_login_events_session_idx
+    ON identity.auth_login_events (session_id)
+    WHERE session_id IS NOT NULL;
+ALTER TABLE identity.auth_sessions
+    ADD COLUMN IF NOT EXISTS device_id text,
+    ADD COLUMN IF NOT EXISTS device_name text;
+"#;
+
 /// Applies migrations/runtime/0130 once per process, for databases the
-/// migrator cannot reach. Failures are logged and retried on the next call.
+/// migrator cannot reach. The tables the logs read go first and on their own;
+/// the permission seeding follows, and a failure there is only logged. Either
+/// failure is retried on the next call.
 pub(crate) async fn ensure_schema(pool: &PgPool) {
     static READY: AtomicBool = AtomicBool::new(false);
     if READY.load(Ordering::Acquire) {
+        return;
+    }
+    if let Err(error) = sqlx::raw_sql(LOG_TABLES_SQL).execute(pool).await {
+        tracing::warn!(%error, "security log tables not applied");
         return;
     }
     match sqlx::raw_sql(include_str!(
@@ -55,7 +94,7 @@ pub(crate) async fn ensure_schema(pool: &PgPool) {
     .await
     {
         Ok(_) => READY.store(true, Ordering::Release),
-        Err(error) => tracing::warn!(%error, "security log schema not applied"),
+        Err(error) => tracing::warn!(%error, "security log permissions not applied"),
     }
 }
 

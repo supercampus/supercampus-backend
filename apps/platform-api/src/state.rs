@@ -2686,6 +2686,10 @@ impl AppState {
                           NULLIF(membership.profile ->> 'department', ''),
                           NULLIF(membership.profile ->> 'dept', '')
                       ) AS department,
+                      COALESCE(
+                          NULLIF(membership.profile ->> 'photoUrl', ''),
+                          NULLIF(user_account.profile ->> 'photoUrl', '')
+                      ) AS photo_url,
                       COALESCE((
                           SELECT jsonb_agg(jsonb_build_object(
                               'id', role.id, 'key', role.role_key, 'name', role.name,
@@ -2757,6 +2761,7 @@ impl AppState {
                     "active": row.try_get::<bool, _>("active")?,
                     "yearOfStudy": year_of_study,
                     "department": row.try_get::<Option<String>, _>("department")?,
+                    "photoUrl": row.try_get::<Option<String>, _>("photo_url")?,
                     "roles": row.try_get::<Value, _>("roles")?,
                 }))
             })
@@ -3370,6 +3375,104 @@ impl AppState {
         Ok(Some(json!({
             "userId": user_id,
             "yearOfStudy": year_of_study,
+            "studentRecordsUpdated": student_records,
+        })))
+    }
+
+    /// Sets or clears a member's profile photo wherever the app reads it: the
+    /// membership and account profiles (what sign-in reads), the person's
+    /// live sessions (what a refreshed session carries), and, in the campus
+    /// database, the account replica and any linked student record. `None`
+    /// removes the photo.
+    pub async fn set_tenant_user_photo(
+        &self,
+        tenant_slug: &str,
+        actor_id: &str,
+        user_id: Uuid,
+        photo_url: Option<&str>,
+    ) -> ApiResult<Option<Value>> {
+        let database = self.database.as_ref().ok_or_else(|| {
+            ApiError::ServiceUnavailable("PostgreSQL is required for user management".into())
+        })?;
+        let tenant_id = ensure_tenant(database, tenant_slug)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let is_member: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM identity.tenant_memberships
+                   WHERE tenant_id = $1 AND user_id = $2
+               )"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_one(database.pool())
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if !is_member {
+            return Ok(None);
+        }
+
+        let mut student_records = 0;
+        match self.tenant_database(tenant_slug).await {
+            Ok(tenant_db) => {
+                student_records =
+                    sync_tenant_user_photo(tenant_db.pool(), tenant_slug, user_id, photo_url)
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(error = %e, %user_id, tenant_slug, "failed to set the photo in the tenant database");
+                            ApiError::BadRequest(
+                                "The photo could not be saved to the campus records. Try again."
+                                    .into(),
+                            )
+                        })?;
+            }
+            Err(error) => {
+                tracing::warn!(%error, tenant_slug, "tenant database unavailable; photo saved in the control plane only");
+            }
+        }
+
+        let mut transaction = database
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        for statement in [
+            r#"UPDATE identity.tenant_memberships
+               SET profile = CASE WHEN $3::text IS NULL
+                       THEN COALESCE(profile, '{}'::jsonb) - 'photoUrl'
+                       ELSE COALESCE(profile, '{}'::jsonb) || jsonb_build_object('photoUrl', $3::text) END,
+                   updated_at = now()
+               WHERE tenant_id = $1 AND user_id = $2"#,
+            r#"UPDATE identity.users
+               SET profile = CASE WHEN $3::text IS NULL
+                       THEN COALESCE(profile, '{}'::jsonb) - 'photoUrl'
+                       ELSE COALESCE(profile, '{}'::jsonb) || jsonb_build_object('photoUrl', $3::text) END,
+                   updated_at = now()
+               WHERE id = $2 AND $1::uuid IS NOT NULL"#,
+            // A live session carries the profile it signed in with; the next
+            // refresh hands the app the new photo.
+            r#"UPDATE identity.auth_sessions
+               SET profile = jsonb_set(profile, '{photoUrl}', to_jsonb(COALESCE($3::text, '')), true)
+               WHERE tenant_id = $1 AND user_id = $2::text
+                 AND revoked_at IS NULL AND expires_at > now()"#,
+        ] {
+            sqlx::query(statement)
+                .bind(tenant_id)
+                .bind(user_id)
+                .bind(photo_url)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        self.validated_principals.write().await.clear();
+        tracing::info!(%user_id, actor_id, tenant_slug, has_photo = photo_url.is_some(), "administrator set a member's profile photo");
+        Ok(Some(json!({
+            "userId": user_id,
+            "photoUrl": photo_url,
             "studentRecordsUpdated": student_records,
         })))
     }
@@ -5080,6 +5183,49 @@ async fn sync_tenant_user_identity(
 
 /// Records a student's year of study (1–6) in the tenant database: the
 /// student record linked to the account and the identity.users replica.
+/// The campus-database half of [`AppState::set_tenant_user_photo`]: the
+/// account replica and any student record linked to the account.
+async fn sync_tenant_user_photo(
+    pool: &sqlx::PgPool,
+    tenant_slug: &str,
+    user_id: Uuid,
+    photo_url: Option<&str>,
+) -> anyhow::Result<u64> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        r#"UPDATE identity.users
+           SET profile = CASE WHEN $2::text IS NULL
+                   THEN COALESCE(profile, '{}'::jsonb) - 'photoUrl'
+                   ELSE COALESCE(profile, '{}'::jsonb) || jsonb_build_object('photoUrl', $2::text) END,
+               updated_at = now()
+           WHERE id = $1"#,
+    )
+    .bind(user_id)
+    .bind(photo_url)
+    .execute(&mut *transaction)
+    .await
+    .context("failed to update the tenant identity replica")?;
+    let updated = sqlx::query(
+        r#"UPDATE core.students student
+           SET profile = CASE WHEN $3::text IS NULL
+                   THEN COALESCE(student.profile, '{}'::jsonb) - 'photoUrl'
+                   ELSE COALESCE(student.profile, '{}'::jsonb) || jsonb_build_object('photoUrl', $3::text) END,
+               updated_at = now()
+           FROM platform.tenants tenant
+           WHERE tenant.id = student.tenant_id
+             AND tenant.slug = $1
+             AND student.user_account_id = $2"#,
+    )
+    .bind(tenant_slug)
+    .bind(user_id)
+    .bind(photo_url)
+    .execute(&mut *transaction)
+    .await
+    .context("failed to update the student record")?;
+    transaction.commit().await?;
+    Ok(updated.rows_affected())
+}
+
 async fn sync_tenant_user_year(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant_slug: &str,

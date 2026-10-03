@@ -1460,6 +1460,8 @@ async fn canteen_store(
         && (configures_shops || !assigned_shop_keys.is_empty());
     let can_read_analytics = access.allows("canteen.analytics.read")
         && (configures_shops || !restrict_to_assignments || !assigned_shop_keys.is_empty());
+    // The orders below name who delivered them, from the action log.
+    crate::order_events::ensure_order_event_schema(db.pool()).await;
     sqlx::query("INSERT INTO campus_ops.canteen_wallets (tenant_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING")
         .bind(tenant).bind(&principal.student.id).execute(db.pool()).await?;
     let mut data = sqlx::query_scalar::<_, Value>(concat!(r#"
@@ -1490,7 +1492,16 @@ async fn canteen_store(
           'customerUserId',customer_user_id,'customerName',customer_name,'lines',lines,
           'total',total::float8,'fulfilmentMode',fulfilment_mode,'status',status,
           'tokenNumber',token_number,'qrPayload',id::text,'createdAt',created_at,'updatedAt',updated_at,
-          'store',store,'walletSplit',wallet_split,'shopKey',"#, order_shop_key_sql!(), r#")
+          'store',store,'walletSplit',wallet_split,'shopKey',"#, order_shop_key_sql!(), r#",
+          -- Who handed a delivered order over, from the per-item action log,
+          -- in the order they first delivered something.
+          'deliveredBy',CASE WHEN status='completed' THEN (
+            SELECT string_agg(delivered.name, ', ' ORDER BY delivered.first_at)
+            FROM (SELECT e.actor_name AS name, min(e.occurred_at) AS first_at
+                  FROM campus_ops.canteen_order_events e
+                  WHERE e.tenant_id=$1 AND e.order_id=campus_ops.canteen_orders.id
+                    AND e.action='delivered' AND COALESCE(btrim(e.actor_name),'')<>''
+                  GROUP BY e.actor_name) delivered) END)
           ORDER BY created_at DESC) FROM campus_ops.canteen_orders
           WHERE tenant_id=$1 AND (($7 AND (NOT $9 OR "#, order_in_shops_sql!(), r#")) OR customer_user_id=$2)), '[]'::jsonb),
         'walletTransactions', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',id,

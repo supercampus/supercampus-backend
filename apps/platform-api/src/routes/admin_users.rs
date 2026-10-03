@@ -193,6 +193,61 @@ pub(super) async fn set_tenant_user_year(
     Ok(Json(ApiResponse::new(result)))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SetTenantUserPhotoRequest {
+    photo_url: Option<String>,
+}
+
+/// `PUT /authorization/users/{user_id}/photo` — set or clear (`null`/empty) a
+/// member's profile photo. The image is uploaded through `/v1/media/upload`
+/// first; only its https URL arrives here.
+pub(super) async fn set_tenant_user_photo(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Extension(access): Extension<EffectiveAccess>,
+    Path(user_id): Path<Uuid>,
+    Json(request): Json<SetTenantUserPhotoRequest>,
+) -> ApiResult<Json<ApiResponse<Value>>> {
+    require_effective_permission(&access, "authorization.users.update")?;
+    let photo_url = request
+        .photo_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(url) = photo_url {
+        if !url.starts_with("https://") {
+            return Err(ApiError::BadRequest(
+                "A profile photo must be an https URL".into(),
+            ));
+        }
+        if url.len() > 2048 {
+            return Err(ApiError::BadRequest("That photo URL is too long".into()));
+        }
+    }
+    let updated = state
+        .set_tenant_user_photo(
+            &principal.student.tenant_id,
+            &principal.student.id,
+            user_id,
+            photo_url,
+        )
+        .await?;
+    let Some(result) = updated else {
+        return Err(ApiError::NotFound("tenant user not found".into()));
+    };
+    // The person's app renews its session on this and shows the new photo.
+    state.publish_realtime(
+        RealtimePublication::tenant(
+            principal.student.tenant_id,
+            "identity.user.updated",
+            result.clone(),
+        )
+        .for_user(user_id.to_string()),
+    );
+    Ok(Json(ApiResponse::new(result)))
+}
+
 /// Roles that carry authority beyond a tenant administrator's: the platform's
 /// own roles and the tenant-level super administrator, which the API treats as
 /// an unconditional override in several places.

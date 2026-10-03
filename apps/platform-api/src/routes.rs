@@ -93,6 +93,10 @@ pub fn router(state: AppState) -> Router {
             put(admin_users::set_tenant_user_year),
         )
         .route(
+            "/authorization/users/{user_id}/photo",
+            put(admin_users::set_tenant_user_photo),
+        )
+        .route(
             "/authorization/users/{user_id}/access",
             get(get_tenant_user_access).put(set_tenant_user_access),
         )
